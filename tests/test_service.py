@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from models import SourceDocument
+from models import CaseItem, SourceDocument
 from service import LawAssistantService
 from storage import SQLiteStorage
-from tests.fakes import FakeAdapter, FakeExtractor, make_event
+from tests.fakes import FakeAdapter, FakeExtractor, RecordingPublisher, make_event
 
 
 def document(source_key: str, item_key: str) -> SourceDocument:
@@ -125,3 +129,134 @@ async def test_service_list_and_get_delegate_to_storage(tmp_path) -> None:
 
     assert len(events) == 1
     assert loaded is not None and loaded.id == event_id
+
+
+@pytest.mark.asyncio
+async def test_unchanged_source_document_skips_duplicate_extraction(tmp_path) -> None:
+    adapter = FakeAdapter("fake", [document("fake", "item-1")])
+
+    class CountingExtractor(FakeExtractor):
+        def __init__(self):
+            super().__init__({"item-1": [make_event()]})
+            self.calls = 0
+
+        async def extract(self, source_document):
+            self.calls += 1
+            return await super().extract(source_document)
+
+    extractor = CountingExtractor()
+    service = LawAssistantService(
+        SQLiteStorage(tmp_path / "runtime.sqlite3"),
+        sources=[(adapter, extractor)],
+    )
+
+    await service.scan_events()
+    await service.scan_events()
+
+    assert extractor.calls == 1
+    assert service.storage.count_events() == 1
+    assert service.storage.get_event_by_key("fake", "item-1").last_seen_at is not None
+
+
+@pytest.mark.asyncio
+async def test_publish_requires_confirmation_and_is_idempotent(tmp_path) -> None:
+    now = datetime(2026, 10, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    publisher = RecordingPublisher()
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    event_id = storage.upsert_event(
+        replace(
+            make_event(),
+            discovered_at=now,
+            updated_at=now,
+            dates=(
+                replace(
+                    make_event().dates[0],
+                    datetime=datetime(
+                        2026, 10, 8, 18, tzinfo=ZoneInfo("Asia/Shanghai")
+                    ),
+                ),
+            ),
+        )
+    )
+    service = LawAssistantService(storage, publisher=publisher, clock=lambda: now)
+    await service.bind_target("aiocqhttp:group:100", "测试群")
+
+    preview = await service.prepare_publish_event(event_id)
+    assert preview["ready"] is True
+    assert publisher.calls == []
+    assert (await service.confirm_publish(preview["token"]))["success"] is True
+    assert (await service.confirm_publish(preview["token"]))["success"] is False
+    assert len(publisher.calls) == 1
+    assert len(storage.list_publications()) == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_reminder_is_sent_once_per_day_and_target(tmp_path) -> None:
+    now = datetime(2026, 10, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    event = replace(
+        make_event(),
+        discovered_at=now,
+        updated_at=now,
+        dates=(
+            replace(
+                make_event().dates[0],
+                datetime=now,
+            ),
+        ),
+    )
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    storage.upsert_event(event)
+    publisher = RecordingPublisher()
+    service = LawAssistantService(storage, publisher=publisher, clock=lambda: now)
+    await service.bind_target("aiocqhttp:group:100", "测试群")
+
+    assert await service.check_deadline_reminders(now=now) == 1
+    assert await service.check_deadline_reminders(now=now) == 0
+    assert len(storage.list_reminders()) == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) -> None:
+    now = datetime(2026, 10, 1, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    storage.upsert_case_item(
+        CaseItem(
+            source_key="court_cases",
+            source_item_key="1",
+            title="典型案例",
+            source_url="https://court.example/1",
+            authority="最高人民法院",
+            raw_text="官方案例正文",
+            content_hash="case-hash",
+        )
+    )
+
+    class Learning:
+        async def daily_case(self, **kwargs):
+            return {"available": True, "content": {"case_summary": "摘要"}}
+
+        async def generate_question(self, **kwargs):
+            return {"available": False}
+
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        daily_case_enabled=True,
+        daily_case_time="08:00",
+        daily_question_enabled=False,
+    )
+    publisher = RecordingPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=config,
+        clock=lambda: now,
+    )
+    await service.bind_target("aiocqhttp:group:100", "测试群")
+
+    first = await service.run_scheduled_jobs(now=now)
+    second = await service.run_scheduled_jobs(now=now)
+
+    assert first["daily_case_sent"] == 1
+    assert second["daily_case_sent"] == 0
+    assert len(storage.list_daily_contents()) == 1

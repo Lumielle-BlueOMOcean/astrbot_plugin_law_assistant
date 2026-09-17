@@ -24,9 +24,11 @@ The intended division is ChatGPT Sol for analysis, architecture, debugging reaso
 - Commands, LLM tools, scheduler, and future integrations must call the same `LawAssistantService` rather than duplicate business logic.
 - Law Assistant and other plugins must not read each other’s SQLite databases or import each other’s internal implementation. Nexus integration is optional and must use a stable exposed contract.
 - LLM interprets evidence; deterministic code owns truth. Stored source evidence, hashes, permissions, publication state, and deduplication cannot be decided by an LLM alone.
-- Future side-effect operations use `prepare -> preview -> explicit confirm -> execute`; an automatic scheduler may act only under an operator-preauthorized policy. Phase 1 does not implement a complex confirmation workflow.
+- Side-effect operations use `prepare -> preview -> explicit confirm -> execute`; automatic scheduler publication/reminders may act only under an operator-preauthorized policy. Publication must remain idempotent by event revision, target and kind.
 - Network operations must be async; do not use `requests`.
 - Every new behavior needs a meaningful deterministic test. Tests must not require real QQ, real LLM providers, real websites, or production databases.
 - Before commit run format, lint, tests, compile, `git diff --check`, and the two real AstrBot compatibility smokes.
 - Keep module boundaries clear; do not let `main.py` or `service.py` grow without a concrete responsibility.
-- README must distinguish implemented behavior from planned capabilities and must not claim unfinished legal sources, daily questions/cases, radar, publishing, or Nexus integration are complete.
+- Source adapters must preserve official URL, fetched evidence and content hash; one source failure is isolated and recorded in `source_runs`.
+- Unconfirmed LLM dates cannot drive deadline lists, reminders or publication previews. LLM-generated learning content must be marked as study material, not legal advice.
+- README must distinguish implemented behavior from planned capabilities and must not claim deferred sources, advanced radar, full QQ management, or Nexus runtime integration are complete.

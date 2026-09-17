@@ -62,7 +62,18 @@ def run_smoke(core_source: Path, expected_commit: str | None = None) -> None:
             raise AssertionError("AstrBot did not register the plugin Star class")
 
         tools = {tool.name for tool in llm_tools.func_list}
-        required_tools = {"law_status", "law_scan_events", "law_list_events"}
+        required_tools = {
+            "law_status",
+            "law_scan_events",
+            "law_list_events",
+            "law_get_event",
+            "law_list_deadlines",
+            "law_get_daily_case",
+            "law_generate_question",
+            "law_list_law_updates",
+            "law_prepare_publish_event",
+            "law_confirm_publish",
+        }
         if not required_tools.issubset(tools):
             raise AssertionError(f"Missing LLM tools: {required_tools - tools}")
 

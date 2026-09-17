@@ -90,6 +90,7 @@ class FakeEvent:
     sender_id: str = ""
     message: str = "/law status"
     platform_name: str = "aiocqhttp"
+    unified_msg_origin: str = "aiocqhttp:private:1"
 
     def is_private_chat(self) -> bool:
         return self.private

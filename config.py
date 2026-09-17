@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,9 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SCAN_INTERVAL_MINUTES = 60
 MIN_SCAN_INTERVAL_MINUTES = 5
 MAX_SCAN_INTERVAL_MINUTES = 24 * 60
+DEFAULT_DEADLINE_REMINDER_DAYS = (7, 3, 1)
+DEFAULT_DAILY_TIME = "08:00"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +21,19 @@ class PluginConfig:
     timezone: str
     auto_scan_enabled: bool
     scan_interval_minutes: int
+    llm_provider_id: str
+    extra_event_source_urls: tuple[str, ...]
+    auto_publish_events: bool
+    deadline_reminder_days: tuple[int, ...]
+    deadline_same_day_enabled: bool
+    daily_case_enabled: bool
+    daily_case_time: str
+    daily_question_enabled: bool
+    daily_question_time: str
+    case_source_court_enabled: bool
+    case_source_spp_enabled: bool
+    law_update_enabled: bool
+    http_timeout_seconds: int
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> PluginConfig:
@@ -24,9 +41,40 @@ class PluginConfig:
         return cls(
             operator_ids=_normalize_operator_ids(values.get("operator_ids", [])),
             timezone=_normalize_timezone(values.get("timezone", DEFAULT_TIMEZONE)),
-            auto_scan_enabled=bool(values.get("auto_scan_enabled", False)),
+            auto_scan_enabled=_to_bool(values.get("auto_scan_enabled", False)),
             scan_interval_minutes=_normalize_interval(
                 values.get("scan_interval_minutes", DEFAULT_SCAN_INTERVAL_MINUTES),
+            ),
+            llm_provider_id=str(values.get("llm_provider_id", "") or "").strip(),
+            extra_event_source_urls=_normalize_urls(
+                values.get("extra_event_source_urls", [])
+            ),
+            auto_publish_events=_to_bool(values.get("auto_publish_events", False)),
+            deadline_reminder_days=_normalize_days(
+                values.get("deadline_reminder_days", DEFAULT_DEADLINE_REMINDER_DAYS)
+            ),
+            deadline_same_day_enabled=_to_bool(
+                values.get("deadline_same_day_enabled", True)
+            ),
+            daily_case_enabled=_to_bool(values.get("daily_case_enabled", False)),
+            daily_case_time=_normalize_time(
+                values.get("daily_case_time", DEFAULT_DAILY_TIME)
+            ),
+            daily_question_enabled=_to_bool(
+                values.get("daily_question_enabled", False)
+            ),
+            daily_question_time=_normalize_time(
+                values.get("daily_question_time", DEFAULT_DAILY_TIME)
+            ),
+            case_source_court_enabled=_to_bool(
+                values.get("case_source_court_enabled", True)
+            ),
+            case_source_spp_enabled=_to_bool(
+                values.get("case_source_spp_enabled", True)
+            ),
+            law_update_enabled=_to_bool(values.get("law_update_enabled", False)),
+            http_timeout_seconds=_normalize_timeout(
+                values.get("http_timeout_seconds", DEFAULT_HTTP_TIMEOUT_SECONDS)
             ),
         )
 
@@ -47,6 +95,37 @@ def _normalize_operator_ids(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _normalize_urls(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        return ()
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        url = str(item or "").strip()
+        if url and url.startswith(("http://", "https://")) and url not in seen:
+            result.append(url)
+            seen.add(url)
+    return tuple(result)
+
+
+def _normalize_days(value: Any) -> tuple[int, ...]:
+    if isinstance(value, int):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return DEFAULT_DEADLINE_REMINDER_DAYS
+    result: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        try:
+            day = int(item)
+        except (TypeError, ValueError):
+            continue
+        if day > 0 and day not in seen:
+            result.append(day)
+            seen.add(day)
+    return tuple(result)
+
+
 def _normalize_timezone(value: Any) -> str:
     candidate = str(value or DEFAULT_TIMEZONE).strip()
     try:
@@ -62,3 +141,24 @@ def _normalize_interval(value: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_SCAN_INTERVAL_MINUTES
     return max(MIN_SCAN_INTERVAL_MINUTES, min(MAX_SCAN_INTERVAL_MINUTES, interval))
+
+
+def _normalize_timeout(value: Any) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    return max(5, min(120, timeout))
+
+
+def _normalize_time(value: Any) -> str:
+    candidate = str(value or DEFAULT_DAILY_TIME).strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", candidate):
+        return DEFAULT_DAILY_TIME
+    return candidate
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

@@ -10,17 +10,61 @@ from storage import SCHEMA_VERSION, SQLiteStorage
 from tests.fakes import make_event
 
 
+def _create_v1_database(db_path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key, value) VALUES ('version', '1');
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT NOT NULL,
+                source_item_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                organizer TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                eligibility TEXT NOT NULL,
+                status TEXT NOT NULL,
+                raw_content_hash TEXT NOT NULL,
+                discovered_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(source_key, source_item_key)
+            );
+            CREATE TABLE event_dates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                datetime TEXT,
+                timezone TEXT NOT NULL,
+                label TEXT NOT NULL,
+                evidence_text TEXT NOT NULL
+            );
+            CREATE TABLE source_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                discovered_count INTEGER NOT NULL,
+                error_summary TEXT
+            );
+            """
+        )
+
+
 def test_storage_initializes_version_one_and_persists_events(tmp_path) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     event = make_event()
 
     storage = SQLiteStorage(db_path)
-    assert storage.schema_version == 1
+    assert storage.schema_version == SCHEMA_VERSION
     event_id = storage.upsert_event(event)
     storage.close()
 
     reopened = SQLiteStorage(db_path)
-    assert reopened.schema_version == 1
+    assert reopened.schema_version == SCHEMA_VERSION
     loaded = reopened.get_event(event_id)
     assert loaded is not None
     assert loaded.title == event.title
@@ -40,7 +84,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 1
+    assert storage.schema_version == SCHEMA_VERSION == 2
     assert storage.count_events() == 0
     storage.close()
 
@@ -59,7 +103,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 1",
+        match=r"schema version 99 is newer than supported version 2",
     ):
         SQLiteStorage(db_path)
 
@@ -109,6 +153,43 @@ def test_storage_preserves_first_discovered_at_on_upsert(tmp_path) -> None:
     assert loaded.title == "Updated competition"
     assert loaded.discovered_at == first_discovered
     assert loaded.updated_at == second_discovered
+    storage.close()
+
+
+def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> None:
+    db_path = tmp_path / "existing-v1.sqlite3"
+    _create_v1_database(db_path)
+    event = make_event(title="Persisted v1 event")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO events(
+                source_key, source_item_key, title, source_url, organizer,
+                event_type, eligibility, status, raw_content_hash,
+                discovered_at, updated_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.source_key,
+                event.source_item_key,
+                event.title,
+                event.source_url,
+                event.organizer,
+                event.event_type,
+                event.eligibility,
+                event.status,
+                event.raw_content_hash,
+                event.discovered_at.isoformat(),
+                event.updated_at.isoformat(),
+                "{}",
+            ),
+        )
+
+    storage = SQLiteStorage(db_path)
+    loaded = storage.get_event(1)
+
+    assert storage.schema_version == SCHEMA_VERSION == 2
+    assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
 

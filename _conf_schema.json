@@ -15,7 +15,7 @@
   "auto_scan_enabled": {
     "type": "bool",
     "default": false,
-    "description": "是否启用自动扫描；Phase 1 默认关闭。"
+    "description": "是否启用自动扫描和提醒；默认关闭。"
   },
   "scan_interval_minutes": {
     "type": "int",
@@ -23,5 +23,74 @@
     "minimum": 5,
     "maximum": 1440,
     "description": "自动扫描间隔，单位为分钟。"
+  },
+  "llm_provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "可选的 LLM provider ID；留空时使用当前会话或宿主默认 provider。"
+  },
+  "extra_event_source_urls": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "可选的同主机通知列表页 URL。"
+  },
+  "auto_publish_events": {
+    "type": "bool",
+    "default": false,
+    "description": "是否将新发现的活动自动发送到已绑定目标；须由管理员预授权。"
+  },
+  "deadline_reminder_days": {
+    "type": "list",
+    "items": {"type": "int"},
+    "default": [7, 3, 1],
+    "description": "DDL 提前提醒天数。"
+  },
+  "deadline_same_day_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否在 DDL 当日提醒。"
+  },
+  "daily_case_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "是否自动发布每日经典案例；需要可用 LLM provider。"
+  },
+  "daily_case_time": {
+    "type": "string",
+    "default": "08:00",
+    "description": "每日案例发布时间（本地时区 HH:MM）。"
+  },
+  "daily_question_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "是否自动发布每日法考风格练习题；需要可用 LLM provider。"
+  },
+  "daily_question_time": {
+    "type": "string",
+    "default": "08:00",
+    "description": "每日练习题发布时间（本地时区 HH:MM）。"
+  },
+  "case_source_court_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用最高人民法院案例列表来源。"
+  },
+  "case_source_spp_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用最高人民检察院案例列表来源。"
+  },
+  "law_update_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "是否启用法律法规更新来源。"
+  },
+  "http_timeout_seconds": {
+    "type": "int",
+    "default": 20,
+    "minimum": 5,
+    "maximum": 120,
+    "description": "单次异步 HTTP 请求超时秒数。"
   }
 }

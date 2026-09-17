@@ -148,3 +148,25 @@ async def test_llm_tools_use_same_service_and_authorization(plugin_module):
     assert recording.status_calls == 1
     assert recording.scan_calls == 1
     assert recording.list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_group_operator_can_bind_current_unified_message_origin(plugin_module):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    response = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=False,
+                sender_id="42",
+                unified_msg_origin="aiocqhttp:group:100",
+                message="/law bind",
+            )
+        )
+    ]
+
+    assert "aiocqhttp:group:100" in response[0]
+    assert plugin.storage.list_targets()[0]["unified_msg_origin"] == (
+        "aiocqhttp:group:100"
+    )
+    await plugin.terminate()

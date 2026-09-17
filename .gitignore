@@ -7,6 +7,9 @@ __pycache__/
 coverage.xml
 htmlcov/
 *.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 *.db
 *.db-wal
 *.db-shm
@@ -15,6 +18,7 @@ logs/
 dist/
 build/
 *.log
+*.tmp
 .DS_Store
 .idea/
 .vscode/

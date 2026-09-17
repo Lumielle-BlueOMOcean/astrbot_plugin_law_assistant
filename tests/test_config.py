@@ -10,6 +10,12 @@ def test_config_defaults_are_safe() -> None:
     assert config.timezone == DEFAULT_TIMEZONE
     assert config.auto_scan_enabled is False
     assert config.scan_interval_minutes == 60
+    assert config.auto_publish_events is False
+    assert config.deadline_reminder_days == (7, 3, 1)
+    assert config.daily_case_enabled is False
+    assert config.daily_question_enabled is False
+    assert config.case_source_court_enabled is True
+    assert config.case_source_spp_enabled is True
 
 
 def test_config_normalizes_operator_ids_without_duplicates() -> None:
@@ -41,3 +47,20 @@ def test_config_uses_default_timezone_for_unknown_timezone() -> None:
     config = PluginConfig.from_mapping({"timezone": "Not/AZone"})
 
     assert config.timezone == DEFAULT_TIMEZONE
+
+
+def test_config_normalizes_extra_sources_and_reminder_days() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "extra_event_source_urls": [
+                " https://example.test/ ",
+                "https://example.test/",
+            ],
+            "deadline_reminder_days": [7, "3", 0, -1, "bad"],
+            "daily_case_time": " 09:30 ",
+        }
+    )
+
+    assert config.extra_event_source_urls == ("https://example.test/",)
+    assert config.deadline_reminder_days == (7, 3)
+    assert config.daily_case_time == "09:30"

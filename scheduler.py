@@ -50,7 +50,10 @@ class LawAssistantScheduler:
         while True:
             await self.sleep(self.interval_minutes * 60)
             try:
-                await self.service.scan_events(trigger="scheduler")
+                if hasattr(self.service, "run_scheduled_jobs"):
+                    await self.service.run_scheduled_jobs()
+                else:
+                    await self.service.scan_events(trigger="scheduler")
             except asyncio.CancelledError:
                 raise
             except Exception:
