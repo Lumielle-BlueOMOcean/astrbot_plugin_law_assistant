@@ -1,0 +1,9 @@
+name: astrbot_plugin_law_assistant
+display_name: 微光·法务助手 / Lumielle Law Assistant
+desc: Phase 1 法律信息助手基础框架，提供状态、扫描、活动列表、SQLite 持久化、来源流水线接口和可选调度基础设施；真实法律信息源与自动发布功能尚未实现。
+version: "0.1.0"
+author: Lumielle-BlueOMOcean
+repo: https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant
+astrbot_version: ">=4.22.0,<5"
+support_platforms:
+  - aiocqhttp

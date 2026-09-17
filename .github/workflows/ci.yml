@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    name: Quality / Unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: python -m pip install pytest pytest-asyncio ruff
+      - name: Compile
+        run: python -m compileall .
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Ruff check
+        run: ruff check .
+      - name: Unit tests
+        run: pytest
+      - name: Diff check
+        run: git diff --check
+
+  astrbot-compatibility:
+    name: AstrBot compatibility (${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 4.22.0
+            commit: 81c7b0f7150485beb6124a7ec524a8d8534e7f6e
+          - version: 4.25.0
+            commit: 02291a3217c92faa0c577bf9d89076949c40954c
+    steps:
+      - name: Check out plugin repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download exact AstrBot source commit
+        env:
+          ASTRBOT_COMMIT: ${{ matrix.commit }}
+        run: |
+          archive="$RUNNER_TEMP/astrbot-$ASTRBOT_COMMIT.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" "https://codeload.github.com/AstrBotDevs/AstrBot/tar.gz/$ASTRBOT_COMMIT"
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "ASTRBOT_SOURCE=$RUNNER_TEMP/AstrBot-$ASTRBOT_COMMIT" >> "$GITHUB_ENV"
+      - name: Install the exact AstrBot source and smoke dependencies
+        run: |
+          python -m pip install "$ASTRBOT_SOURCE"
+          python -m pip install pytest pytest-asyncio ruff
+      - name: Run real loader compatibility smoke
+        run: python tests/compatibility_smoke.py "$ASTRBOT_SOURCE" --commit "${{ matrix.commit }}"

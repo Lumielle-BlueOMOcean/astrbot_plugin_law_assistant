@@ -1,0 +1,27 @@
+{
+  "operator_ids": {
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "description": "除 AstrBot Admin 外，可以私聊控制 Law Assistant 的 QQ 用户 ID。"
+  },
+  "timezone": {
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "description": "活动时间和调度使用的 IANA 时区。"
+  },
+  "auto_scan_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "是否启用自动扫描；Phase 1 默认关闭。"
+  },
+  "scan_interval_minutes": {
+    "type": "int",
+    "default": 60,
+    "minimum": 5,
+    "maximum": 1440,
+    "description": "自动扫描间隔，单位为分钟。"
+  }
+}
