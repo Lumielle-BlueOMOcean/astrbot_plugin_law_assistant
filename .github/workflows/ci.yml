@@ -27,7 +27,7 @@ jobs:
       - name: Unit tests
         run: pytest
       - name: Diff check
-        run: git diff --check
+        run: git show --check --format= HEAD
 
   astrbot-compatibility:
     name: AstrBot compatibility (${{ matrix.version }})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime as DateTime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,64 @@ else:
     from models import EventDate, LegalEvent
 
 SCHEMA_VERSION = 1
+
+
+class UnsupportedSchemaVersionError(RuntimeError):
+    """Raised when a database requires a schema newer than this plugin supports."""
+
+
+def _migrate_0_to_1(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL,
+            source_item_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            organizer TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            eligibility TEXT NOT NULL,
+            status TEXT NOT NULL,
+            raw_content_hash TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(source_key, source_item_key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_dates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            datetime TEXT,
+            timezone TEXT NOT NULL,
+            label TEXT NOT NULL,
+            evidence_text TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            discovered_count INTEGER NOT NULL,
+            error_summary TEXT
+        )
+        """
+    )
+
+
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    0: _migrate_0_to_1,
+}
 
 
 class SQLiteStorage:
@@ -31,52 +90,64 @@ class SQLiteStorage:
         return int(row["value"]) if row else 0
 
     def _initialize_schema(self) -> None:
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS schema_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_key TEXT NOT NULL,
-                source_item_key TEXT NOT NULL,
-                title TEXT NOT NULL,
-                source_url TEXT NOT NULL,
-                organizer TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                eligibility TEXT NOT NULL,
-                status TEXT NOT NULL,
-                raw_content_hash TEXT NOT NULL,
-                discovered_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                metadata_json TEXT NOT NULL,
-                UNIQUE(source_key, source_item_key)
-            );
-            CREATE TABLE IF NOT EXISTS event_dates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL,
-                datetime TEXT,
-                timezone TEXT NOT NULL,
-                label TEXT NOT NULL,
-                evidence_text TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS source_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_key TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                success INTEGER NOT NULL,
-                discovered_count INTEGER NOT NULL,
-                error_summary TEXT
-            );
-            INSERT INTO schema_meta(key, value)
-            VALUES ('version', '1')
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-            """,
-        )
-        self._connection.commit()
+        connection = self._connection
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+            if row is None:
+                current_version = 0
+                connection.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('version', '0')"
+                )
+            else:
+                try:
+                    current_version = int(row["value"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"invalid database schema version: {row['value']!r}"
+                    ) from exc
+
+            if current_version > SCHEMA_VERSION:
+                raise UnsupportedSchemaVersionError(
+                    "database schema version "
+                    f"{current_version} is newer than supported version "
+                    f"{SCHEMA_VERSION}"
+                )
+            if current_version < 0:
+                raise RuntimeError(
+                    f"invalid database schema version: {current_version}"
+                )
+
+            while current_version < SCHEMA_VERSION:
+                migration = _MIGRATIONS.get(current_version)
+                if migration is None:
+                    raise RuntimeError(
+                        "no migration is registered for database schema version "
+                        f"{current_version}"
+                    )
+                migration(connection)
+                next_version = current_version + 1
+                connection.execute(
+                    """
+                    UPDATE schema_meta SET value = ? WHERE key = 'version'
+                    """,
+                    (str(next_version),),
+                )
+                current_version = next_version
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def upsert_event(self, event: LegalEvent) -> int:
         existing = self._connection.execute(
@@ -103,11 +174,22 @@ class SQLiteStorage:
                 """
                 UPDATE events SET title = ?, source_url = ?, organizer = ?,
                     event_type = ?, eligibility = ?, status = ?,
-                    raw_content_hash = ?, discovered_at = ?, updated_at = ?,
+                    raw_content_hash = ?, updated_at = ?,
                     metadata_json = ?
                 WHERE id = ?
                 """,
-                values[2:] + (event_id,),
+                (
+                    values[2],
+                    values[3],
+                    values[4],
+                    values[5],
+                    values[6],
+                    values[7],
+                    values[8],
+                    values[10],
+                    values[11],
+                    event_id,
+                ),
             )
         else:
             cursor = self._connection.execute(
