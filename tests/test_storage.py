@@ -84,7 +84,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 2
+    assert storage.schema_version == SCHEMA_VERSION == 3
     assert storage.count_events() == 0
     storage.close()
 
@@ -103,7 +103,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 2",
+        match=r"schema version 99 is newer than supported version 3",
     ):
         SQLiteStorage(db_path)
 
@@ -188,8 +188,55 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 2
+    assert storage.schema_version == SCHEMA_VERSION == 3
     assert loaded is not None and loaded.title == "Persisted v1 event"
+    storage.close()
+
+
+def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_history(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "existing-v2.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key, value) VALUES ('version', '2');
+            CREATE TABLE events (id INTEGER PRIMARY KEY, source_key TEXT NOT NULL,
+                source_item_key TEXT NOT NULL, UNIQUE(source_key, source_item_key));
+            CREATE TABLE event_dates (id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, datetime TEXT, timezone TEXT NOT NULL,
+                label TEXT NOT NULL, evidence_text TEXT NOT NULL, confirmed INTEGER NOT NULL);
+            CREATE TABLE publish_targets (id INTEGER PRIMARY KEY, unified_msg_origin TEXT NOT NULL);
+            CREATE TABLE reminders (
+                id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL,
+                event_date_id INTEGER NOT NULL, deadline_value TEXT NOT NULL,
+                target_id INTEGER NOT NULL, reminder_offset INTEGER NOT NULL,
+                status TEXT NOT NULL, attempted_at TEXT NOT NULL,
+                finished_at TEXT, error_summary TEXT
+            );
+            INSERT INTO events(id, source_key, source_item_key)
+                VALUES (1, 'fake', 'item-1');
+            INSERT INTO event_dates(id, event_id, kind, datetime, timezone, label,
+                evidence_text, confirmed)
+                VALUES (10, 1, 'submission_deadline', '2026-10-08T10:00:00+00:00',
+                    'UTC', '投稿截止', '官方原文', 1);
+            INSERT INTO publish_targets(id, unified_msg_origin)
+                VALUES (20, 'aiocqhttp:group:100');
+            INSERT INTO reminders(id, event_id, event_date_id, deadline_value,
+                target_id, reminder_offset, status, attempted_at, finished_at)
+                VALUES (30, 1, 10, '2026-10-08T10:00:00+00:00', 20, 7, 'sent',
+                    '2026-10-01T10:00:00+00:00', '2026-10-01T10:00:01+00:00');
+            """
+        )
+
+    storage = SQLiteStorage(db_path)
+
+    reminder = storage.list_reminders()[0]
+    assert storage.schema_version == SCHEMA_VERSION == 3
+    assert reminder["date_kind"] == "submission_deadline"
+    assert reminder["status"] == "sent"
+    assert "event_date_id" not in reminder
     storage.close()
 
 

@@ -108,6 +108,49 @@ async def test_case_adapter_and_extractors_preserve_authority_and_source() -> No
     assert "产权" in item.raw_text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "authority", "index_url", "index_fixture", "detail_urls", "detail_fixture"),
+    [
+        (
+            "court_cases",
+            "最高人民法院",
+            "https://www.court.gov.cn/zixun/gengduo/104.html",
+            "court_cases_index.html",
+            [
+                "https://www.court.gov.cn/zixun/xiangqing/123456.html",
+                "https://www.court.gov.cn/zixun/xiangqing/123457.html",
+            ],
+            "court_case.html",
+        ),
+        (
+            "spp_cases",
+            "最高人民检察院",
+            "https://www.spp.gov.cn/spp/zgjdxal/",
+            "spp_cases_index.html",
+            [
+                "https://www.spp.gov.cn/spp/xwfbh/202609/t20260917_123456.shtml",
+                "https://www.spp.gov.cn/spp/xwfbh/202609/t20260916_123457.shtml",
+            ],
+            "spp_case.html",
+        ),
+    ],
+)
+async def test_official_case_adapters_filter_navigation_links(
+    key, authority, index_url, index_fixture, detail_urls, detail_fixture
+) -> None:
+    pages = {index_url: (fixture_text(index_fixture), "text/html")}
+    pages.update(
+        {url: (fixture_text(detail_fixture), "text/html") for url in detail_urls}
+    )
+    http = FakeHttp(pages)
+
+    documents = await CaseSourceAdapter(key, authority, index_url, http).fetch()
+
+    assert [document.url for document in documents] == detail_urls
+    assert http.calls == [index_url, *detail_urls]
+
+
 def test_law_update_extractor_returns_structured_update() -> None:
     document = SourceDocument(
         source_key="npc_laws",

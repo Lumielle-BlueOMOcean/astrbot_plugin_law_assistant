@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 if __package__ and "." in __package__:
     from ..date_parser import extract_publication_datetime
@@ -28,6 +29,20 @@ class CaseSourceAdapter(GenericEventSourceAdapter):
     ):
         super().__init__(key, index_url, http, max_items=max_items)
         self.authority = authority
+
+    def _is_candidate_link(self, link: Any) -> bool:
+        """Keep official list navigation out of the case detail fetch set."""
+        host = urlparse(link.url).netloc.lower()
+        if host == "www.court.gov.cn":
+            return bool(
+                re.fullmatch(r"/zixun/xiangqing/\d+\.html", urlparse(link.url).path)
+            )
+        if host == "www.spp.gov.cn":
+            path = urlparse(link.url).path
+            if re.fullmatch(r"/spp/zgjdxal(?:/index(?:_\d+)?\.s?html)?/?", path):
+                return False
+            return any(marker in link.title for marker in ("典型案例", "典型事例"))
+        return True
 
 
 class CaseDetailExtractor:

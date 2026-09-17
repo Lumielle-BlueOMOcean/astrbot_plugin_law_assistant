@@ -62,7 +62,8 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 
 - `operator_ids`：可私聊执行管理操作的 QQ 用户 ID；AstrBot Admin 同样有效。
 - `timezone`：默认 `Asia/Shanghai`。
-- `auto_scan_enabled`：默认 `false`；开启后 scheduler 扫描、案例/法规来源和提醒。
+- `auto_scan_enabled`：默认 `false`；开启后 scheduler 扫描活动、案例/法规来源和提醒。
+- `daily_case_enabled` / `daily_question_enabled`：独立开启每日案例或每日题 scheduler；不要求同时开启活动扫描。
 - `extra_event_source_urls`：可选活动通知列表页。
 - `case_source_court_enabled` / `case_source_spp_enabled`：官方案例来源开关。
 - `law_update_enabled`：法规更新来源开关，默认关闭。

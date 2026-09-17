@@ -93,11 +93,14 @@ def plugin_module(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_plugin_import_lifecycle_and_entrypoint_registration(plugin_module):
-    plugin = plugin_module.LawAssistant(None, {"auto_scan_enabled": False})
+    plugin = plugin_module.LawAssistant(
+        None, {"auto_scan_enabled": False, "daily_case_enabled": True}
+    )
 
     await plugin.initialize()
     await plugin.terminate()
 
+    assert plugin.scheduler.enabled is True
     assert plugin_module.LawAssistant.law._fake_command == "law"
     assert plugin_module.LawAssistant.law_status._fake_llm_tool == "law_status"
     assert (

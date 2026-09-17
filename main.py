@@ -141,7 +141,12 @@ class LawAssistant(Star):
         )
         self.scheduler = LawAssistantScheduler(
             self.service,
-            enabled=self.plugin_config.auto_scan_enabled,
+            enabled=(
+                self.plugin_config.auto_scan_enabled
+                or self.plugin_config.daily_case_enabled
+                or self.plugin_config.daily_question_enabled
+                or self.plugin_config.law_update_enabled
+            ),
             interval_minutes=self.plugin_config.scan_interval_minutes,
             logger=logger,
         )

@@ -159,6 +159,121 @@ async def test_unchanged_source_document_skips_duplicate_extraction(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_failed_event_processing_does_not_consume_new_source_hash(
+    tmp_path,
+) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    old_document = SourceDocument(
+        source_key="fake",
+        source_item_key="item-1",
+        url="https://example.test/item-1",
+        title="Old document",
+        content="old content",
+        fetched_at="2026-09-16T00:00:00+00:00",
+    )
+    storage.upsert_source_document(old_document)
+    storage.upsert_event(make_event())
+    new_document = document("fake", "item-1")
+
+    class RetryExtractor:
+        calls = 0
+
+        async def extract(self, source_document):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary extraction failure")
+            return [
+                replace(
+                    make_event(title="Recovered event"),
+                    raw_content_hash=source_document.content_hash,
+                )
+            ]
+
+    extractor = RetryExtractor()
+    service = LawAssistantService(
+        storage,
+        sources=[(FakeAdapter("fake", [new_document]), extractor)],
+    )
+
+    first = await service.scan_events()
+    assert len(first.failures) == 1
+    assert storage.get_source_document("fake", "item-1").content_hash == (
+        old_document.content_hash
+    )
+
+    second = await service.scan_events()
+
+    assert second.failures == ()
+    assert extractor.calls == 2
+    assert storage.get_source_document("fake", "item-1").content_hash == (
+        new_document.content_hash
+    )
+    assert storage.get_event_by_key("fake", "item-1").title == "Recovered event"
+
+
+@pytest.mark.asyncio
+async def test_failed_secondary_processing_can_retry_same_source_hash(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    old_document = SourceDocument(
+        source_key="court_cases",
+        source_item_key="case-1",
+        url="https://court.example/case-1",
+        title="Old case",
+        content="old case content",
+        fetched_at="2026-09-16T00:00:00+00:00",
+    )
+    storage.upsert_source_document(old_document)
+    new_document = SourceDocument(
+        source_key="court_cases",
+        source_item_key="case-1",
+        url="https://court.example/case-1",
+        title="New case",
+        content="new case content",
+        fetched_at="2026-09-17T00:00:00+00:00",
+    )
+
+    class RetryCaseExtractor:
+        calls = 0
+
+        async def extract(self, source_document):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary case extraction failure")
+            return CaseItem(
+                source_key=source_document.source_key,
+                source_item_key=source_document.source_item_key,
+                title="Recovered case",
+                source_url=source_document.url,
+                authority="最高人民法院",
+                raw_text=source_document.content,
+                content_hash=source_document.content_hash,
+                discovered_at=source_document.fetched_at,
+                last_seen_at=source_document.fetched_at,
+            )
+
+    extractor = RetryCaseExtractor()
+    service = LawAssistantService(
+        storage,
+        case_sources=[(FakeAdapter("court_cases", [new_document]), extractor)],
+    )
+
+    first = await service.scan_cases()
+    assert len(first["failures"]) == 1
+    assert storage.get_source_document("court_cases", "case-1").content_hash == (
+        old_document.content_hash
+    )
+
+    second = await service.scan_cases()
+
+    assert second["failures"] == []
+    assert extractor.calls == 2
+    assert storage.get_source_document("court_cases", "case-1").content_hash == (
+        new_document.content_hash
+    )
+    assert storage.list_case_items()[0].title == "Recovered case"
+
+
+@pytest.mark.asyncio
 async def test_publish_requires_confirmation_and_is_idempotent(tmp_path) -> None:
     now = datetime(2026, 10, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
     publisher = RecordingPublisher()
@@ -175,19 +290,33 @@ async def test_publish_requires_confirmation_and_is_idempotent(tmp_path) -> None
                         2026, 10, 8, 18, tzinfo=ZoneInfo("Asia/Shanghai")
                     ),
                 ),
+                replace(
+                    make_event().dates[0],
+                    kind="other",
+                    label="未确认辅助时间",
+                    confirmed=False,
+                ),
             ),
         )
     )
-    service = LawAssistantService(storage, publisher=publisher, clock=lambda: now)
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        config=SimpleNamespace(auto_publish_events=True),
+        clock=lambda: now,
+    )
     await service.bind_target("aiocqhttp:group:100", "测试群")
 
     preview = await service.prepare_publish_event(event_id)
     assert preview["ready"] is True
+    assert "未确认辅助时间" not in preview["preview"]
     assert publisher.calls == []
     assert (await service.confirm_publish(preview["token"]))["success"] is True
     assert (await service.confirm_publish(preview["token"]))["success"] is False
     assert len(publisher.calls) == 1
     assert len(storage.list_publications()) == 1
+    assert await service._publish_event_to_targets(event_id, kind="automatic") == 1
+    assert len(publisher.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -216,6 +345,62 @@ async def test_deadline_reminder_is_sent_once_per_day_and_target(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_deadline_reminder_survives_unrelated_event_revision(tmp_path) -> None:
+    now = datetime(2026, 10, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    event = replace(
+        make_event(),
+        discovered_at=now,
+        updated_at=now,
+        dates=(replace(make_event().dates[0], datetime=now),),
+    )
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    event_id = storage.upsert_event(event)
+    publisher = RecordingPublisher()
+    service = LawAssistantService(storage, publisher=publisher, clock=lambda: now)
+    await service.bind_target("aiocqhttp:group:100", "测试群")
+
+    assert await service.check_deadline_reminders(now=now) == 1
+    revised = replace(event, title="Updated title", updated_at=now)
+    storage.upsert_event(revised)
+
+    assert storage.get_event(event_id).revision == 2
+    assert await service.check_deadline_reminders(now=now) == 0
+    assert len(storage.list_reminders()) == 1
+    assert len(publisher.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_deadline_creates_new_reminder_identity(tmp_path) -> None:
+    now = datetime(2026, 10, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    first_date = replace(make_event().dates[0], datetime=now)
+    event = replace(
+        make_event(), discovered_at=now, updated_at=now, dates=(first_date,)
+    )
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    event_id = storage.upsert_event(event)
+    publisher = RecordingPublisher()
+    service = LawAssistantService(storage, publisher=publisher, clock=lambda: now)
+    await service.bind_target("aiocqhttp:group:100", "测试群")
+
+    assert await service.check_deadline_reminders(now=now) == 1
+    changed = replace(
+        event,
+        dates=(replace(first_date, datetime=now.replace(day=2)),),
+        updated_at=now,
+    )
+    storage.upsert_event(changed)
+
+    assert storage.get_event(event_id).revision == 2
+    assert await service.check_deadline_reminders(now=now) == 1
+    reminders = storage.list_reminders()
+    assert len(reminders) == 2
+    assert {item["deadline_value"] for item in reminders} == {
+        now.isoformat(),
+        now.replace(day=2).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
 async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) -> None:
     now = datetime(2026, 10, 1, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
     storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
@@ -240,6 +425,7 @@ async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) ->
 
     config = SimpleNamespace(
         timezone="Asia/Shanghai",
+        auto_scan_enabled=False,
         daily_case_enabled=True,
         daily_case_time="08:00",
         daily_question_enabled=False,
@@ -252,6 +438,11 @@ async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) ->
         config=config,
         clock=lambda: now,
     )
+
+    async def unexpected_event_scan(*args, **kwargs):
+        raise AssertionError("daily case must not force an event scan")
+
+    service.scan_events = unexpected_event_scan
     await service.bind_target("aiocqhttp:group:100", "测试群")
 
     first = await service.run_scheduled_jobs(now=now)
@@ -259,4 +450,5 @@ async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) ->
 
     assert first["daily_case_sent"] == 1
     assert second["daily_case_sent"] == 0
+    assert "events" not in first
     assert len(storage.list_daily_contents()) == 1

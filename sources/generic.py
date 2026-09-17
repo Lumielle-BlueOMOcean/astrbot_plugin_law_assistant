@@ -41,6 +41,8 @@ class GenericEventSourceAdapter:
                 continue
             if link.url.rstrip("/") == self.index_url.rstrip("/"):
                 continue
+            if not self._is_candidate_link(link):
+                continue
             seen.add(link.url)
             if len(documents) >= self.max_items:
                 break
@@ -67,6 +69,10 @@ class GenericEventSourceAdapter:
                 )
             )
         return documents
+
+    def _is_candidate_link(self, link: Any) -> bool:
+        """Allow a specialized source to exclude navigation links."""
+        return True
 
 
 def _generic_item_key(url: str) -> str:

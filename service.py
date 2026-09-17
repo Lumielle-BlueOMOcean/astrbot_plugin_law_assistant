@@ -120,7 +120,6 @@ class LawAssistantService:
                         existing = self.storage.get_event_by_key(
                             document.source_key, document.source_item_key
                         )
-                        self.storage.upsert_source_document(document)
                         if (
                             prior is not None
                             and prior.content_hash == document.content_hash
@@ -169,6 +168,9 @@ class LawAssistantService:
                                 )
                             upserted_count += 1
                             source_discovered += 1
+                        # A document becomes the processed baseline only after its
+                        # full extraction, validation, and event writes succeed.
+                        self.storage.upsert_source_document(document)
                     discovered_count += source_discovered
                     self.storage.record_source_run(
                         source_key=source_key,
@@ -239,13 +241,15 @@ class LawAssistantService:
                         previous = self.storage.get_source_document(
                             document.source_key, document.source_item_key
                         )
-                        self.storage.upsert_source_document(document)
                         if previous and previous.content_hash == document.content_hash:
                             continue
                         item = await _maybe_await(extractor.extract(document))
                         if item is not None:
                             handler(item)
                             count += 1
+                        # Keep the last successfully processed document so a failed
+                        # extraction can be retried on the next scan.
+                        self.storage.upsert_source_document(document)
                     total += count
                     self.storage.record_source_run(
                         source_key=key,
@@ -347,10 +351,8 @@ class LawAssistantService:
         event = self.storage.get_event(event_id)
         if event is None:
             return {"ready": False, "reason": "event not found"}
-        if not event.source_url or any(
-            date.datetime is None or not date.confirmed for date in event.dates
-        ):
-            return {"ready": False, "reason": "事件缺少可验证的来源或时间证据"}
+        if not event.source_url:
+            return {"ready": False, "reason": "事件缺少可验证的来源"}
         targets = self.storage.list_targets(enabled_only=True)
         if not targets:
             return {"ready": False, "reason": "尚未绑定发布目标"}
@@ -384,8 +386,12 @@ class LawAssistantService:
             return 0
         if kind == "automatic" and (
             event.status.upper() in {"CLOSED", "UNKNOWN"}
-            or not event.dates
-            or any(not date.confirmed for date in event.dates)
+            or not any(
+                date.confirmed
+                and date.datetime is not None
+                and date.kind in {"registration_deadline", "submission_deadline"}
+                for date in event.dates
+            )
         ):
             return 0
         count = 0
@@ -434,7 +440,7 @@ class LawAssistantService:
             for target in self.storage.list_targets(enabled_only=True):
                 reminder_id = self.storage.claim_reminder(
                     event_id=event.id,
-                    event_date_id=date.id,
+                    date_kind=date.kind,
                     deadline_value=date.datetime.isoformat(),
                     target_id=target["id"],
                     reminder_offset=remaining,
@@ -481,16 +487,23 @@ class LawAssistantService:
     async def run_scheduled_jobs(
         self, *, now: datetime | None = None
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"events": await self.scan_events(trigger="scheduler")}
-        if self.case_sources:
+        auto_scan_enabled = bool(getattr(self.config, "auto_scan_enabled", False))
+        daily_case_enabled = bool(getattr(self.config, "daily_case_enabled", False))
+        law_update_enabled = bool(getattr(self.config, "law_update_enabled", False))
+        result: dict[str, Any] = {}
+        if auto_scan_enabled:
+            result["events"] = await self.scan_events(trigger="scheduler")
+        if self.case_sources and (auto_scan_enabled or daily_case_enabled):
             result["cases"] = await self.scan_cases(trigger="scheduler")
-        if self.law_sources:
+        if self.law_sources and law_update_enabled:
             result["law_updates"] = await self.scan_law_updates(trigger="scheduler")
         current = now or self.clock()
-        result["reminders_sent"] = await self.check_deadline_reminders(now=current)
+        result["reminders_sent"] = (
+            await self.check_deadline_reminders(now=current) if auto_scan_enabled else 0
+        )
         result["daily_case_sent"] = await self._run_daily_content(
             content_type="daily_case",
-            enabled=bool(getattr(self.config, "daily_case_enabled", False)),
+            enabled=daily_case_enabled,
             configured_time=str(getattr(self.config, "daily_case_time", "08:00")),
             now=current,
         )

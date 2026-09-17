@@ -14,7 +14,7 @@ if __package__ and "." in __package__:
 else:
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -234,9 +234,66 @@ def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_2_to_3(connection: sqlite3.Connection) -> None:
+    """Move reminder identity from replaceable event-date rows to logical values."""
+    connection.execute("ALTER TABLE reminders RENAME TO reminders_v2")
+    connection.execute(
+        """
+        CREATE TABLE reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            date_kind TEXT NOT NULL,
+            deadline_value TEXT NOT NULL,
+            target_id INTEGER NOT NULL REFERENCES publish_targets(id),
+            reminder_offset INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            finished_at TEXT,
+            error_summary TEXT,
+            UNIQUE(event_id, date_kind, deadline_value, target_id, reminder_offset)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO reminders(
+            event_id, date_kind, deadline_value, target_id, reminder_offset,
+            status, attempted_at, finished_at, error_summary
+        )
+        SELECT old.event_id, date.kind, old.deadline_value, old.target_id,
+            old.reminder_offset, old.status, old.attempted_at, old.finished_at,
+            old.error_summary
+        FROM reminders_v2 AS old
+        JOIN event_dates AS date ON date.id = old.event_date_id
+        ON CONFLICT(event_id, date_kind, deadline_value, target_id, reminder_offset)
+        DO UPDATE SET
+            status = CASE
+                WHEN reminders.status = 'sent' OR excluded.status = 'sent'
+                THEN 'sent'
+                ELSE excluded.status
+            END,
+            attempted_at = CASE
+                WHEN excluded.attempted_at > reminders.attempted_at
+                THEN excluded.attempted_at
+                ELSE reminders.attempted_at
+            END,
+            finished_at = CASE
+                WHEN reminders.status = 'sent' THEN reminders.finished_at
+                ELSE excluded.finished_at
+            END,
+            error_summary = CASE
+                WHEN reminders.status = 'sent' THEN reminders.error_summary
+                ELSE excluded.error_summary
+            END
+        """
+    )
+    connection.execute("DROP TABLE reminders_v2")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
+    2: _migrate_2_to_3,
 }
 
 
@@ -778,7 +835,7 @@ class SQLiteStorage:
         self,
         *,
         event_id: int,
-        event_date_id: int,
+        date_kind: str,
         deadline_value: str,
         target_id: int,
         reminder_offset: int,
@@ -786,13 +843,13 @@ class SQLiteStorage:
         cursor = self._connection.execute(
             """
             INSERT OR IGNORE INTO reminders(
-                event_id, event_date_id, deadline_value, target_id,
+                event_id, date_kind, deadline_value, target_id,
                 reminder_offset, status, attempted_at
             ) VALUES (?, ?, ?, ?, ?, 'claimed', ?)
             """,
             (
                 event_id,
-                event_date_id,
+                date_kind,
                 deadline_value,
                 target_id,
                 reminder_offset,
