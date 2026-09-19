@@ -146,6 +146,10 @@ class LawAssistant(Star):
                 or self.plugin_config.daily_case_enabled
                 or self.plugin_config.daily_question_enabled
                 or self.plugin_config.law_update_enabled
+                or any(
+                    bool(item.get("enabled"))
+                    for item in self.storage.list_daily_plans()
+                )
             ),
             interval_minutes=self.plugin_config.scan_interval_minutes,
             logger=logger,
@@ -214,19 +218,50 @@ class LawAssistant(Star):
             )
         elif subcommand == "publish" and len(parts) > 2:
             text = _json_text(
-                await self.service.prepare_publish_event(_safe_int(parts[2]))
+                await self.service.prepare_publish_event(
+                    _safe_int(parts[2]),
+                    _split_targets(" ".join(parts[3:])),
+                    actor_id=str(event.get_sender_id()),
+                )
             )
         elif subcommand == "confirm" and len(parts) > 2:
-            text = _json_text(await self.service.confirm_publish(parts[2]))
+            text = _json_text(
+                await self.service.confirm_publish(
+                    parts[2], actor_id=str(event.get_sender_id())
+                )
+            )
         elif subcommand == "case":
             text = _json_text(
-                await self.service.get_daily_case(session_origin=_session_origin(event))
+                await self.service.get_daily_case(
+                    subject=" ".join(parts[2:]) or None,
+                    session_origin=_session_origin(event),
+                )
             )
         elif subcommand == "question":
+            origin, subject, question_type = _parse_question_args(parts[2:])
             text = _json_text(
                 await self.service.generate_question(
-                    " ".join(parts[2:]), session_origin=_session_origin(event)
+                    subject or "",
+                    origin=origin,
+                    question_type=question_type,
+                    session_origin=_session_origin(event),
                 )
+            )
+        elif subcommand in {"plans", "plan"}:
+            selector = " ".join(parts[2:]).strip()
+            try:
+                text = _json_text(
+                    await self.service.list_daily_plans(
+                        _split_targets(selector) if selector else None
+                    )
+                )
+            except ValueError as exc:
+                text = str(exc)
+        elif subcommand in {"question-import", "import-questions"} and len(parts) > 2:
+            text = _json_text(await self.service.import_real_questions_file(parts[2]))
+        elif subcommand == "case-tag" and len(parts) > 2:
+            text = _json_text(
+                await self.service.set_case_subjects(_safe_int(parts[2]), parts[3:])
             )
         elif subcommand == "laws":
             text = _json_text(await self.service.list_law_updates())
@@ -286,28 +321,203 @@ class LawAssistant(Star):
         return _json_text(await self.service.list_deadlines(limit=limit))
 
     @filter.llm_tool(name="law_get_daily_case")
-    async def law_get_daily_case(self, event: AstrMessageEvent) -> str:
+    async def law_get_daily_case(
+        self, event: AstrMessageEvent, subject: str = ""
+    ) -> str:
         """基于已保存官方案例生成今日案例学习内容。"""
         if not self._authorized(event):
             return self._denial(event)
         return _json_text(
-            await self.service.get_daily_case(session_origin=_session_origin(event))
+            await self.service.get_daily_case(
+                subject=subject or None, session_origin=_session_origin(event)
+            )
         )
 
     @filter.llm_tool(name="law_generate_question")
     async def law_generate_question(
-        self, event: AstrMessageEvent, subject: str = ""
+        self,
+        event: AstrMessageEvent,
+        subject: str = "",
+        origin: str = "random",
+        question_type: str = "",
     ) -> str:
-        """生成一道法律学习题；题目会明确标注为练习，不构成法律意见。
+        """按来源、方向和题型获取一道题目；真题只来自已核验题库。
 
         Args:
-            subject(string): 可选法律学习主题。
+            subject(string): 可选方向，如刑法、民商法、知识产权。
+            origin(string): real、mock 或 random，默认 random。
+            question_type(string): 单选、多选、判断、简答或案例分析；留空随机。
         """
         if not self._authorized(event):
             return self._denial(event)
         return _json_text(
             await self.service.generate_question(
-                subject, session_origin=_session_origin(event)
+                subject,
+                origin=origin,
+                question_type=question_type or None,
+                session_origin=_session_origin(event),
+            )
+        )
+
+    @filter.llm_tool(name="law_question_inventory")
+    async def law_question_inventory(self, event: AstrMessageEvent) -> str:
+        """查询已导入且已核验真题的数量、方向和题型覆盖。"""
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(await self.service.question_inventory())
+
+    @filter.llm_tool(name="law_list_targets")
+    async def law_list_targets(self, event: AstrMessageEvent) -> str:
+        """列出可定向发布的已启用群目标及其人类可读名称。"""
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(await self.service.list_targets())
+
+    @filter.llm_tool(name="law_get_daily_plans")
+    async def law_get_daily_plans(
+        self, event: AstrMessageEvent, target: str = "", days: int = 7
+    ) -> str:
+        """查看全局默认和群级每日案例/每日一题计划及未来安排。
+
+        Args:
+            target(string): 可选群名或目标 ID；留空查看全部已绑定群。
+            days(number): 预览天数，默认 7。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        try:
+            result = await self.service.list_daily_plans(
+                _split_targets(target) if target else None, days=days
+            )
+        except ValueError as exc:
+            return str(exc)
+        return _json_text(result)
+
+    @filter.llm_tool(name="law_prepare_publish_question")
+    async def law_prepare_publish_question(
+        self,
+        event: AstrMessageEvent,
+        origin: str = "random",
+        subject: str = "",
+        question_type: str = "",
+        target: str = "",
+    ) -> str:
+        """生成并预览一题后定向发布；必须用 law_confirm_publish 明确确认。
+
+        Args:
+            origin(string): real、mock 或 random。
+            subject(string): 方向，可用中文名称。
+            question_type(string): 题型；留空随机。
+            target(string): 群名、目标 ID，或用逗号分隔的多个群；留空时仅有一个群才自动选择。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.prepare_publish_question(
+                origin=origin,
+                subject=subject or None,
+                question_type=question_type or None,
+                target_selectors=_split_targets(target) if target else None,
+                session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
+            )
+        )
+
+    @filter.llm_tool(name="law_prepare_publish_case")
+    async def law_prepare_publish_case(
+        self, event: AstrMessageEvent, subject: str = "", target: str = ""
+    ) -> str:
+        """按方向选择官方案例并预览定向发布；必须明确确认。
+
+        Args:
+            subject(string): 可选案例方向。
+            target(string): 群名、目标 ID，或逗号分隔的多个群。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.prepare_publish_case(
+                subject=subject or None,
+                target_selectors=_split_targets(target) if target else None,
+                session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
+            )
+        )
+
+    @filter.llm_tool(name="law_prepare_daily_plan_update")
+    async def law_prepare_daily_plan_update(
+        self,
+        event: AstrMessageEvent,
+        scope: str = "target",
+        target: str = "",
+        content_type: str = "both",
+        enabled: str = "",
+        time: str = "",
+        selection_mode: str = "",
+        fixed_subject: str = "",
+        rotation_subjects: str = "",
+        rotation_start_date: str = "",
+        rotation_start_index: int = -1,
+        question_origin: str = "",
+        question_type: str = "",
+    ) -> str:
+        """预览每日案例/每日一题长期计划变更；必须随后明确确认。
+
+        Args:
+            scope(string): target 修改单个群，global 修改全局默认。
+            target(string): 群名或目标 ID；scope=target 时必填，单群时可留空。
+            content_type(string): daily_case、daily_question 或 both。
+            enabled(string): true/false；留空保持原值。
+            time(string): HH:MM；留空保持原值。
+            selection_mode(string): random、fixed 或 rotation；留空保持原值。
+            fixed_subject(string): fixed 模式方向。
+            rotation_subjects(string): 用逗号、顿号或“和”分隔的有序方向列表；也可填“学校四方向”。
+            rotation_start_date(string): YYYY-MM-DD。
+            rotation_start_index(number): 起始位置；负数保持原值。
+            question_origin(string): real、mock 或 random。
+            question_type(string): 题型；留空保持原值。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        changes: dict[str, Any] = {}
+        if enabled.strip():
+            changes["enabled"] = enabled.strip().lower() in {"1", "true", "yes", "on"}
+        for key, value in {
+            "time": time,
+            "selection_mode": selection_mode,
+            "fixed_subject": fixed_subject,
+            "rotation_start_date": rotation_start_date,
+            "question_origin": question_origin,
+            "question_type": question_type,
+        }.items():
+            if value.strip():
+                changes[key] = value.strip()
+        if rotation_subjects.strip():
+            changes["rotation_subjects"] = _split_targets(rotation_subjects)
+        if rotation_start_index >= 0:
+            changes["rotation_start_index"] = rotation_start_index
+        try:
+            result = await self.service.prepare_daily_plan_update(
+                target_selectors=_split_targets(target) if target else None,
+                global_scope=scope.strip().lower() == "global",
+                content_type=content_type.strip() or "both",
+                changes=changes,
+                actor_id=str(event.get_sender_id()),
+            )
+        except ValueError as exc:
+            return str(exc)
+        return _json_text(result)
+
+    @filter.llm_tool(name="law_confirm_daily_plan_update")
+    async def law_confirm_daily_plan_update(
+        self, event: AstrMessageEvent, token: str
+    ) -> str:
+        """确认并保存 law_prepare_daily_plan_update 返回的计划变更 token。"""
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.confirm_daily_plan_update(
+                token, actor_id=str(event.get_sender_id())
             )
         )
 
@@ -326,16 +536,23 @@ class LawAssistant(Star):
 
     @filter.llm_tool(name="law_prepare_publish_event")
     async def law_prepare_publish_event(
-        self, event: AstrMessageEvent, event_id: int
+        self, event: AstrMessageEvent, event_id: int, target: str = ""
     ) -> str:
         """准备一条活动发布预览，必须随后明确确认才会发送。
 
         Args:
             event_id(number): 要预览的活动内部 ID。
+            target(string): 可选群名、目标 ID，或逗号分隔的多个群。
         """
         if not self._authorized(event):
             return self._denial(event)
-        return _json_text(await self.service.prepare_publish_event(event_id))
+        return _json_text(
+            await self.service.prepare_publish_event(
+                event_id,
+                _split_targets(target) if target else None,
+                actor_id=str(event.get_sender_id()),
+            )
+        )
 
     @filter.llm_tool(name="law_confirm_publish")
     async def law_confirm_publish(self, event: AstrMessageEvent, token: str) -> str:
@@ -346,7 +563,11 @@ class LawAssistant(Star):
         """
         if not self._authorized(event):
             return self._denial(event)
-        return _json_text(await self.service.confirm_publish(token))
+        return _json_text(
+            await self.service.confirm_publish(
+                token, actor_id=str(event.get_sender_id())
+            )
+        )
 
     @staticmethod
     def _scan_dict(result: ScanResult) -> dict[str, Any]:
@@ -392,8 +613,9 @@ class LawAssistant(Star):
     def _help_text() -> str:
         return (
             "用法：/law status、/law scan、/law events、/law deadlines、"
-            "/law case、/law question、/law bind、/law publish <id>、"
-            "/law confirm <token>、/law help"
+            "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
+            "/law targets、/law plans、/law question-import <JSON路径>、"
+            "/law bind、/law publish <id> [群名]、/law confirm <token>、/law help"
         )
 
 
@@ -417,6 +639,40 @@ def _safe_int(value: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         return -1
+
+
+def _split_targets(value: str) -> list[str]:
+    return [
+        item.strip()
+        for item in value.replace("，", ",")
+        .replace("、", ",")
+        .replace("和", ",")
+        .split(",")
+        if item.strip()
+    ]
+
+
+def _parse_question_args(parts: list[str]) -> tuple[str, str, str | None]:
+    try:
+        from .content import normalize_question_type, normalize_subject
+    except ImportError:
+        from content import normalize_question_type, normalize_subject
+
+    origin = "random"
+    subject = ""
+    question_type: str | None = None
+    for part in parts:
+        candidate = part.strip().lower()
+        if candidate in {"real", "mock", "random"}:
+            origin = candidate
+            continue
+        normalized_type = normalize_question_type(part)
+        if normalized_type:
+            question_type = normalized_type
+            continue
+        if normalize_subject(part):
+            subject = part
+    return origin, subject, question_type
 
 
 def _event_dict(event: Any) -> dict[str, Any]:

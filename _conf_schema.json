@@ -61,6 +61,33 @@
     "default": "08:00",
     "description": "每日案例发布时间（本地时区 HH:MM）。"
   },
+  "daily_case_selection_mode": {
+    "type": "string",
+    "default": "random",
+    "description": "每日案例方向模式：random、fixed 或 rotation。"
+  },
+  "daily_case_subject": {
+    "type": "string",
+    "default": "",
+    "description": "每日案例固定方向；留空表示随机或使用轮换列表。"
+  },
+  "daily_case_rotation_subjects": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "每日案例轮换方向的有序列表。"
+  },
+  "daily_case_rotation_start_date": {
+    "type": "string",
+    "default": "",
+    "description": "每日案例轮换起始日期 YYYY-MM-DD。"
+  },
+  "daily_case_rotation_start_index": {
+    "type": "int",
+    "default": 0,
+    "minimum": 0,
+    "description": "每日案例轮换的起始位置。"
+  },
   "daily_question_enabled": {
     "type": "bool",
     "default": false,
@@ -70,6 +97,43 @@
     "type": "string",
     "default": "08:00",
     "description": "每日练习题发布时间（本地时区 HH:MM）。"
+  },
+  "daily_question_selection_mode": {
+    "type": "string",
+    "default": "random",
+    "description": "每日一题方向模式：random、fixed 或 rotation。"
+  },
+  "daily_question_origin": {
+    "type": "string",
+    "default": "random",
+    "description": "每日一题来源：real、mock 或 random。真题必须来自已核验题库。"
+  },
+  "daily_question_subject": {
+    "type": "string",
+    "default": "",
+    "description": "每日一题固定方向；留空表示随机或使用轮换列表。"
+  },
+  "daily_question_type": {
+    "type": "string",
+    "default": "",
+    "description": "每日一题题型；留空表示随机。"
+  },
+  "daily_question_rotation_subjects": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "每日一题轮换方向的有序列表。"
+  },
+  "daily_question_rotation_start_date": {
+    "type": "string",
+    "default": "",
+    "description": "每日一题轮换起始日期 YYYY-MM-DD。"
+  },
+  "daily_question_rotation_start_index": {
+    "type": "int",
+    "default": 0,
+    "minimum": 0,
+    "description": "每日一题轮换的起始位置。"
   },
   "case_source_court_enabled": {
     "type": "bool",

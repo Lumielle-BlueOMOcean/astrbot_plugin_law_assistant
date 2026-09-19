@@ -68,7 +68,15 @@ class CaseDetailExtractor:
             published_at=published_at,
             discovered_at=document.fetched_at,
             last_seen_at=document.fetched_at,
-            metadata={"content_type": document.content_type},
+            subjects=tuple(document.metadata.get("subjects", ())),
+            metadata={
+                "content_type": document.content_type,
+                **(
+                    {"subjects": list(document.metadata["subjects"])}
+                    if document.metadata.get("subjects")
+                    else {}
+                ),
+            },
         )
 
 

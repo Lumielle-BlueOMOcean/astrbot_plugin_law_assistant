@@ -14,6 +14,9 @@ def test_config_defaults_are_safe() -> None:
     assert config.deadline_reminder_days == (7, 3, 1)
     assert config.daily_case_enabled is False
     assert config.daily_question_enabled is False
+    assert config.daily_case_selection_mode == "random"
+    assert config.daily_question_origin == "random"
+    assert config.daily_question_type is None
     assert config.case_source_court_enabled is True
     assert config.case_source_spp_enabled is True
 
@@ -64,3 +67,25 @@ def test_config_normalizes_extra_sources_and_reminder_days() -> None:
     assert config.extra_event_source_urls == ("https://example.test/",)
     assert config.deadline_reminder_days == (7, 3)
     assert config.daily_case_time == "09:30"
+
+
+def test_config_normalizes_daily_plan_subjects_and_dates() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "daily_case_selection_mode": "rotation",
+            "daily_case_rotation_subjects": ["知产", "民商法", "unknown"],
+            "daily_case_rotation_start_date": "2026-09-21",
+            "daily_question_origin": "real",
+            "daily_question_type": "多选",
+            "daily_question_subject": "经济法",
+        }
+    )
+
+    assert config.daily_case_rotation_subjects == (
+        "intellectual_property",
+        "civil_commercial",
+    )
+    assert config.daily_case_rotation_start_date == "2026-09-21"
+    assert config.daily_question_origin == "real"
+    assert config.daily_question_type == "multiple_choice"
+    assert config.daily_question_subject == "economic_law"

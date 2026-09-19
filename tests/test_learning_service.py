@@ -15,6 +15,7 @@ class FakeLLM:
             return {"case_summary": "summary", "issues": ["issue"]}
         return {
             "question": "问题",
+            "options": ["A", "B", "C", "D"],
             "answer": "A",
             "explanation": "解释",
             "source_note": "练习题",
@@ -41,7 +42,9 @@ async def test_learning_service_uses_stored_case_and_provider(tmp_path) -> None:
     service = LearningService(storage, FakeLLM())
 
     result = await service.daily_case(date="2026-09-17")
-    question = await service.generate_question(subject="民法")
+    question = await service.generate_question(
+        subject="民法", question_type="single_choice"
+    )
 
     assert result["available"] is True
     assert result["source_url"] == "https://court.example/1"

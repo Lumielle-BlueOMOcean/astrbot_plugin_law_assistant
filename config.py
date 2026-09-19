@@ -6,6 +6,21 @@ from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
 
+if __package__ and "." in __package__:
+    from .content import (
+        normalize_origin,
+        normalize_question_type,
+        normalize_selection_mode,
+        normalize_subject,
+    )
+else:
+    from content import (
+        normalize_origin,
+        normalize_question_type,
+        normalize_selection_mode,
+        normalize_subject,
+    )
+
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SCAN_INTERVAL_MINUTES = 60
 MIN_SCAN_INTERVAL_MINUTES = 5
@@ -28,8 +43,20 @@ class PluginConfig:
     deadline_same_day_enabled: bool
     daily_case_enabled: bool
     daily_case_time: str
+    daily_case_selection_mode: str
+    daily_case_subject: str | None
+    daily_case_rotation_subjects: tuple[str, ...]
+    daily_case_rotation_start_date: str | None
+    daily_case_rotation_start_index: int
     daily_question_enabled: bool
     daily_question_time: str
+    daily_question_selection_mode: str
+    daily_question_origin: str
+    daily_question_subject: str | None
+    daily_question_type: str | None
+    daily_question_rotation_subjects: tuple[str, ...]
+    daily_question_rotation_start_date: str | None
+    daily_question_rotation_start_index: int
     case_source_court_enabled: bool
     case_source_spp_enabled: bool
     law_update_enabled: bool
@@ -60,11 +87,45 @@ class PluginConfig:
             daily_case_time=_normalize_time(
                 values.get("daily_case_time", DEFAULT_DAILY_TIME)
             ),
+            daily_case_selection_mode=normalize_selection_mode(
+                values.get("daily_case_selection_mode", "random")
+            ),
+            daily_case_subject=normalize_subject(values.get("daily_case_subject")),
+            daily_case_rotation_subjects=_normalize_subjects(
+                values.get("daily_case_rotation_subjects", [])
+            ),
+            daily_case_rotation_start_date=_normalize_date(
+                values.get("daily_case_rotation_start_date")
+            ),
+            daily_case_rotation_start_index=_normalize_index(
+                values.get("daily_case_rotation_start_index", 0)
+            ),
             daily_question_enabled=_to_bool(
                 values.get("daily_question_enabled", False)
             ),
             daily_question_time=_normalize_time(
                 values.get("daily_question_time", DEFAULT_DAILY_TIME)
+            ),
+            daily_question_selection_mode=normalize_selection_mode(
+                values.get("daily_question_selection_mode", "random")
+            ),
+            daily_question_origin=normalize_origin(
+                values.get("daily_question_origin", "random")
+            ),
+            daily_question_subject=normalize_subject(
+                values.get("daily_question_subject")
+            ),
+            daily_question_type=normalize_question_type(
+                values.get("daily_question_type")
+            ),
+            daily_question_rotation_subjects=_normalize_subjects(
+                values.get("daily_question_rotation_subjects", [])
+            ),
+            daily_question_rotation_start_date=_normalize_date(
+                values.get("daily_question_rotation_start_date")
+            ),
+            daily_question_rotation_start_index=_normalize_index(
+                values.get("daily_question_rotation_start_index", 0)
             ),
             case_source_court_enabled=_to_bool(
                 values.get("case_source_court_enabled", True)
@@ -156,6 +217,36 @@ def _normalize_time(value: Any) -> str:
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", candidate):
         return DEFAULT_DAILY_TIME
     return candidate
+
+
+def _normalize_subjects(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        return ()
+    result: list[str] = []
+    for item in value:
+        subject = normalize_subject(item)
+        if subject and subject not in result:
+            result.append(subject)
+    return tuple(result)
+
+
+def _normalize_date(value: Any) -> str | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        from datetime import date
+
+        return date.fromisoformat(candidate).isoformat()
+    except ValueError:
+        return None
+
+
+def _normalize_index(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _to_bool(value: Any) -> bool:

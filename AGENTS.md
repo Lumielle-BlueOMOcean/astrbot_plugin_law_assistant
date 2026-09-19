@@ -31,4 +31,9 @@ The intended division is ChatGPT Sol for analysis, architecture, debugging reaso
 - Keep module boundaries clear; do not let `main.py` or `service.py` grow without a concrete responsibility.
 - Source adapters must preserve official URL, fetched evidence and content hash; one source failure is isolated and recorded in `source_runs`.
 - Unconfirmed LLM dates cannot drive deadline lists, reminders or publication previews. LLM-generated learning content must be marked as study material, not legal advice.
+- Learning content has three distinct identities: verified real questions, AI-generated mock questions, and official-source cases. Never label generated or unverifiable material as a real exam question or official case.
+- Real questions may enter the inventory only through a source-recorded, verification-marked import. Preserve source, locator, answer provenance and verification status; an unavailable answer must not be guessed by an LLM.
+- Daily case and daily question plans are independent. Global defaults may be overridden per enabled target; rotation uses the configured local calendar date, start date, ordered subjects and start index rather than an in-memory counter.
+- A missing subject-matched case or question is a strict skip and must not silently fall back to another subject, type, origin or task. Case failure or disablement must not advance or block the question plan, and vice versa.
+- Long-lived plan changes require a preview and explicit confirmation. Content publication also locks the selected body and exact target IDs at preview time; confirmation must not regenerate content or expand targets.
 - README must distinguish implemented behavior from planned capabilities and must not claim deferred sources, advanced radar, full QQ management, or Nexus runtime integration are complete.

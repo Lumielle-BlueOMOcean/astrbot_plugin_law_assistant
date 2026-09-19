@@ -74,6 +74,7 @@ class CaseItem:
     published_at: DateTime | None = None
     discovered_at: DateTime | str | None = None
     last_seen_at: DateTime | str | None = None
+    subjects: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
     id: int | None = None
 

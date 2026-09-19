@@ -10,11 +10,15 @@ from pathlib import Path
 from typing import Any
 
 if __package__ and "." in __package__:
+    from .content import RealQuestion, subject_filter
+    from .daily_plans import DailyPlan
     from .models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 else:
+    from content import RealQuestion, subject_filter
+    from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -79,6 +83,13 @@ def _add_column_if_missing(
     columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
 
 
 def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
@@ -290,10 +301,78 @@ def _migrate_2_to_3(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE reminders_v2")
 
 
+def _migrate_3_to_4(connection: sqlite3.Connection) -> None:
+    """Add verified question inventory and independent daily-plan state."""
+    if _table_exists(connection, "case_items"):
+        _add_column_if_missing(
+            connection, "case_items", "subjects_json", "TEXT NOT NULL DEFAULT '[]'"
+        )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS real_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identity_key TEXT NOT NULL UNIQUE,
+            source_name TEXT NOT NULL,
+            exam_name TEXT NOT NULL,
+            exam_year TEXT NOT NULL,
+            exam_date TEXT NOT NULL,
+            paper TEXT NOT NULL,
+            question_number TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            source_locator TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            question_type TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            answer_json TEXT,
+            explanation TEXT NOT NULL,
+            answer_source TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id INTEGER REFERENCES publish_targets(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            time TEXT NOT NULL,
+            selection_mode TEXT NOT NULL,
+            fixed_subject TEXT,
+            rotation_subjects_json TEXT NOT NULL,
+            rotation_start_date TEXT,
+            rotation_start_index INTEGER NOT NULL,
+            question_origin TEXT NOT NULL,
+            question_type TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS daily_plans_global_unique
+        ON daily_plans(content_type) WHERE target_id IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS daily_plans_target_unique
+        ON daily_plans(target_id, content_type) WHERE target_id IS NOT NULL
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
 }
 
 
@@ -788,6 +867,210 @@ class SQLiteStorage:
         ).fetchone()
         return _target_from_row(row)
 
+    def get_target(self, target_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM publish_targets WHERE id = ?", (target_id,)
+        ).fetchone()
+        return _target_from_row(row) if row else None
+
+    def import_real_questions(
+        self, records: Iterable[RealQuestion | dict[str, Any]]
+    ) -> int:
+        imported = 0
+        now = _serialize_datetime(DateTime.now(timezone.utc))
+        self._connection.execute("BEGIN")
+        try:
+            for raw in records:
+                question = (
+                    raw
+                    if isinstance(raw, RealQuestion)
+                    else RealQuestion.from_mapping(raw)
+                )
+                identity = "|".join(
+                    (
+                        question.source_name,
+                        question.exam_name,
+                        question.source_locator
+                        or question.question_number
+                        or question.content_hash,
+                    )
+                )
+                self._connection.execute(
+                    """
+                INSERT INTO real_questions(
+                    identity_key, source_name, exam_name, exam_year, exam_date,
+                    paper, question_number, source_url, source_locator, subject,
+                    question_type, stem, options_json, answer_json, explanation,
+                    answer_source, verification_status, content_hash, metadata_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(identity_key) DO UPDATE SET
+                    source_name = excluded.source_name, exam_name = excluded.exam_name,
+                    exam_year = excluded.exam_year, exam_date = excluded.exam_date,
+                    paper = excluded.paper, question_number = excluded.question_number,
+                    source_url = excluded.source_url, source_locator = excluded.source_locator,
+                    subject = excluded.subject, question_type = excluded.question_type,
+                    stem = excluded.stem, options_json = excluded.options_json,
+                    answer_json = excluded.answer_json, explanation = excluded.explanation,
+                    answer_source = excluded.answer_source,
+                    verification_status = excluded.verification_status,
+                    content_hash = excluded.content_hash, metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                    """,
+                    (
+                        identity,
+                        question.source_name,
+                        question.exam_name,
+                        question.exam_year,
+                        question.exam_date,
+                        question.paper,
+                        question.question_number,
+                        question.source_url,
+                        question.source_locator,
+                        question.subject,
+                        question.question_type,
+                        question.stem,
+                        json.dumps(
+                            question.options, ensure_ascii=False, sort_keys=True
+                        ),
+                        json.dumps(question.answer, ensure_ascii=False, sort_keys=True)
+                        if question.answer is not None
+                        else None,
+                        question.explanation,
+                        question.answer_source,
+                        question.verification_status,
+                        question.content_hash,
+                        json.dumps(
+                            question.metadata, ensure_ascii=False, sort_keys=True
+                        ),
+                        now,
+                        now,
+                    ),
+                )
+                imported += 1
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return imported
+
+    def list_real_questions(
+        self,
+        *,
+        subject: Any = None,
+        question_type: str | None = None,
+        source_name: str | None = None,
+        exam_year: str | None = None,
+        exclude_ids: set[int] | None = None,
+        limit: int = 100,
+    ) -> list[RealQuestion]:
+        rows = self._connection.execute(
+            "SELECT * FROM real_questions WHERE verification_status IN "
+            "('verified', 'official', 'user_verified') ORDER BY id LIMIT ?",
+            (max(1, min(limit, 1000)),),
+        ).fetchall()
+        requested_subjects = subject_filter(subject)
+        excluded = exclude_ids or set()
+        result: list[RealQuestion] = []
+        for row in rows:
+            if int(row["id"]) in excluded:
+                continue
+            if (
+                requested_subjects is not None
+                and row["subject"] not in requested_subjects
+            ):
+                continue
+            if question_type and row["question_type"] != question_type:
+                continue
+            if source_name and row["source_name"] != source_name:
+                continue
+            if exam_year and row["exam_year"] != str(exam_year):
+                continue
+            result.append(_real_question_from_row(row))
+        return result
+
+    def count_real_questions(
+        self, *, subject: Any = None, question_type: str | None = None
+    ) -> int:
+        return len(
+            self.list_real_questions(
+                subject=subject, question_type=question_type, limit=1000
+            )
+        )
+
+    def real_question_inventory(self) -> dict[str, Any]:
+        questions = self.list_real_questions(limit=1000)
+        by_subject: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for question in questions:
+            by_subject[question.subject] = by_subject.get(question.subject, 0) + 1
+            by_type[question.question_type] = by_type.get(question.question_type, 0) + 1
+        return {"count": len(questions), "by_subject": by_subject, "by_type": by_type}
+
+    def get_daily_plan(
+        self, target_id: int | None, content_type: str
+    ) -> DailyPlan | None:
+        if target_id is None:
+            row = self._connection.execute(
+                "SELECT * FROM daily_plans WHERE target_id IS NULL AND content_type = ?",
+                (content_type,),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT * FROM daily_plans WHERE target_id = ? AND content_type = ?",
+                (target_id, content_type),
+            ).fetchone()
+        return _daily_plan_from_row(row) if row else None
+
+    def upsert_daily_plan(self, plan: DailyPlan, target_id: int | None = None) -> None:
+        now = _serialize_datetime(DateTime.now(timezone.utc))
+        self._connection.execute(
+            """
+            INSERT INTO daily_plans(
+                target_id, content_type, enabled, time, selection_mode, fixed_subject,
+                rotation_subjects_json, rotation_start_date, rotation_start_index,
+                question_origin, question_type, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO UPDATE SET
+                enabled = excluded.enabled, time = excluded.time,
+                selection_mode = excluded.selection_mode, fixed_subject = excluded.fixed_subject,
+                rotation_subjects_json = excluded.rotation_subjects_json,
+                rotation_start_date = excluded.rotation_start_date,
+                rotation_start_index = excluded.rotation_start_index,
+                question_origin = excluded.question_origin, question_type = excluded.question_type,
+                updated_at = excluded.updated_at
+            """,
+            (
+                target_id,
+                plan.content_type,
+                int(plan.enabled),
+                plan.time,
+                plan.selection_mode,
+                plan.fixed_subject,
+                json.dumps(plan.rotation_subjects, ensure_ascii=False),
+                plan.rotation_start_date,
+                plan.rotation_start_index,
+                plan.question_origin,
+                plan.question_type,
+                now,
+            ),
+        )
+        self._connection.commit()
+
+    def list_daily_plans(self) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT * FROM daily_plans ORDER BY target_id, content_type"
+        ).fetchall()
+        return [_daily_plan_record(row) for row in rows]
+
+    def delete_daily_plan(self, target_id: int, content_type: str) -> bool:
+        cursor = self._connection.execute(
+            "DELETE FROM daily_plans WHERE target_id = ? AND content_type = ?",
+            (target_id, content_type),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
     def claim_publication(
         self, event_id: int, revision: int, target_id: int, kind: str
     ) -> int | None:
@@ -890,13 +1173,14 @@ class SQLiteStorage:
             INSERT INTO case_items(
                 source_key, source_item_key, title, published_at, source_url,
                 authority, raw_text, content_hash, discovered_at, last_seen_at,
-                metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                subjects_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_key, source_item_key) DO UPDATE SET
                 title = excluded.title, published_at = excluded.published_at,
                 source_url = excluded.source_url, authority = excluded.authority,
                 raw_text = excluded.raw_text, content_hash = excluded.content_hash,
-                last_seen_at = excluded.last_seen_at, metadata_json = excluded.metadata_json
+                last_seen_at = excluded.last_seen_at, subjects_json = excluded.subjects_json,
+                metadata_json = excluded.metadata_json
             """,
             (
                 item.source_key,
@@ -909,6 +1193,7 @@ class SQLiteStorage:
                 item.content_hash,
                 _serialize_datetime(discovered),
                 _serialize_datetime(now),
+                json.dumps(item.subjects, ensure_ascii=False),
                 json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
             ),
         )
@@ -918,6 +1203,17 @@ class SQLiteStorage:
             (item.source_key, item.source_item_key),
         ).fetchone()
         return int(row["id"])
+
+    def set_case_subjects(self, case_id: int, subjects: Iterable[str]) -> bool:
+        normalized = tuple(
+            dict.fromkeys(str(item).strip() for item in subjects if str(item).strip())
+        )
+        cursor = self._connection.execute(
+            "UPDATE case_items SET subjects_json = ? WHERE id = ?",
+            (json.dumps(normalized, ensure_ascii=False), case_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
 
     def list_case_items(self, limit: int = 50) -> list[CaseItem]:
         rows = self._connection.execute(
@@ -963,6 +1259,33 @@ class SQLiteStorage:
         self._connection.commit()
         return int(cursor.lastrowid) if cursor.rowcount else None
 
+    def has_daily_content(
+        self, *, content_date: str, target_id: int, content_type: str
+    ) -> bool:
+        row = self._connection.execute(
+            "SELECT 1 FROM daily_contents WHERE content_date = ? AND target_id = ? "
+            "AND content_type = ?",
+            (content_date, target_id, content_type),
+        ).fetchone()
+        return row is not None
+
+    def record_daily_skip(
+        self,
+        *,
+        content_date: str,
+        target_id: int,
+        content_type: str,
+        reason: str,
+        subject: str | None = None,
+    ) -> int | None:
+        body = {"skipped": True, "reason": reason, "subject": subject}
+        return self.claim_daily_content(
+            content_date=content_date,
+            target_id=target_id,
+            content_type=content_type,
+            body=body,
+        )
+
     def finish_daily_content(
         self, content_id: int, *, success: bool, error_summary: str | None = None
     ) -> None:
@@ -975,6 +1298,18 @@ class SQLiteStorage:
                 "sent" if success else "failed",
                 _serialize_datetime(DateTime.now(timezone.utc)),
                 error_summary,
+                content_id,
+            ),
+        )
+        self._connection.commit()
+
+    def mark_daily_skipped(self, content_id: int, reason: str) -> None:
+        self._connection.execute(
+            "UPDATE daily_contents SET status = ?, finished_at = ?, error_summary = ? WHERE id = ?",
+            (
+                "skipped",
+                _serialize_datetime(DateTime.now(timezone.utc)),
+                reason,
                 content_id,
             ),
         )
@@ -997,6 +1332,14 @@ class SQLiteStorage:
         rows = self._connection.execute(
             "SELECT DISTINCT source_item_id FROM daily_contents "
             "WHERE content_type = 'daily_case' AND status = 'sent' "
+            "AND source_item_id IS NOT NULL"
+        ).fetchall()
+        return {int(row["source_item_id"]) for row in rows}
+
+    def published_question_ids(self) -> set[int]:
+        rows = self._connection.execute(
+            "SELECT DISTINCT source_item_id FROM daily_contents "
+            "WHERE content_type = 'daily_question' AND status = 'sent' "
             "AND source_item_id IS NOT NULL"
         ).fetchall()
         return {int(row["source_item_id"]) for row in rows}
@@ -1194,6 +1537,54 @@ def _target_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _real_question_from_row(row: sqlite3.Row) -> RealQuestion:
+    return RealQuestion(
+        id=int(row["id"]),
+        source_name=row["source_name"],
+        exam_name=row["exam_name"],
+        exam_year=row["exam_year"],
+        exam_date=row["exam_date"],
+        paper=row["paper"],
+        question_number=row["question_number"],
+        source_url=row["source_url"],
+        source_locator=row["source_locator"],
+        subject=row["subject"],
+        question_type=row["question_type"],
+        stem=row["stem"],
+        options=json.loads(row["options_json"]),
+        answer=json.loads(row["answer_json"]) if row["answer_json"] else None,
+        explanation=row["explanation"],
+        answer_source=row["answer_source"],
+        verification_status=row["verification_status"],
+        content_hash=row["content_hash"],
+        metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def _daily_plan_from_row(row: sqlite3.Row) -> DailyPlan:
+    return DailyPlan(
+        content_type=row["content_type"],
+        enabled=bool(row["enabled"]),
+        time=row["time"],
+        selection_mode=row["selection_mode"],
+        fixed_subject=row["fixed_subject"],
+        rotation_subjects=tuple(json.loads(row["rotation_subjects_json"])),
+        rotation_start_date=row["rotation_start_date"],
+        rotation_start_index=int(row["rotation_start_index"]),
+        question_origin=row["question_origin"],
+        question_type=row["question_type"],
+    )
+
+
+def _daily_plan_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "target_id": int(row["target_id"]) if row["target_id"] is not None else None,
+        **_daily_plan_from_row(row).to_mapping(),
+        "updated_at": row["updated_at"],
+    }
+
+
 def _case_from_row(row: sqlite3.Row) -> CaseItem:
     return CaseItem(
         id=int(row["id"]),
@@ -1209,6 +1600,7 @@ def _case_from_row(row: sqlite3.Row) -> CaseItem:
         ),
         discovered_at=row["discovered_at"],
         last_seen_at=row["last_seen_at"],
+        subjects=tuple(json.loads(row["subjects_json"])),
         metadata=json.loads(row["metadata_json"]),
     )
 

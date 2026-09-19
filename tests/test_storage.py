@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from daily_plans import DailyPlan
 from storage import SCHEMA_VERSION, SQLiteStorage
 from tests.fakes import make_event
 
@@ -84,7 +85,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 3
+    assert storage.schema_version == SCHEMA_VERSION == 4
     assert storage.count_events() == 0
     storage.close()
 
@@ -103,7 +104,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 3",
+        match=r"schema version 99 is newer than supported version 4",
     ):
         SQLiteStorage(db_path)
 
@@ -188,7 +189,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 3
+    assert storage.schema_version == SCHEMA_VERSION == 4
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -233,7 +234,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 3
+    assert storage.schema_version == SCHEMA_VERSION == 4
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -267,3 +268,83 @@ def test_storage_records_source_run_success_and_failure(tmp_path) -> None:
         run["success"] is False and run["error_summary"] == "timeout" for run in runs
     )
     storage.close()
+
+
+def test_storage_imports_and_retrieves_verified_real_questions(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    record = {
+        "source_name": "合法取得的题库",
+        "exam_name": "法硕测试卷",
+        "exam_year": "2025",
+        "source_locator": "第一卷第 1 题",
+        "source_url": "https://example.test/question/1",
+        "subject": "刑法",
+        "question_type": "多选",
+        "stem": "下列哪些说法正确？",
+        "options": ["A", "B", "C", "D"],
+        "answer": ["A", "C"],
+        "answer_source": "official",
+        "verification_status": "verified",
+    }
+
+    assert storage.import_real_questions([record]) == 1
+    questions = storage.list_real_questions(
+        subject="刑事法", question_type="multiple_choice"
+    )
+
+    assert len(questions) == 1
+    assert questions[0].exam_name == "法硕测试卷"
+    assert storage.real_question_inventory()["count"] == 1
+    storage.close()
+
+
+def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    target = storage.bind_target("aiocqhttp:group:100", "一群")
+    global_plan = DailyPlan(
+        content_type="daily_case",
+        enabled=True,
+        selection_mode="rotation",
+        rotation_subjects=("intellectual_property", "civil_commercial"),
+        rotation_start_date="2026-09-21",
+    )
+    target_plan = DailyPlan(
+        content_type="daily_question",
+        enabled=True,
+        selection_mode="fixed",
+        fixed_subject="economic_law",
+        question_origin="real",
+        question_type="multiple_choice",
+    )
+    storage.upsert_daily_plan(global_plan)
+    storage.upsert_daily_plan(target_plan, target["id"])
+    storage.close()
+
+    reopened = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    assert reopened.get_daily_plan(None, "daily_case").rotation_subjects == (
+        "intellectual_property",
+        "civil_commercial",
+    )
+    assert (
+        reopened.get_daily_plan(target["id"], "daily_question").question_origin
+        == "real"
+    )
+    assert reopened.schema_version == 4
+    reopened.close()
+
+
+def test_storage_runs_the_v3_to_v4_migration_path(tmp_path) -> None:
+    db_path = tmp_path / "v3.sqlite3"
+    storage = SQLiteStorage(db_path)
+    storage.close()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE schema_meta SET value = '3' WHERE key = 'version'")
+        connection.execute("DROP TABLE real_questions")
+        connection.execute("DROP TABLE daily_plans")
+        connection.commit()
+
+    migrated = SQLiteStorage(db_path)
+    assert migrated.schema_version == SCHEMA_VERSION == 4
+    assert migrated.real_question_inventory()["count"] == 0
+    assert migrated.list_daily_plans() == []
+    migrated.close()

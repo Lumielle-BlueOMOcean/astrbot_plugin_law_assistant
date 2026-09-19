@@ -9,12 +9,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 if __package__ and "." in __package__:
+    from .content import (
+        format_question_content,
+        normalize_subject,
+    )
+    from .daily_plans import DailyPlan
     from .learning_service import LearningService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from .publisher import format_deadline_reminder, format_event
     from .sources.base import Extractor, SourceAdapter, Validator
     from .storage import SQLiteStorage
 else:
+    from content import (
+        format_question_content,
+        normalize_subject,
+    )
+    from daily_plans import DailyPlan
     from learning_service import LearningService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from publisher import format_deadline_reminder, format_event
@@ -37,6 +47,27 @@ class ScanResult:
     failures: tuple[ScanFailure, ...]
     duration_seconds: float
     skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPublication:
+    content_type: str
+    body: str
+    target_ids: tuple[int, ...]
+    created_at: datetime
+    expires_at: datetime
+    event_id: int | None = None
+    owner_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPlanUpdate:
+    target_id: int | None
+    content_types: tuple[str, ...]
+    plans: tuple[DailyPlan, ...]
+    created_at: datetime
+    expires_at: datetime
+    owner_id: str | None = None
 
 
 class LawAssistantService:
@@ -67,7 +98,8 @@ class LawAssistantService:
         self.learning_service = learning_service
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._scan_lock = asyncio.Lock()
-        self._publish_confirmations: dict[str, tuple[int, datetime]] = {}
+        self._publish_confirmations: dict[str, PendingPublication] = {}
+        self._plan_confirmations: dict[str, PendingPlanUpdate] = {}
 
     async def status(self) -> dict[str, Any]:
         return {
@@ -78,6 +110,7 @@ class LawAssistantService:
             "law_source_count": len(self.law_sources),
             "event_count": self.storage.count_events(),
             "case_count": len(self.storage.list_case_items(limit=100000)),
+            "real_question_inventory": self.storage.real_question_inventory(),
             "target_count": len(self.storage.list_targets(enabled_only=True)),
             "scan_in_progress": self._scan_lock.locked(),
             "last_source_run": self.storage.latest_source_run(),
@@ -347,19 +380,247 @@ class LawAssistantService:
     async def list_targets(self) -> list[dict[str, Any]]:
         return self.storage.list_targets()
 
-    async def prepare_publish_event(self, event_id: int) -> dict[str, Any]:
+    async def question_inventory(self) -> dict[str, Any]:
+        return self.storage.real_question_inventory()
+
+    def _config_default_plan(self, content_type: str) -> DailyPlan:
+        if content_type == "daily_case":
+            return DailyPlan(
+                content_type=content_type,
+                enabled=bool(getattr(self.config, "daily_case_enabled", False)),
+                time=str(getattr(self.config, "daily_case_time", "08:00")),
+                selection_mode=str(
+                    getattr(self.config, "daily_case_selection_mode", "random")
+                ),
+                fixed_subject=getattr(self.config, "daily_case_subject", None),
+                rotation_subjects=tuple(
+                    getattr(self.config, "daily_case_rotation_subjects", ())
+                ),
+                rotation_start_date=getattr(
+                    self.config, "daily_case_rotation_start_date", None
+                ),
+                rotation_start_index=int(
+                    getattr(self.config, "daily_case_rotation_start_index", 0)
+                ),
+            )
+        return DailyPlan(
+            content_type=content_type,
+            enabled=bool(getattr(self.config, "daily_question_enabled", False)),
+            time=str(getattr(self.config, "daily_question_time", "08:00")),
+            selection_mode=str(
+                getattr(self.config, "daily_question_selection_mode", "random")
+            ),
+            fixed_subject=getattr(self.config, "daily_question_subject", None),
+            rotation_subjects=tuple(
+                getattr(self.config, "daily_question_rotation_subjects", ())
+            ),
+            rotation_start_date=getattr(
+                self.config, "daily_question_rotation_start_date", None
+            ),
+            rotation_start_index=int(
+                getattr(self.config, "daily_question_rotation_start_index", 0)
+            ),
+            question_origin=str(
+                getattr(self.config, "daily_question_origin", "random")
+            ),
+            question_type=getattr(self.config, "daily_question_type", None),
+        )
+
+    def effective_daily_plan(
+        self, target_id: int | None, content_type: str
+    ) -> DailyPlan:
+        if target_id is not None:
+            override = self.storage.get_daily_plan(target_id, content_type)
+            if override is not None:
+                return override
+        global_plan = self.storage.get_daily_plan(None, content_type)
+        return global_plan or self._config_default_plan(content_type)
+
+    async def list_daily_plans(
+        self, target_selectors: list[str] | None = None, *, days: int = 7
+    ) -> dict[str, Any]:
+        if target_selectors:
+            targets = self._resolve_targets(target_selectors)
+        else:
+            targets = self.storage.list_targets(enabled_only=True)
+        local_today = _local_datetime(
+            self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
+        ).date()
+        result: dict[str, Any] = {
+            "global": {
+                content_type: {
+                    "plan": self.effective_daily_plan(None, content_type).to_mapping(),
+                    "preview": self.effective_daily_plan(None, content_type).preview(
+                        local_today, days
+                    ),
+                }
+                for content_type in ("daily_case", "daily_question")
+            },
+            "targets": [],
+        }
+        for target in targets:
+            result["targets"].append(
+                {
+                    "target": target,
+                    "plans": {
+                        content_type: {
+                            "plan": self.effective_daily_plan(
+                                target["id"], content_type
+                            ).to_mapping(),
+                            "preview": self.effective_daily_plan(
+                                target["id"], content_type
+                            ).preview(local_today, days),
+                            "override": self.storage.get_daily_plan(
+                                target["id"], content_type
+                            )
+                            is not None,
+                        }
+                        for content_type in ("daily_case", "daily_question")
+                    },
+                }
+            )
+        return result
+
+    async def prepare_daily_plan_update(
+        self,
+        *,
+        target_selectors: list[str] | None = None,
+        global_scope: bool = False,
+        content_type: str = "both",
+        changes: dict[str, Any] | None = None,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        if global_scope:
+            target_id = None
+            target_info: list[dict[str, Any]] = [{"scope": "global"}]
+        else:
+            targets = self._resolve_targets(target_selectors)
+            if len(targets) != 1:
+                return {
+                    "ready": False,
+                    "reason": "一次只能修改一个群级计划；全局修改请使用 global_scope",
+                }
+            target_id = targets[0]["id"]
+            target_info = [targets[0]]
+        content_types = (
+            ("daily_case", "daily_question")
+            if content_type == "both"
+            else (content_type,)
+        )
+        if any(item not in {"daily_case", "daily_question"} for item in content_types):
+            return {
+                "ready": False,
+                "reason": "content_type 必须是 daily_case、daily_question 或 both",
+            }
+        values = changes or {}
+        plans: list[DailyPlan] = []
+        for item in content_types:
+            current = self.effective_daily_plan(target_id, item).to_mapping()
+            item_values = values.get(item, values) if isinstance(values, dict) else {}
+            merged = {**current, **item_values, "content_type": item}
+            plans.append(DailyPlan.from_mapping(item, merged))
+        local_today = _local_datetime(
+            self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
+        ).date()
+        token = secrets.token_urlsafe(12)
+        created = self._now_utc()
+        self._plan_confirmations[token] = PendingPlanUpdate(
+            target_id=target_id,
+            content_types=tuple(content_types),
+            plans=tuple(plans),
+            created_at=created,
+            expires_at=created + timedelta(minutes=10),
+            owner_id=actor_id,
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "scope": "global" if global_scope else "target",
+            "targets": target_info,
+            "content_types": list(content_types),
+            "plans": [
+                {"plan": plan.to_mapping(), "preview": plan.preview(local_today, 7)}
+                for plan in plans
+            ],
+            "notice": "计划修改只会在明确确认后持久化。案例与题目计划独立执行。",
+        }
+
+    async def confirm_daily_plan_update(
+        self, token: str, *, actor_id: str | None = None
+    ) -> dict[str, Any]:
+        pending = self._plan_confirmations.pop(token.strip(), None)
+        if pending is None:
+            return {"success": False, "reason": "确认 token 无效或已使用"}
+        if pending.owner_id and pending.owner_id != str(actor_id or ""):
+            self._plan_confirmations[token.strip()] = pending
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        if self._now_utc() > pending.expires_at:
+            return {"success": False, "reason": "确认 token 已过期"}
+        if pending.target_id is not None:
+            target = self.storage.get_target(pending.target_id)
+            if target is None or not target["enabled"]:
+                return {"success": False, "reason": "目标群已不存在或已停用"}
+        for plan in pending.plans:
+            self.storage.upsert_daily_plan(plan, pending.target_id)
+        return {"success": True, "content_types": list(pending.content_types)}
+
+    def _resolve_targets(self, selectors: list[str] | None) -> list[dict[str, Any]]:
+        targets = self.storage.list_targets(enabled_only=True)
+        if not selectors:
+            if len(targets) == 1:
+                return targets
+            if not targets:
+                raise ValueError("尚未绑定发布目标")
+            raise ValueError("已绑定多个群，请明确提供群名、群 ID 或目标列表")
+        if any(
+            str(item).strip().lower() in {"all", "所有群", "所有学习群"}
+            for item in selectors
+        ):
+            return targets
+        result: list[dict[str, Any]] = []
+        for selector in selectors:
+            needle = str(selector).strip()
+            matches = [
+                target
+                for target in targets
+                if needle == str(target["id"])
+                or needle == target["unified_msg_origin"]
+                or needle.casefold() == str(target["label"]).casefold()
+            ]
+            if len(matches) > 1:
+                raise ValueError(f"群名称有歧义：{needle}")
+            if not matches:
+                raise ValueError(f"未找到启用的发布目标：{needle}")
+            if matches[0] not in result:
+                result.append(matches[0])
+        return result
+
+    async def prepare_publish_event(
+        self,
+        event_id: int,
+        target_selectors: list[str] | None = None,
+        *,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
         event = self.storage.get_event(event_id)
         if event is None:
             return {"ready": False, "reason": "event not found"}
         if not event.source_url:
             return {"ready": False, "reason": "事件缺少可验证的来源"}
-        targets = self.storage.list_targets(enabled_only=True)
-        if not targets:
-            return {"ready": False, "reason": "尚未绑定发布目标"}
+        try:
+            targets = self._resolve_targets(target_selectors)
+        except ValueError as exc:
+            return {"ready": False, "reason": str(exc)}
         token = secrets.token_urlsafe(12)
-        self._publish_confirmations[token] = (
-            event_id,
-            self._now_utc() + timedelta(minutes=10),
+        created = self._now_utc()
+        self._publish_confirmations[token] = PendingPublication(
+            content_type="event",
+            body=format_event(event),
+            target_ids=tuple(target["id"] for target in targets),
+            created_at=created,
+            expires_at=created + timedelta(minutes=10),
+            event_id=event_id,
+            owner_id=actor_id,
         )
         return {
             "ready": True,
@@ -370,17 +631,150 @@ class LawAssistantService:
             "preview": format_event(event),
         }
 
-    async def confirm_publish(self, token: str) -> dict[str, Any]:
+    async def confirm_publish(
+        self, token: str, *, actor_id: str | None = None
+    ) -> dict[str, Any]:
         claimed = self._publish_confirmations.pop(token.strip(), None)
         if claimed is None:
             return {"success": False, "reason": "确认 token 无效或已使用"}
-        event_id, expires_at = claimed
-        if self._now_utc() > expires_at:
+        if claimed.owner_id and claimed.owner_id != str(actor_id or ""):
+            self._publish_confirmations[token.strip()] = claimed
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        if self._now_utc() > claimed.expires_at:
             return {"success": False, "reason": "确认 token 已过期"}
-        count = await self._publish_event_to_targets(event_id, kind="manual")
+        if claimed.event_id is not None:
+            count = await self._publish_event_to_targets(
+                claimed.event_id,
+                kind="manual",
+                target_ids=claimed.target_ids,
+                fixed_body=claimed.body,
+            )
+        else:
+            count = await self._publish_fixed_to_targets(
+                claimed.body, claimed.target_ids, claimed.content_type
+            )
         return {"success": count > 0, "published_count": count}
 
-    async def _publish_event_to_targets(self, event_id: int, *, kind: str) -> int:
+    async def prepare_publish_question(
+        self,
+        *,
+        origin: str = "random",
+        subject: str | None = None,
+        question_type: str | None = None,
+        target_selectors: list[str] | None = None,
+        session_origin: str | None = None,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            targets = self._resolve_targets(target_selectors)
+        except ValueError as exc:
+            return {"ready": False, "reason": str(exc)}
+        content = await self.generate_question(
+            subject or "",
+            origin=origin,
+            question_type=question_type,
+            session_origin=session_origin,
+        )
+        if not content.get("available"):
+            return {"ready": False, **content}
+        body = format_question_content(content)
+        token = secrets.token_urlsafe(12)
+        created = self._now_utc()
+        self._publish_confirmations[token] = PendingPublication(
+            content_type="question",
+            body=body,
+            target_ids=tuple(target["id"] for target in targets),
+            created_at=created,
+            expires_at=created + timedelta(minutes=10),
+            owner_id=actor_id,
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "content_type": "question",
+            "targets": targets,
+            "preview": body,
+            "selection": {
+                key: content.get(key)
+                for key in ("origin", "subject", "question_type", "source_url")
+                if content.get(key) is not None
+            },
+        }
+
+    async def prepare_publish_case(
+        self,
+        *,
+        subject: str | None = None,
+        target_selectors: list[str] | None = None,
+        session_origin: str | None = None,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            targets = self._resolve_targets(target_selectors)
+        except ValueError as exc:
+            return {"ready": False, "reason": str(exc)}
+        content = await self.get_daily_case(
+            subject=subject, session_origin=session_origin
+        )
+        if not content.get("available"):
+            return {"ready": False, **content}
+        body = _format_daily_content("daily_case", content)
+        token = secrets.token_urlsafe(12)
+        created = self._now_utc()
+        self._publish_confirmations[token] = PendingPublication(
+            content_type="case",
+            body=body,
+            target_ids=tuple(target["id"] for target in targets),
+            created_at=created,
+            expires_at=created + timedelta(minutes=10),
+            owner_id=actor_id,
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "content_type": "case",
+            "targets": targets,
+            "preview": body,
+        }
+
+    async def set_case_subjects(
+        self, case_id: int, subjects: list[str]
+    ) -> dict[str, Any]:
+        normalized = tuple(
+            item for item in (normalize_subject(value) for value in subjects) if item
+        )
+        if not normalized:
+            return {"success": False, "reason": "至少需要一个有效方向"}
+        return {
+            "success": self.storage.set_case_subjects(case_id, normalized),
+            "case_id": case_id,
+            "subjects": list(normalized),
+        }
+
+    def import_real_questions_file(self, path: str) -> dict[str, Any]:
+        try:
+            from .content import load_real_questions
+        except ImportError:
+            from content import load_real_questions
+        try:
+            questions = load_real_questions(path)
+            count = self.storage.import_real_questions(questions)
+        except (OSError, ValueError, TypeError) as exc:
+            return {"success": False, "reason": str(exc)}
+        return {
+            "success": True,
+            "imported_count": count,
+            "inventory": self.storage.real_question_inventory(),
+        }
+
+    async def _publish_event_to_targets(
+        self,
+        event_id: int,
+        *,
+        kind: str,
+        target_ids: tuple[int, ...] | None = None,
+        fixed_body: str | None = None,
+    ) -> int:
         event = self.storage.get_event(event_id)
         if event is None or self.publisher is None:
             return 0
@@ -395,14 +789,17 @@ class LawAssistantService:
         ):
             return 0
         count = 0
+        allowed = set(target_ids) if target_ids is not None else None
         for target in self.storage.list_targets(enabled_only=True):
+            if allowed is not None and target["id"] not in allowed:
+                continue
             publication_id = self.storage.claim_publication(
                 event.id, event.revision, target["id"], kind
             )
             if publication_id is None:
                 continue
             success = await self.publisher.publish_text(
-                target["unified_msg_origin"], format_event(event)
+                target["unified_msg_origin"], fixed_body or format_event(event)
             )
             self.storage.finish_publication(publication_id, success=success)
             if success:
@@ -416,6 +813,33 @@ class LawAssistantService:
                 self.logger.warning(
                     "Law Assistant failed to publish event %s to %s",
                     event_id,
+                    target["unified_msg_origin"],
+                )
+        return count
+
+    async def _publish_fixed_to_targets(
+        self, body: str, target_ids: tuple[int, ...], content_type: str
+    ) -> int:
+        if self.publisher is None:
+            return 0
+        count = 0
+        enabled_targets = {
+            target["id"]: target
+            for target in self.storage.list_targets(enabled_only=True)
+        }
+        for target_id in target_ids:
+            target = enabled_targets.get(target_id)
+            if target is None:
+                continue
+            success = await self.publisher.publish_text(
+                target["unified_msg_origin"], body
+            )
+            if success:
+                count += 1
+            else:
+                self.logger.warning(
+                    "Law Assistant failed to publish %s to %s",
+                    content_type,
                     target["unified_msg_origin"],
                 )
         return count
@@ -460,17 +884,25 @@ class LawAssistantService:
         return sent
 
     async def get_daily_case(
-        self, *, session_origin: str | None = None
+        self,
+        *,
+        subject: str | None = None,
+        session_origin: str | None = None,
     ) -> dict[str, Any]:
         if self.learning_service is None:
             return {"available": False, "reason": "daily case service unavailable"}
-        return await self.learning_service.daily_case(session_origin=session_origin)
+        return await self.learning_service.daily_case(
+            subject=subject, session_origin=session_origin
+        )
 
     async def generate_question(
         self,
         subject: str = "",
         *,
-        question_type: str = "single",
+        question_type: str | None = None,
+        origin: str = "random",
+        source_name: str | None = None,
+        exam_year: str | None = None,
         session_origin: str | None = None,
     ) -> dict[str, Any]:
         if self.learning_service is None:
@@ -478,6 +910,9 @@ class LawAssistantService:
         return await self.learning_service.generate_question(
             subject=subject,
             question_type=question_type,
+            origin=origin,
+            source_name=source_name,
+            exam_year=exam_year,
             session_origin=session_origin,
         )
 
@@ -488,7 +923,13 @@ class LawAssistantService:
         self, *, now: datetime | None = None
     ) -> dict[str, Any]:
         auto_scan_enabled = bool(getattr(self.config, "auto_scan_enabled", False))
-        daily_case_enabled = bool(getattr(self.config, "daily_case_enabled", False))
+        stored_plans = self.storage.list_daily_plans()
+        daily_case_enabled = bool(
+            getattr(self.config, "daily_case_enabled", False)
+        ) or any(
+            item["content_type"] == "daily_case" and item["enabled"]
+            for item in stored_plans
+        )
         law_update_enabled = bool(getattr(self.config, "law_update_enabled", False))
         result: dict[str, Any] = {}
         if auto_scan_enabled:
@@ -503,14 +944,10 @@ class LawAssistantService:
         )
         result["daily_case_sent"] = await self._run_daily_content(
             content_type="daily_case",
-            enabled=daily_case_enabled,
-            configured_time=str(getattr(self.config, "daily_case_time", "08:00")),
             now=current,
         )
         result["daily_question_sent"] = await self._run_daily_content(
             content_type="daily_question",
-            enabled=bool(getattr(self.config, "daily_question_enabled", False)),
-            configured_time=str(getattr(self.config, "daily_question_time", "08:00")),
             now=current,
         )
         return result
@@ -519,41 +956,73 @@ class LawAssistantService:
         self,
         *,
         content_type: str,
-        enabled: bool,
-        configured_time: str,
         now: datetime | str,
     ) -> int:
-        if (
-            not enabled
-            or self.publisher is None
-            or not _time_is_due(now, configured_time, self.config)
-        ):
+        if self.publisher is None:
             return 0
         local_now = _local_datetime(
             now, getattr(self.config, "timezone", "Asia/Shanghai")
         )
-        if content_type == "daily_case":
-            content = await self.get_daily_case()
-        else:
-            content = await self.generate_question()
-        if not content.get("available"):
-            return 0
-        raw_body = content.get("content", content)
-        body = raw_body if isinstance(raw_body, dict) else {"body": raw_body}
         sent = 0
         for target in self.storage.list_targets(enabled_only=True):
+            plan = self.effective_daily_plan(target["id"], content_type)
+            if not plan.enabled or not _time_is_due(now, plan.time, self.config):
+                continue
+            selected_subject = plan.subject_for(local_now.date())
+            if plan.selection_mode == "rotation" and selected_subject is None:
+                self._record_daily_skip(
+                    local_now.date().isoformat(),
+                    target["id"],
+                    content_type,
+                    "轮换计划尚未开始或缺少有效方向",
+                    None,
+                )
+                continue
+            content_date = local_now.date().isoformat()
+            if self.storage.has_daily_content(
+                content_date=content_date,
+                target_id=target["id"],
+                content_type=content_type,
+            ):
+                continue
+            if content_type == "daily_case":
+                content = await self.get_daily_case(subject=selected_subject)
+            else:
+                content = await self.generate_question(
+                    selected_subject or "",
+                    origin=plan.question_origin,
+                    question_type=plan.question_type,
+                )
+            if not content.get("available"):
+                reason = str(content.get("reason", "没有匹配内容"))
+                if "匹配" in reason or "暂无" in reason:
+                    self._record_daily_skip(
+                        content_date,
+                        target["id"],
+                        content_type,
+                        reason,
+                        selected_subject,
+                    )
+                continue
+            raw_body = content.get("content", content)
+            body = raw_body if isinstance(raw_body, dict) else {"body": raw_body}
             claim_id = self.storage.claim_daily_content(
-                content_date=local_now.date().isoformat(),
+                content_date=content_date,
                 target_id=target["id"],
                 content_type=content_type,
                 body=body,
-                source_item_id=content.get("case_id"),
+                source_item_id=content.get("case_id") or content.get("question_id"),
             )
             if claim_id is None:
                 continue
+            formatted = (
+                _format_daily_content(content_type, content)
+                if content_type == "daily_case"
+                else format_question_content(content)
+            )
             success = await self.publisher.publish_text(
                 target["unified_msg_origin"],
-                _format_daily_content(content_type, content),
+                formatted,
             )
             self.storage.finish_daily_content(claim_id, success=success)
             sent += int(success)
@@ -564,6 +1033,24 @@ class LawAssistantService:
                     target["unified_msg_origin"],
                 )
         return sent
+
+    def _record_daily_skip(
+        self,
+        content_date: str,
+        target_id: int,
+        content_type: str,
+        reason: str,
+        subject: str | None,
+    ) -> None:
+        claim_id = self.storage.record_daily_skip(
+            content_date=content_date,
+            target_id=target_id,
+            content_type=content_type,
+            reason=reason,
+            subject=subject,
+        )
+        if claim_id is not None:
+            self.storage.mark_daily_skipped(claim_id, reason)
 
     def _auto_publish_enabled(self) -> bool:
         return bool(getattr(self.config, "auto_publish_events", False))
@@ -614,9 +1101,12 @@ def _time_is_due(value: datetime | str, configured_time: str, config: Any) -> bo
 
 
 def _format_daily_content(content_type: str, content: dict[str, Any]) -> str:
-    title = (
-        "【每日一案】" if content_type == "daily_case" else "【每日一题｜原创练习题】"
-    )
+    if content_type == "daily_case":
+        title = "【每日一案】"
+        if content.get("subject"):
+            title += f"｜{content['subject']}"
+    else:
+        title = "【每日一题｜模拟题】"
     body = content.get("content", content)
     if not isinstance(body, dict):
         return f"{title}\n{body}"
@@ -632,6 +1122,11 @@ def _format_daily_content(content_type: str, content: dict[str, Any]) -> str:
         "source_note": "参考来源/说明",
     }
     lines = [title]
+    if content_type == "daily_case":
+        if content.get("title"):
+            lines.append(f"案例：{content['title']}")
+        if content.get("authority"):
+            lines.append(f"来源机关：{content['authority']}")
     for key, value in body.items():
         lines.append(f"{labels.get(key, key)}：{value}")
     if content.get("source_url"):
