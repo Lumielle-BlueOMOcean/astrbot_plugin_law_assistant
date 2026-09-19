@@ -322,7 +322,8 @@ def validate_generated_question(content: Any, question_type: str | None) -> bool
         return False
     if not str(content.get("question") or "").strip():
         return False
-    if not str(content.get("answer") or "").strip():
+    answer = content.get("answer")
+    if not _has_nonempty_value(answer):
         return False
     if not str(content.get("explanation") or "").strip():
         return False
@@ -330,9 +331,32 @@ def validate_generated_question(content: Any, question_type: str | None) -> bool
         options = content.get("options")
         if not isinstance(options, (list, dict)) or len(options) < 2:
             return False
+        if question_type == "single_choice" and isinstance(
+            answer, (list, tuple, set, dict)
+        ):
+            return len(answer) == 1
+    if question_type == "true_false":
+        if isinstance(answer, bool):
+            return True
+        return str(answer).strip().lower() in {
+            "正确",
+            "错误",
+            "对",
+            "错",
+            "true",
+            "false",
+        }
     return question_type != "case_analysis" or bool(
         content.get("questions") or content.get("issues")
     )
+
+
+def _has_nonempty_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return bool(str(value).strip())
 
 
 def format_question_content(result: dict[str, Any]) -> str:

@@ -43,7 +43,7 @@ LLM interprets evidence; deterministic code owns truth：来源 URL、原文 has
 
 ## Compatibility
 
-目标范围为 `>=4.22.0,<5`，Python `>=3.12`。CI 使用官方源码 exact commit 验证：
+目标范围为 `>=4.22.0,<5`，Python `>=3.12`。Windows 会通过 `requirements.txt` 安装 `tzdata`，为 `zoneinfo` 提供 `Asia/Shanghai` 等 IANA 时区数据。CI 使用官方源码 exact commit 验证：
 
 - AstrBot v4.22.0 — `81c7b0f7150485beb6124a7ec524a8d8534e7f6e`
 - AstrBot v4.25.0 — `02291a3217c92faa0c577bf9d89076949c40954c`

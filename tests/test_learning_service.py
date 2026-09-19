@@ -22,6 +22,19 @@ class FakeLLM:
         }
 
 
+class InvalidShapeLLM:
+    def __init__(self, answer):
+        self.answer = answer
+
+    async def generate_json(self, prompt, *, session_origin=None):
+        return {
+            "question": "问题",
+            "options": ["A", "B"],
+            "answer": self.answer,
+            "explanation": "解释",
+        }
+
+
 def case_item() -> CaseItem:
     return CaseItem(
         source_key="court_cases",
@@ -58,3 +71,23 @@ async def test_learning_service_degrades_without_provider(tmp_path) -> None:
     result = await service.generate_question()
 
     assert result == {"available": False, "reason": "LLM provider unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question_type, answer", [("true_false", "不确定"), ("multiple_choice", [])]
+)
+async def test_learning_service_rejects_invalid_answer_shape(
+    tmp_path, question_type, answer
+) -> None:
+    service = LearningService(
+        SQLiteStorage(tmp_path / f"{question_type}.sqlite3"),
+        InvalidShapeLLM(answer),
+    )
+
+    result = await service.generate_question(origin="mock", question_type=question_type)
+
+    assert result == {
+        "available": False,
+        "reason": "LLM response does not match requested question type",
+    }
