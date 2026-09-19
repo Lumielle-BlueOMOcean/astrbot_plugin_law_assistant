@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -264,6 +264,72 @@ def test_explicit_invalid_question_parameters_do_not_fall_back_to_random(tmp_pat
     )
     assert result["available"] is False
     assert result["error"] == "invalid_parameter"
+
+
+def test_global_rotation_anchor_is_persisted_and_reused_after_restart(tmp_path):
+    config = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        daily_case_enabled=True,
+        daily_case_selection_mode="rotation",
+        daily_case_subject=None,
+        daily_case_rotation_subjects=("intellectual_property", "economic_law"),
+        daily_case_rotation_start_date=None,
+        daily_case_rotation_start_index=0,
+        daily_question_enabled=True,
+        daily_question_selection_mode="rotation",
+        daily_question_subject=None,
+        daily_question_rotation_subjects=("criminal_law", "civil_commercial"),
+        daily_question_rotation_start_date=None,
+        daily_question_rotation_start_index=0,
+        daily_question_origin="random",
+        daily_question_type=None,
+    )
+    database = tmp_path / "runtime.sqlite3"
+    first = LawAssistantService(
+        SQLiteStorage(database),
+        config=config,
+        clock=lambda: datetime(2026, 9, 21, 16, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    first.materialize_config_rotation_anchors()
+    assert first.storage.get_rotation_anchor("daily_case") == "2026-09-22"
+    assert first.storage.get_rotation_anchor("daily_question") == "2026-09-22"
+    assert (
+        first.effective_daily_plan(None, "daily_case").subject_for(date(2026, 9, 23))
+        == "economic_law"
+    )
+    anchored = first.effective_daily_plan(None, "daily_question")
+    assert anchored.rotation_start_date == "2026-09-22"
+    assert anchored.subject_for(date(2026, 9, 22)) == "criminal_law"
+    first.storage.close()
+
+    second = LawAssistantService(
+        SQLiteStorage(database),
+        config=config,
+        clock=lambda: datetime(2026, 9, 22, 16, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    second.materialize_config_rotation_anchors()
+    assert second.storage.get_rotation_anchor("daily_case") == "2026-09-22"
+    assert (
+        second.storage.get_rotation_anchor("daily_question")
+        == anchored.rotation_start_date
+    )
+    reopened = second.effective_daily_plan(None, "daily_question")
+    assert reopened.rotation_start_date == anchored.rotation_start_date
+    assert reopened.subject_for(date(2026, 9, 23)) == "civil_commercial"
+    second.storage.close()
+
+    config.daily_case_rotation_start_date = "2026-10-01"
+    third = LawAssistantService(
+        SQLiteStorage(database),
+        config=config,
+        clock=lambda: datetime(2026, 9, 23, 16, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    third.materialize_config_rotation_anchors()
+    assert (
+        third.effective_daily_plan(None, "daily_case").rotation_start_date
+        == "2026-10-01"
+    )
+    third.storage.close()
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -78,8 +77,6 @@ class PluginConfig:
         case_rotation_start_date = _normalize_date(
             values.get("daily_case_rotation_start_date")
         )
-        if case_selection_mode == "rotation" and case_rotation_start_date is None:
-            case_rotation_start_date = _local_today(timezone_name)
         question_selection_mode = normalize_selection_mode(
             values.get("daily_question_selection_mode", "random")
         )
@@ -91,11 +88,6 @@ class PluginConfig:
         question_rotation_start_date = _normalize_date(
             values.get("daily_question_rotation_start_date")
         )
-        if (
-            question_selection_mode == "rotation"
-            and question_rotation_start_date is None
-        ):
-            question_rotation_start_date = _local_today(timezone_name)
         return cls(
             operator_ids=_normalize_operator_ids(values.get("operator_ids", [])),
             timezone=timezone_name,
@@ -259,10 +251,6 @@ def _normalize_date(value: Any) -> str | None:
         return date.fromisoformat(candidate).isoformat()
     except ValueError:
         return None
-
-
-def _local_today(timezone_name: str) -> str:
-    return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
 
 
 def _normalize_index(value: Any) -> int:

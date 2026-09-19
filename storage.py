@@ -424,6 +424,27 @@ class SQLiteStorage:
         ).fetchone()
         return int(row["value"]) if row else 0
 
+    def get_rotation_anchor(self, content_type: str) -> str | None:
+        if content_type not in {"daily_case", "daily_question"}:
+            raise ValueError(f"unsupported daily content type: {content_type}")
+        row = self._connection.execute(
+            "SELECT value FROM schema_meta WHERE key = ?",
+            (f"rotation_anchor:{content_type}",),
+        ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_rotation_anchor(self, content_type: str, value: str) -> None:
+        if content_type not in {"daily_case", "daily_question"}:
+            raise ValueError(f"unsupported daily content type: {content_type}")
+        self._connection.execute(
+            """
+            INSERT INTO schema_meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"rotation_anchor:{content_type}", value),
+        )
+        self._connection.commit()
+
     def _initialize_schema(self) -> None:
         connection = self._connection
         connection.execute("BEGIN")

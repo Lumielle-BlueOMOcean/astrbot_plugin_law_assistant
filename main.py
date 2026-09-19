@@ -140,6 +140,7 @@ class LawAssistant(Star):
             config=self.plugin_config,
             logger=logger,
         )
+        self.service.materialize_config_rotation_anchors()
         self.scheduler = LawAssistantScheduler(
             self.service,
             enabled=(
@@ -187,8 +188,10 @@ class LawAssistant(Star):
     @filter.command("law")
     async def law(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """法务助手统一控制命令；管理扫描、发布和确认只接受私聊。"""
+        message_text = str(event.get_message_str() or "").strip()
+        question_import_path = _extract_question_import_path(message_text)
         try:
-            parts = shlex.split(str(event.get_message_str() or "").strip())
+            parts = shlex.split(message_text)
         except ValueError as exc:
             yield event.plain_result(f"命令格式错误：{exc}")
             return
@@ -302,7 +305,9 @@ class LawAssistant(Star):
                 text = str(exc)
         elif subcommand in {"question-import", "import-questions"} and len(parts) > 2:
             text = _json_text(
-                self.service.import_real_questions_file(" ".join(parts[2:]))
+                self.service.import_real_questions_file(
+                    question_import_path or " ".join(parts[2:])
+                )
             )
         elif subcommand == "case-tag" and len(parts) > 2:
             text = _json_text(
@@ -761,7 +766,28 @@ def _parse_question_args(parts: list[str]) -> tuple[str, str, str | None]:
             continue
         if normalize_subject(part):
             subject = part
+            continue
+        if not subject:
+            subject = part
+        else:
+            question_type = part
     return origin, subject, question_type
+
+
+def _extract_question_import_path(message_text: str) -> str | None:
+    """Read the raw import tail so Windows backslashes survive shlex parsing."""
+    fields = message_text.strip().split(None, 2)
+    if len(fields) < 3:
+        return None
+    if fields[0].lower() != "/law" or fields[1].lower() not in {
+        "question-import",
+        "import-questions",
+    }:
+        return None
+    path = fields[2].strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in {"'", '"'}:
+        path = path[1:-1]
+    return path or None
 
 
 def _event_dict(event: Any) -> dict[str, Any]:

@@ -89,3 +89,15 @@ def test_config_normalizes_daily_plan_subjects_and_dates() -> None:
     assert config.daily_question_origin == "real"
     assert config.daily_question_type == "multiple_choice"
     assert config.daily_question_subject == "economic_law"
+
+
+def test_config_keeps_missing_rotation_anchor_unset_for_persistence_layer() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "daily_question_enabled": True,
+            "daily_question_selection_mode": "rotation",
+            "daily_question_rotation_subjects": ["刑法", "民商法"],
+        }
+    )
+
+    assert config.daily_question_rotation_start_date is None

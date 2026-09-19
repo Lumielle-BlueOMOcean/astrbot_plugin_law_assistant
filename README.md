@@ -80,6 +80,8 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 - `daily_case_selection_mode`、`daily_question_selection_mode`：`random`、`fixed` 或 `rotation`。
 - `*_rotation_subjects`、`*_rotation_start_date`、`*_rotation_start_index`：案例和题目各自独立的有序轮换列表及起点。
 
+选择 `rotation` 并留空起始日期时，首次启用会按配置时区当天建立持久化锚点；之后重启不会重新计算，案例和题目分别保存。明确填写的新起始日期及已确认的群级/全局计划优先。
+
 内置学校四方向预设的顺序是：知识产权 → 民商法 → 司法实务 → 经济法。预设不是默认行为，需在配置或确认计划变更时主动应用。
 
 群级计划保存于运行时 SQLite：群级有明确值时只覆盖对应群、对应内容类型；未覆盖的内容类型继续继承全局默认。计划变更必须先预览，再使用确认 token 保存。

@@ -470,7 +470,36 @@ class LawAssistantService:
                 ),
                 "question_type": getattr(self.config, "daily_question_type", None),
             }
-        return DailyPlan.from_mapping(content_type, values)
+        if str(
+            values.get("selection_mode", "random")
+        ).strip().lower() == "rotation" and not values.get("rotation_start_date"):
+            values["rotation_start_date"] = self.storage.get_rotation_anchor(
+                content_type
+            )
+        return DailyPlan.from_mapping(
+            content_type, values, allow_unanchored_rotation=True
+        )
+
+    def materialize_config_rotation_anchors(self) -> None:
+        """Persist missing global rotation anchors exactly once per plan."""
+        local_today = (
+            _local_datetime(
+                self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
+            )
+            .date()
+            .isoformat()
+        )
+        for content_type in ("daily_case", "daily_question"):
+            if self.storage.get_daily_plan(None, content_type) is not None:
+                continue
+            plan = self._config_default_plan(content_type)
+            if (
+                plan.enabled
+                and plan.selection_mode == "rotation"
+                and plan.rotation_subjects
+                and plan.rotation_start_date is None
+            ):
+                self.storage.set_rotation_anchor(content_type, local_today)
 
     def effective_daily_plan(
         self, target_id: int | None, content_type: str

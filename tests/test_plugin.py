@@ -239,6 +239,64 @@ async def test_question_import_command_accepts_quoted_path_and_reports_inventory
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "reason_fragment"),
+    [
+        ("real 不存在的方向 多选", "不支持的方向"),
+        ("real 刑法 不存在的题型", "不支持的题型"),
+        ("不存在的来源 刑法 单选", "不支持的题目来源"),
+    ],
+)
+async def test_question_command_rejects_unknown_explicit_parameters_at_entrypoint(
+    plugin_module, arguments, reason_fragment
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    response = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=True,
+                sender_id="42",
+                message=f"/law question {arguments}",
+            )
+        )
+    ]
+
+    assert '"error": "invalid_parameter"' in response[0]
+    assert reason_fragment in response[0]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_question_import_command_preserves_quoted_windows_path(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    captured: list[str] = []
+
+    def capture(path: str) -> dict[str, object]:
+        captured.append(path)
+        return {"success": True, "path": path, "imported_count": 0}
+
+    plugin.service.import_real_questions_file = capture
+    windows_path = r"C:\Users\Alice\verified questions.json"
+    response = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=True,
+                sender_id="42",
+                message=f'/law question-import "{windows_path}"',
+            )
+        )
+    ]
+
+    assert captured == [windows_path]
+    assert json.loads(response[0])["path"] == windows_path
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_confirming_daily_plan_wakes_initially_disabled_plugin_scheduler(
     plugin_module,
 ):
@@ -264,3 +322,22 @@ async def test_confirming_daily_plan_wakes_initially_disabled_plugin_scheduler(
     assert plugin.scheduler.enabled is True
     assert plugin.scheduler.task is not None
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_plugin_persists_global_rotation_anchor_across_reinitialization(
+    plugin_module,
+):
+    config = {
+        "daily_question_enabled": True,
+        "daily_question_selection_mode": "rotation",
+        "daily_question_rotation_subjects": ["刑法", "民商法"],
+    }
+    first = plugin_module.LawAssistant(None, config)
+    first_anchor = first.storage.get_rotation_anchor("daily_question")
+    assert first_anchor is not None
+    await first.terminate()
+
+    second = plugin_module.LawAssistant(None, config)
+    assert second.storage.get_rotation_anchor("daily_question") == first_anchor
+    await second.terminate()

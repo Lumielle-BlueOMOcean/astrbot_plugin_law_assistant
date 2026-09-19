@@ -46,7 +46,11 @@ class DailyPlan:
 
     @classmethod
     def from_mapping(
-        cls, content_type: str, raw: dict[str, Any] | None = None
+        cls,
+        content_type: str,
+        raw: dict[str, Any] | None = None,
+        *,
+        allow_unanchored_rotation: bool = False,
     ) -> DailyPlan:
         if content_type not in {"daily_case", "daily_question"}:
             raise ValueError(f"unsupported daily content type: {content_type}")
@@ -86,7 +90,11 @@ class DailyPlan:
                 start_date = date.fromisoformat(start_date).isoformat()
             except ValueError as exc:
                 raise ValueError("rotation_start_date 必须是 YYYY-MM-DD") from exc
-        if selection_mode == "rotation" and start_date is None:
+        if (
+            selection_mode == "rotation"
+            and start_date is None
+            and not allow_unanchored_rotation
+        ):
             raise ValueError("rotation 选择模式必须提供 rotation_start_date")
         try:
             start_index = int(values.get("rotation_start_index", 0) or 0)

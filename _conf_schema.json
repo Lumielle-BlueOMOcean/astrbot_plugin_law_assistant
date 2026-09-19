@@ -80,7 +80,7 @@
   "daily_case_rotation_start_date": {
     "type": "string",
     "default": "",
-    "description": "每日案例轮换起始日期 YYYY-MM-DD。"
+    "description": "每日案例轮换起始日期 YYYY-MM-DD；留空时首次启用按配置时区建立持久化锚点。"
   },
   "daily_case_rotation_start_index": {
     "type": "int",
@@ -127,7 +127,7 @@
   "daily_question_rotation_start_date": {
     "type": "string",
     "default": "",
-    "description": "每日一题轮换起始日期 YYYY-MM-DD。"
+    "description": "每日一题轮换起始日期 YYYY-MM-DD；留空时首次启用按配置时区建立持久化锚点。"
   },
   "daily_question_rotation_start_index": {
     "type": "int",
