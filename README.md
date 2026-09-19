@@ -18,7 +18,7 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 可选法律法规更新列表接口。
 - 已绑定目标的 DDL 提醒；新事件自动发布可由 operator 预授权开启。
 - 发布操作默认 `prepare → preview → explicit confirm → execute`，按事件 revision、目标和发布类型幂等。
-- 自动 scheduler 默认关闭；启用后统一调用 service，reload 会取消任务。
+- 自动 scheduler 默认关闭；计划在运行中经确认启用后会唤醒同一个 scheduler，不需要手动 reload；reload/terminate 会取消任务。
 - Python 3.12 单元测试、ruff、compile 和真实 AstrBot 4.22.0/4.25.0 loader smoke。
 
 ## Planned / deferred
@@ -94,7 +94,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 ## Commands and LLM Tools
 
-管理命令需要 AstrBot Admin 或 configured operator。扫描、查询、发布和确认要求私聊；`bind`/`unbind` 可由管理员或 operator 在群聊中绑定当前会话目标。
+管理命令需要 AstrBot Admin 或 configured operator。扫描、查询、发布和确认要求私聊；`bind`/`unbind`/`rename` 可由管理员或 operator 在群聊中操作当前会话目标。DDL 提醒使用配置时区的本地日历日期。
 
 ```text
 /law status
@@ -104,8 +104,10 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law deadlines
 /law sources
 /law targets
-/law bind [unified_msg_origin]
+/law bind [当前群别名]
+/law bind-umo <unified_msg_origin> [群别名]
 /law unbind [unified_msg_origin]
+/law rename <目标群名或 ID> <新别名>
 /law publish <id>
 /law confirm <token>
 /law case [方向]
@@ -117,15 +119,19 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law help
 ```
 
-自然语言可以直接说“给我一道知识产权真题多选题”“给我一个刑法案例”“把这道题发到一群和二群”“看看未来七天一群的安排”。对应 Tools 会把理解后的来源、方向、题型和目标传给 Service；所有 Tool 仍执行私聊、Admin/operator 权限检查。
+群内 `/law bind 法硕一群` 会把当前群的真实 `unified_msg_origin` 与别名一起保存；私聊绑定其他目标必须使用明确的 `/law bind-umo <unified_msg_origin> [群别名]`，插件不会根据群名猜 UMO。已绑定群可用 `/law rename <目标群名或 ID> <新别名>` 改名，或在当前群使用 `/law rename <新别名>`。
+
+自然语言可以直接说“给我一道知识产权真题多选题”“给我一个刑法案例”“把这道题发到一群和二群”“看看未来七天一群的安排”。`law_get_daily_case` 与 `law_generate_question` 返回短期、绑定操作者和私聊会话的 `content_ref`；随后发布 Tool 传入该引用即可发布刚才看到的同一条内容，不会重新随机或生成。若明确要求重新出题，则不传引用。所有 Tool 仍执行私聊、Admin/operator 权限检查。
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_list_targets`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
+可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
 
 ### 真题导入格式
 
-管理员可在私聊执行 `/law question-import <path>`，导入用户合法取得且已核验的 JSON。文件可以是数组，也可以是 `{ "questions": [...] }`。每条记录至少需要：`source_name`、`exam_name`、`subject`、`question_type`、`stem`，以及 `source_url`、`source_locator` 或 `question_number` 之一；还必须明确 `verification_status` 为 `verified`、`official` 或 `user_verified`。
+管理员可在私聊执行 `/law question-import <path>`，导入用户合法取得且已核验的 JSON；带空格的路径请使用引号。文件可以是数组，也可以是 `{ "questions": [...] }`。每条记录至少需要：`source_name`、`exam_name`、`subject`、`question_type`、`stem`，以及 `source_url`、`source_locator` 或 `question_number` 之一；还必须明确 `verification_status` 为 `verified`、`official` 或 `user_verified`。导入命令会返回新增数量和当前库存；仓库不内置伪造或未经授权的真题。
+
+自然语言修改每日计划时，服务会先返回作用群、案例/题目范围、来源/题型、方向模式及未来安排预览，只有明确确认后才保存。计划的参数若明确提供了不支持的方向、题型、来源或选择模式会直接报错，不会静默改成随机；rotation 未提供起始日期时按配置时区的当天日期起算。案例与每日一题分别持有自己的全局默认和群级覆盖，暂停一项不会停止其他群或另一种内容。
 
 ```json
 {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -65,9 +66,39 @@ class PluginConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> PluginConfig:
         values = raw or {}
+        timezone_name = _normalize_timezone(values.get("timezone", DEFAULT_TIMEZONE))
+        case_selection_mode = normalize_selection_mode(
+            values.get("daily_case_selection_mode", "random")
+        )
+        case_rotation_subjects = _normalize_subjects(
+            values.get("daily_case_rotation_subjects", [])
+        )
+        if case_selection_mode == "rotation" and not case_rotation_subjects:
+            case_selection_mode = "random"
+        case_rotation_start_date = _normalize_date(
+            values.get("daily_case_rotation_start_date")
+        )
+        if case_selection_mode == "rotation" and case_rotation_start_date is None:
+            case_rotation_start_date = _local_today(timezone_name)
+        question_selection_mode = normalize_selection_mode(
+            values.get("daily_question_selection_mode", "random")
+        )
+        question_rotation_subjects = _normalize_subjects(
+            values.get("daily_question_rotation_subjects", [])
+        )
+        if question_selection_mode == "rotation" and not question_rotation_subjects:
+            question_selection_mode = "random"
+        question_rotation_start_date = _normalize_date(
+            values.get("daily_question_rotation_start_date")
+        )
+        if (
+            question_selection_mode == "rotation"
+            and question_rotation_start_date is None
+        ):
+            question_rotation_start_date = _local_today(timezone_name)
         return cls(
             operator_ids=_normalize_operator_ids(values.get("operator_ids", [])),
-            timezone=_normalize_timezone(values.get("timezone", DEFAULT_TIMEZONE)),
+            timezone=timezone_name,
             auto_scan_enabled=_to_bool(values.get("auto_scan_enabled", False)),
             scan_interval_minutes=_normalize_interval(
                 values.get("scan_interval_minutes", DEFAULT_SCAN_INTERVAL_MINUTES),
@@ -87,16 +118,10 @@ class PluginConfig:
             daily_case_time=_normalize_time(
                 values.get("daily_case_time", DEFAULT_DAILY_TIME)
             ),
-            daily_case_selection_mode=normalize_selection_mode(
-                values.get("daily_case_selection_mode", "random")
-            ),
+            daily_case_selection_mode=case_selection_mode,
             daily_case_subject=normalize_subject(values.get("daily_case_subject")),
-            daily_case_rotation_subjects=_normalize_subjects(
-                values.get("daily_case_rotation_subjects", [])
-            ),
-            daily_case_rotation_start_date=_normalize_date(
-                values.get("daily_case_rotation_start_date")
-            ),
+            daily_case_rotation_subjects=case_rotation_subjects,
+            daily_case_rotation_start_date=case_rotation_start_date,
             daily_case_rotation_start_index=_normalize_index(
                 values.get("daily_case_rotation_start_index", 0)
             ),
@@ -106,9 +131,7 @@ class PluginConfig:
             daily_question_time=_normalize_time(
                 values.get("daily_question_time", DEFAULT_DAILY_TIME)
             ),
-            daily_question_selection_mode=normalize_selection_mode(
-                values.get("daily_question_selection_mode", "random")
-            ),
+            daily_question_selection_mode=question_selection_mode,
             daily_question_origin=normalize_origin(
                 values.get("daily_question_origin", "random")
             ),
@@ -118,12 +141,8 @@ class PluginConfig:
             daily_question_type=normalize_question_type(
                 values.get("daily_question_type")
             ),
-            daily_question_rotation_subjects=_normalize_subjects(
-                values.get("daily_question_rotation_subjects", [])
-            ),
-            daily_question_rotation_start_date=_normalize_date(
-                values.get("daily_question_rotation_start_date")
-            ),
+            daily_question_rotation_subjects=question_rotation_subjects,
+            daily_question_rotation_start_date=question_rotation_start_date,
             daily_question_rotation_start_index=_normalize_index(
                 values.get("daily_question_rotation_start_index", 0)
             ),
@@ -240,6 +259,10 @@ def _normalize_date(value: Any) -> str | None:
         return date.fromisoformat(candidate).isoformat()
     except ValueError:
         return None
+
+
+def _local_today(timezone_name: str) -> str:
+    return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
 
 
 def _normalize_index(value: Any) -> int:

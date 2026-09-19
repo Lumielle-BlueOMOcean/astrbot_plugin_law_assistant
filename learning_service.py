@@ -14,6 +14,7 @@ if __package__ and "." in __package__:
         QuestionRequest,
         RealQuestion,
         normalize_subject,
+        parse_subject,
         subject_matches,
         validate_generated_question,
     )
@@ -26,6 +27,7 @@ else:
         QuestionRequest,
         RealQuestion,
         normalize_subject,
+        parse_subject,
         subject_matches,
         validate_generated_question,
     )
@@ -58,8 +60,9 @@ class LearningService:
         subject: str | None = None,
         session_origin: str | None = None,
     ) -> dict[str, Any]:
+        requested_subject = parse_subject(subject)
         items = self.storage.list_case_items(limit=500)
-        if subject:
+        if requested_subject:
             items = [
                 item
                 for item in items
@@ -71,7 +74,7 @@ class LearningService:
                         if item.metadata.get("subject")
                         else ()
                     ),
-                    subject,
+                    requested_subject,
                 )
             ]
             if not items:
@@ -101,7 +104,7 @@ class LearningService:
             "title": selected.title,
             "source_url": selected.source_url,
             "authority": selected.authority,
-            "subject": normalize_subject(subject)
+            "subject": requested_subject
             or next(
                 (
                     normalize_subject(value)

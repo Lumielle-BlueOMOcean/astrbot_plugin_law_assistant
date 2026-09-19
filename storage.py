@@ -18,7 +18,7 @@ else:
     from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -368,11 +368,35 @@ def _migrate_3_to_4(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_4_to_5(connection: sqlite3.Connection) -> None:
+    """Separate source-provided case subjects from operator classifications."""
+    if not _table_exists(connection, "case_items"):
+        return
+    _add_column_if_missing(
+        connection,
+        "case_items",
+        "manual_subjects_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    # Before v5 every stored subject could have come from /law case-tag. Keep
+    # those labels as manual classifications instead of allowing the next
+    # source refresh to erase them.
+    connection.execute(
+        """
+        UPDATE case_items
+        SET manual_subjects_json = subjects_json,
+            subjects_json = '[]'
+        WHERE manual_subjects_json = '[]' AND subjects_json <> '[]'
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
+    4: _migrate_4_to_5,
 }
 
 
@@ -852,6 +876,18 @@ class SQLiteStorage:
         self._connection.commit()
         return cursor.rowcount > 0
 
+    def rename_target(self, target_id: int, label: str) -> dict[str, Any]:
+        now = _serialize_datetime(DateTime.now(timezone.utc))
+        cursor = self._connection.execute(
+            "UPDATE publish_targets SET label = ?, updated_at = ? WHERE id = ?",
+            (str(label).strip(), now, target_id),
+        )
+        self._connection.commit()
+        if cursor.rowcount == 0:
+            return {"success": False, "reason": "未找到发布目标"}
+        target = self.get_target(target_id)
+        return {"success": True, "target": target}
+
     def list_targets(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         query = "SELECT * FROM publish_targets"
         if enabled_only:
@@ -1173,8 +1209,8 @@ class SQLiteStorage:
             INSERT INTO case_items(
                 source_key, source_item_key, title, published_at, source_url,
                 authority, raw_text, content_hash, discovered_at, last_seen_at,
-                subjects_json, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                subjects_json, manual_subjects_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_key, source_item_key) DO UPDATE SET
                 title = excluded.title, published_at = excluded.published_at,
                 source_url = excluded.source_url, authority = excluded.authority,
@@ -1194,6 +1230,7 @@ class SQLiteStorage:
                 _serialize_datetime(discovered),
                 _serialize_datetime(now),
                 json.dumps(item.subjects, ensure_ascii=False),
+                json.dumps([], ensure_ascii=False),
                 json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
             ),
         )
@@ -1209,7 +1246,7 @@ class SQLiteStorage:
             dict.fromkeys(str(item).strip() for item in subjects if str(item).strip())
         )
         cursor = self._connection.execute(
-            "UPDATE case_items SET subjects_json = ? WHERE id = ?",
+            "UPDATE case_items SET manual_subjects_json = ? WHERE id = ?",
             (json.dumps(normalized, ensure_ascii=False), case_id),
         )
         self._connection.commit()
@@ -1586,6 +1623,8 @@ def _daily_plan_record(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _case_from_row(row: sqlite3.Row) -> CaseItem:
+    source_subjects = tuple(json.loads(row["subjects_json"]))
+    manual_subjects = tuple(json.loads(row["manual_subjects_json"]))
     return CaseItem(
         id=int(row["id"]),
         source_key=row["source_key"],
@@ -1600,7 +1639,7 @@ def _case_from_row(row: sqlite3.Row) -> CaseItem:
         ),
         discovered_at=row["discovered_at"],
         last_seen_at=row["last_seen_at"],
-        subjects=tuple(json.loads(row["subjects_json"])),
+        subjects=tuple(dict.fromkeys((*source_subjects, *manual_subjects))),
         metadata=json.loads(row["metadata_json"]),
     )
 

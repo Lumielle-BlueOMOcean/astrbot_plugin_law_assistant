@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import logging
 import secrets
@@ -12,6 +13,9 @@ if __package__ and "." in __package__:
     from .content import (
         format_question_content,
         normalize_subject,
+        parse_origin,
+        parse_question_type,
+        parse_subject,
     )
     from .daily_plans import DailyPlan
     from .learning_service import LearningService
@@ -23,6 +27,9 @@ else:
     from content import (
         format_question_content,
         normalize_subject,
+        parse_origin,
+        parse_question_type,
+        parse_subject,
     )
     from daily_plans import DailyPlan
     from learning_service import LearningService
@@ -70,6 +77,16 @@ class PendingPlanUpdate:
     owner_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ContentReference:
+    content_type: str
+    content: dict[str, Any]
+    owner_id: str
+    session_origin: str
+    created_at: datetime
+    expires_at: datetime
+
+
 class LawAssistantService:
     """The single business facade used by commands, tools and scheduler."""
 
@@ -100,6 +117,12 @@ class LawAssistantService:
         self._scan_lock = asyncio.Lock()
         self._publish_confirmations: dict[str, PendingPublication] = {}
         self._plan_confirmations: dict[str, PendingPlanUpdate] = {}
+        self._content_references: dict[str, ContentReference] = {}
+        self._scheduler_wakeup: Any | None = None
+
+    def set_scheduler_wakeup(self, callback: Any | None) -> None:
+        """Register the host scheduler's idempotent wake-up callback."""
+        self._scheduler_wakeup = callback
 
     async def status(self) -> dict[str, Any]:
         return {
@@ -374,6 +397,29 @@ class LawAssistantService:
     ) -> dict[str, Any]:
         return self.storage.bind_target(unified_msg_origin, label)
 
+    async def rename_target(self, selector: str, label: str) -> dict[str, Any]:
+        needle = str(selector or "").strip()
+        new_label = str(label or "").strip()
+        if not needle:
+            return {
+                "success": False,
+                "reason": "必须提供明确的目标群 ID、UMO 或现有别名",
+            }
+        if not new_label:
+            return {"success": False, "reason": "群别名不能为空"}
+        matches = [
+            target
+            for target in self.storage.list_targets(enabled_only=False)
+            if needle == str(target["id"])
+            or needle == target["unified_msg_origin"]
+            or needle.casefold() == str(target["label"]).casefold()
+        ]
+        if len(matches) > 1:
+            return {"success": False, "reason": f"群名称有歧义：{needle}"}
+        if not matches:
+            return {"success": False, "reason": f"未找到发布目标：{needle}"}
+        return self.storage.rename_target(matches[0]["id"], new_label)
+
     async def unbind_target(self, unified_msg_origin: str) -> bool:
         return self.storage.unbind_target(unified_msg_origin)
 
@@ -385,46 +431,46 @@ class LawAssistantService:
 
     def _config_default_plan(self, content_type: str) -> DailyPlan:
         if content_type == "daily_case":
-            return DailyPlan(
-                content_type=content_type,
-                enabled=bool(getattr(self.config, "daily_case_enabled", False)),
-                time=str(getattr(self.config, "daily_case_time", "08:00")),
-                selection_mode=str(
+            values = {
+                "enabled": bool(getattr(self.config, "daily_case_enabled", False)),
+                "time": str(getattr(self.config, "daily_case_time", "08:00")),
+                "selection_mode": str(
                     getattr(self.config, "daily_case_selection_mode", "random")
                 ),
-                fixed_subject=getattr(self.config, "daily_case_subject", None),
-                rotation_subjects=tuple(
+                "fixed_subject": getattr(self.config, "daily_case_subject", None),
+                "rotation_subjects": tuple(
                     getattr(self.config, "daily_case_rotation_subjects", ())
                 ),
-                rotation_start_date=getattr(
+                "rotation_start_date": getattr(
                     self.config, "daily_case_rotation_start_date", None
                 ),
-                rotation_start_index=int(
+                "rotation_start_index": int(
                     getattr(self.config, "daily_case_rotation_start_index", 0)
                 ),
-            )
-        return DailyPlan(
-            content_type=content_type,
-            enabled=bool(getattr(self.config, "daily_question_enabled", False)),
-            time=str(getattr(self.config, "daily_question_time", "08:00")),
-            selection_mode=str(
-                getattr(self.config, "daily_question_selection_mode", "random")
-            ),
-            fixed_subject=getattr(self.config, "daily_question_subject", None),
-            rotation_subjects=tuple(
-                getattr(self.config, "daily_question_rotation_subjects", ())
-            ),
-            rotation_start_date=getattr(
-                self.config, "daily_question_rotation_start_date", None
-            ),
-            rotation_start_index=int(
-                getattr(self.config, "daily_question_rotation_start_index", 0)
-            ),
-            question_origin=str(
-                getattr(self.config, "daily_question_origin", "random")
-            ),
-            question_type=getattr(self.config, "daily_question_type", None),
-        )
+            }
+        else:
+            values = {
+                "enabled": bool(getattr(self.config, "daily_question_enabled", False)),
+                "time": str(getattr(self.config, "daily_question_time", "08:00")),
+                "selection_mode": str(
+                    getattr(self.config, "daily_question_selection_mode", "random")
+                ),
+                "fixed_subject": getattr(self.config, "daily_question_subject", None),
+                "rotation_subjects": tuple(
+                    getattr(self.config, "daily_question_rotation_subjects", ())
+                ),
+                "rotation_start_date": getattr(
+                    self.config, "daily_question_rotation_start_date", None
+                ),
+                "rotation_start_index": int(
+                    getattr(self.config, "daily_question_rotation_start_index", 0)
+                ),
+                "question_origin": str(
+                    getattr(self.config, "daily_question_origin", "random")
+                ),
+                "question_type": getattr(self.config, "daily_question_type", None),
+            }
+        return DailyPlan.from_mapping(content_type, values)
 
     def effective_daily_plan(
         self, target_id: int | None, content_type: str
@@ -513,15 +559,19 @@ class LawAssistantService:
                 "reason": "content_type 必须是 daily_case、daily_question 或 both",
             }
         values = changes or {}
+        local_today = _local_datetime(
+            self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
+        ).date()
         plans: list[DailyPlan] = []
         for item in content_types:
             current = self.effective_daily_plan(target_id, item).to_mapping()
             item_values = values.get(item, values) if isinstance(values, dict) else {}
             merged = {**current, **item_values, "content_type": item}
+            if str(
+                merged.get("selection_mode", "random")
+            ).strip().lower() == "rotation" and not merged.get("rotation_start_date"):
+                merged["rotation_start_date"] = local_today.isoformat()
             plans.append(DailyPlan.from_mapping(item, merged))
-        local_today = _local_datetime(
-            self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
-        ).date()
         token = secrets.token_urlsafe(12)
         created = self._now_utc()
         self._plan_confirmations[token] = PendingPlanUpdate(
@@ -562,7 +612,31 @@ class LawAssistantService:
                 return {"success": False, "reason": "目标群已不存在或已停用"}
         for plan in pending.plans:
             self.storage.upsert_daily_plan(plan, pending.target_id)
+        if any(plan.enabled for plan in pending.plans) or self._has_enabled_plan():
+            await self._wake_scheduler()
         return {"success": True, "content_types": list(pending.content_types)}
+
+    def _has_enabled_plan(self) -> bool:
+        if any(
+            bool(getattr(self.config, name, False))
+            for name in (
+                "auto_scan_enabled",
+                "daily_case_enabled",
+                "daily_question_enabled",
+                "law_update_enabled",
+            )
+        ):
+            return True
+        return any(
+            bool(item.get("enabled")) for item in self.storage.list_daily_plans()
+        )
+
+    async def _wake_scheduler(self) -> None:
+        if self._scheduler_wakeup is None:
+            return
+        result = self._scheduler_wakeup()
+        if inspect.isawaitable(result):
+            await result
 
     def _resolve_targets(self, selectors: list[str] | None) -> list[dict[str, Any]]:
         targets = self.storage.list_targets(enabled_only=True)
@@ -664,17 +738,29 @@ class LawAssistantService:
         target_selectors: list[str] | None = None,
         session_origin: str | None = None,
         actor_id: str | None = None,
+        content_ref: str | None = None,
     ) -> dict[str, Any]:
         try:
             targets = self._resolve_targets(target_selectors)
         except ValueError as exc:
             return {"ready": False, "reason": str(exc)}
-        content = await self.generate_question(
-            subject or "",
-            origin=origin,
-            question_type=question_type,
-            session_origin=session_origin,
-        )
+        if content_ref:
+            content, reference_error = self._take_content_reference(
+                content_ref,
+                content_type="question",
+                actor_id=actor_id,
+                session_origin=session_origin,
+            )
+            if content is None:
+                return {"ready": False, "reason": reference_error}
+        else:
+            content = await self.generate_question(
+                subject or "",
+                origin=origin,
+                question_type=question_type,
+                session_origin=session_origin,
+                actor_id=actor_id,
+            )
         if not content.get("available"):
             return {"ready": False, **content}
         body = format_question_content(content)
@@ -694,6 +780,7 @@ class LawAssistantService:
             "content_type": "question",
             "targets": targets,
             "preview": body,
+            "content_ref": content.get("content_ref"),
             "selection": {
                 key: content.get(key)
                 for key in ("origin", "subject", "question_type", "source_url")
@@ -708,14 +795,27 @@ class LawAssistantService:
         target_selectors: list[str] | None = None,
         session_origin: str | None = None,
         actor_id: str | None = None,
+        content_ref: str | None = None,
     ) -> dict[str, Any]:
         try:
             targets = self._resolve_targets(target_selectors)
         except ValueError as exc:
             return {"ready": False, "reason": str(exc)}
-        content = await self.get_daily_case(
-            subject=subject, session_origin=session_origin
-        )
+        if content_ref:
+            content, reference_error = self._take_content_reference(
+                content_ref,
+                content_type="case",
+                actor_id=actor_id,
+                session_origin=session_origin,
+            )
+            if content is None:
+                return {"ready": False, "reason": reference_error}
+        else:
+            content = await self.get_daily_case(
+                subject=subject,
+                session_origin=session_origin,
+                actor_id=actor_id,
+            )
         if not content.get("available"):
             return {"ready": False, **content}
         body = _format_daily_content("daily_case", content)
@@ -735,7 +835,58 @@ class LawAssistantService:
             "content_type": "case",
             "targets": targets,
             "preview": body,
+            "content_ref": content.get("content_ref"),
         }
+
+    def _remember_content(
+        self,
+        content_type: str,
+        content: dict[str, Any],
+        *,
+        actor_id: str | None,
+        session_origin: str | None,
+    ) -> dict[str, Any]:
+        if not actor_id or not session_origin or not content.get("available"):
+            return content
+        token = secrets.token_urlsafe(12)
+        now = self._now_utc()
+        self._content_references[token] = ContentReference(
+            content_type=content_type,
+            content=copy.deepcopy(content),
+            owner_id=str(actor_id),
+            session_origin=str(session_origin),
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        result = dict(content)
+        result["content_ref"] = token
+        return result
+
+    def _take_content_reference(
+        self,
+        token: str,
+        *,
+        content_type: str,
+        actor_id: str | None,
+        session_origin: str | None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        key = str(token or "").strip()
+        pending = self._content_references.get(key)
+        if pending is None:
+            return None, "内容引用无效、已使用或已过期"
+        if self._now_utc() > pending.expires_at:
+            self._content_references.pop(key, None)
+            return None, "内容引用无效、已使用或已过期"
+        if pending.content_type != content_type:
+            return None, "内容引用类型不匹配"
+        if pending.owner_id != str(actor_id or ""):
+            return None, "内容引用不属于当前操作者"
+        if pending.session_origin != str(session_origin or ""):
+            return None, "内容引用不属于当前会话"
+        self._content_references.pop(key, None)
+        result = copy.deepcopy(pending.content)
+        result["content_ref"] = key
+        return result, ""
 
     async def set_case_subjects(
         self, case_id: int, subjects: list[str]
@@ -847,7 +998,8 @@ class LawAssistantService:
     async def check_deadline_reminders(self, *, now: datetime | None = None) -> int:
         if self.publisher is None:
             return 0
-        current = _as_utc(now or self.clock())
+        timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
+        local_current = _local_datetime(now or self.clock(), timezone_name)
         offsets = set(getattr(self.config, "deadline_reminder_days", (7, 3, 1)))
         if getattr(self.config, "deadline_same_day_enabled", True):
             offsets.add(0)
@@ -856,9 +1008,8 @@ class LawAssistantService:
             event, date = item["event"], item["date"]
             if date.id is None or date.datetime is None:
                 continue
-            remaining = (
-                date.datetime.astimezone(current.tzinfo).date() - current.date()
-            ).days
+            deadline_local = date.datetime.astimezone(local_current.tzinfo)
+            remaining = (deadline_local.date() - local_current.date()).days
             if remaining not in offsets:
                 continue
             for target in self.storage.list_targets(enabled_only=True):
@@ -888,11 +1039,33 @@ class LawAssistantService:
         *,
         subject: str | None = None,
         session_origin: str | None = None,
+        actor_id: str | None = None,
     ) -> dict[str, Any]:
+        try:
+            parse_subject(subject)
+        except ValueError as exc:
+            return {
+                "available": False,
+                "error": "invalid_parameter",
+                "reason": str(exc),
+            }
         if self.learning_service is None:
             return {"available": False, "reason": "daily case service unavailable"}
-        return await self.learning_service.daily_case(
-            subject=subject, session_origin=session_origin
+        try:
+            result = await self.learning_service.daily_case(
+                subject=subject, session_origin=session_origin
+            )
+        except ValueError as exc:
+            return {
+                "available": False,
+                "error": "invalid_parameter",
+                "reason": str(exc),
+            }
+        return self._remember_content(
+            "case",
+            result,
+            actor_id=actor_id,
+            session_origin=session_origin,
         )
 
     async def generate_question(
@@ -904,15 +1077,39 @@ class LawAssistantService:
         source_name: str | None = None,
         exam_year: str | None = None,
         session_origin: str | None = None,
+        actor_id: str | None = None,
     ) -> dict[str, Any]:
+        try:
+            parse_origin(origin)
+            parse_subject(subject)
+            parse_question_type(question_type)
+        except ValueError as exc:
+            return {
+                "available": False,
+                "error": "invalid_parameter",
+                "reason": str(exc),
+            }
         if self.learning_service is None:
             return {"available": False, "reason": "question service unavailable"}
-        return await self.learning_service.generate_question(
-            subject=subject,
-            question_type=question_type,
-            origin=origin,
-            source_name=source_name,
-            exam_year=exam_year,
+        try:
+            result = await self.learning_service.generate_question(
+                subject=subject,
+                question_type=question_type,
+                origin=origin,
+                source_name=source_name,
+                exam_year=exam_year,
+                session_origin=session_origin,
+            )
+        except ValueError as exc:
+            return {
+                "available": False,
+                "error": "invalid_parameter",
+                "reason": str(exc),
+            }
+        return self._remember_content(
+            "question",
+            result,
+            actor_id=actor_id,
             session_origin=session_origin,
         )
 

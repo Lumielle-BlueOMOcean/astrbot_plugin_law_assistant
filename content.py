@@ -123,6 +123,50 @@ def normalize_selection_mode(value: Any) -> str:
     return candidate if candidate in SELECTION_MODES else "random"
 
 
+def parse_subject(value: Any, *, field_name: str = "方向") -> str | None:
+    """Normalize an explicit subject, rejecting unknown values."""
+    candidate = str(value or "").strip()
+    if not candidate or candidate.lower() in {"random", "随机", "任意"}:
+        return None
+    normalized = normalize_subject(candidate)
+    if normalized is None:
+        raise ValueError(f"不支持的{field_name}：{candidate}")
+    return normalized
+
+
+def parse_question_type(value: Any, *, field_name: str = "题型") -> str | None:
+    """Normalize an explicit question type, rejecting unknown values."""
+    candidate = str(value or "").strip()
+    if not candidate or candidate.lower() in {"random", "随机", "任意"}:
+        return None
+    normalized = normalize_question_type(candidate)
+    if normalized is None:
+        raise ValueError(f"不支持的{field_name}：{candidate}")
+    return normalized
+
+
+def parse_origin(value: Any) -> str:
+    """Normalize an explicit question origin, rejecting unknown values."""
+    candidate = str(value or "random").strip().lower()
+    if not candidate or candidate in {"random", "随机", "任意"}:
+        return "random"
+    if candidate not in QUESTION_ORIGINS:
+        raise ValueError(f"不支持的题目来源：{candidate}；可选值为 real、mock、random")
+    return candidate
+
+
+def parse_selection_mode(value: Any) -> str:
+    """Normalize an explicit plan mode, rejecting unknown values."""
+    candidate = str(value or "random").strip().lower()
+    if not candidate or candidate in {"random", "随机", "任意"}:
+        return "random"
+    if candidate not in SELECTION_MODES:
+        raise ValueError(
+            f"不支持的选择模式：{candidate}；可选值为 random、fixed、rotation"
+        )
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class QuestionRequest:
     origin: str = "random"
@@ -142,9 +186,9 @@ class QuestionRequest:
         exam_year: Any = None,
     ) -> QuestionRequest:
         return cls(
-            origin=normalize_origin(origin),
-            subject=normalize_subject(subject),
-            question_type=normalize_question_type(question_type),
+            origin=parse_origin(origin),
+            subject=parse_subject(subject),
+            question_type=parse_question_type(question_type),
             source_name=str(source_name).strip() if source_name else None,
             exam_year=str(exam_year).strip() if exam_year else None,
         )

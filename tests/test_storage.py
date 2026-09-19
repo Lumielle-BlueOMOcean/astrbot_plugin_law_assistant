@@ -85,7 +85,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 4
+    assert storage.schema_version == SCHEMA_VERSION == 5
     assert storage.count_events() == 0
     storage.close()
 
@@ -104,7 +104,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 4",
+        match=r"schema version 99 is newer than supported version 5",
     ):
         SQLiteStorage(db_path)
 
@@ -189,7 +189,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 4
+    assert storage.schema_version == SCHEMA_VERSION == 5
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -234,7 +234,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 4
+    assert storage.schema_version == SCHEMA_VERSION == 5
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -329,7 +329,7 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 4
+    assert reopened.schema_version == 5
     reopened.close()
 
 
@@ -344,7 +344,7 @@ def test_storage_runs_the_v3_to_v4_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 4
+    assert migrated.schema_version == SCHEMA_VERSION == 5
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()

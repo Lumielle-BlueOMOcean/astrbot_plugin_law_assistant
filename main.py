@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,7 @@ class LawAssistant(Star):
             interval_minutes=self.plugin_config.scan_interval_minutes,
             logger=logger,
         )
+        self.service.set_scheduler_wakeup(self._wake_scheduler)
 
     async def initialize(self) -> None:
         await self.scheduler.start()
@@ -162,6 +164,10 @@ class LawAssistant(Star):
         await self.scheduler.stop()
         await self.http.close()
         self.storage.close()
+
+    async def _wake_scheduler(self) -> None:
+        self.scheduler.enabled = True
+        await self.scheduler.start()
 
     def _authorized(
         self, event: AstrMessageEvent, *, allow_group: bool = False
@@ -181,9 +187,13 @@ class LawAssistant(Star):
     @filter.command("law")
     async def law(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """法务助手统一控制命令；管理扫描、发布和确认只接受私聊。"""
-        parts = str(event.get_message_str() or "").strip().split()
+        try:
+            parts = shlex.split(str(event.get_message_str() or "").strip())
+        except ValueError as exc:
+            yield event.plain_result(f"命令格式错误：{exc}")
+            return
         subcommand = parts[1].lower() if len(parts) > 1 else "help"
-        allow_group = subcommand in {"bind", "unbind"}
+        allow_group = subcommand in {"bind", "bind-umo", "unbind", "rename"}
         if not self._authorized(event, allow_group=allow_group):
             yield event.plain_result(self._denial(event, allow_group=allow_group))
             return
@@ -205,9 +215,24 @@ class LawAssistant(Star):
         elif subcommand == "targets":
             text = _json_text(await self.service.list_targets())
         elif subcommand == "bind":
-            target = parts[2] if len(parts) > 2 else _session_origin(event)
+            if event.is_private_chat():
+                if len(parts) < 3 or not _looks_like_umo(parts[2]):
+                    text = (
+                        "私聊绑定请使用 /law bind-umo <unified_msg_origin> [群别名]。"
+                    )
+                else:
+                    text = _json_text(
+                        await self.service.bind_target(parts[2], " ".join(parts[3:]))
+                    )
+            else:
+                text = _json_text(
+                    await self.service.bind_target(
+                        _session_origin(event), " ".join(parts[2:])
+                    )
+                )
+        elif subcommand == "bind-umo" and len(parts) > 2:
             text = _json_text(
-                await self.service.bind_target(target, " ".join(parts[3:]))
+                await self.service.bind_target(parts[2], " ".join(parts[3:]))
             )
         elif subcommand == "unbind":
             target = parts[2] if len(parts) > 2 else _session_origin(event)
@@ -216,6 +241,22 @@ class LawAssistant(Star):
                 if await self.service.unbind_target(target)
                 else "未找到该发布目标。"
             )
+        elif subcommand == "rename":
+            if event.is_private_chat():
+                if len(parts) < 4:
+                    text = "私聊改名请使用 /law rename <目标群名或 ID> <新别名>。"
+                else:
+                    text = _json_text(
+                        await self.service.rename_target(parts[2], " ".join(parts[3:]))
+                    )
+            elif len(parts) > 2:
+                text = _json_text(
+                    await self.service.rename_target(
+                        _session_origin(event), " ".join(parts[2:])
+                    )
+                )
+            else:
+                text = "群聊改名请使用 /law rename <新别名>。"
         elif subcommand == "publish" and len(parts) > 2:
             text = _json_text(
                 await self.service.prepare_publish_event(
@@ -235,6 +276,7 @@ class LawAssistant(Star):
                 await self.service.get_daily_case(
                     subject=" ".join(parts[2:]) or None,
                     session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
                 )
             )
         elif subcommand == "question":
@@ -245,6 +287,7 @@ class LawAssistant(Star):
                     origin=origin,
                     question_type=question_type,
                     session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
                 )
             )
         elif subcommand in {"plans", "plan"}:
@@ -258,7 +301,9 @@ class LawAssistant(Star):
             except ValueError as exc:
                 text = str(exc)
         elif subcommand in {"question-import", "import-questions"} and len(parts) > 2:
-            text = _json_text(await self.service.import_real_questions_file(parts[2]))
+            text = _json_text(
+                self.service.import_real_questions_file(" ".join(parts[2:]))
+            )
         elif subcommand == "case-tag" and len(parts) > 2:
             text = _json_text(
                 await self.service.set_case_subjects(_safe_int(parts[2]), parts[3:])
@@ -329,7 +374,9 @@ class LawAssistant(Star):
             return self._denial(event)
         return _json_text(
             await self.service.get_daily_case(
-                subject=subject or None, session_origin=_session_origin(event)
+                subject=subject or None,
+                session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
             )
         )
 
@@ -356,6 +403,7 @@ class LawAssistant(Star):
                 origin=origin,
                 question_type=question_type or None,
                 session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
             )
         )
 
@@ -373,6 +421,15 @@ class LawAssistant(Star):
             return self._denial(event)
         return _json_text(await self.service.list_targets())
 
+    @filter.llm_tool(name="law_rename_target")
+    async def law_rename_target(
+        self, event: AstrMessageEvent, target: str, label: str
+    ) -> str:
+        """将明确指定的已绑定群目标改为新的可读别名。"""
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(await self.service.rename_target(target, label))
+
     @filter.llm_tool(name="law_get_daily_plans")
     async def law_get_daily_plans(
         self, event: AstrMessageEvent, target: str = "", days: int = 7
@@ -389,7 +446,7 @@ class LawAssistant(Star):
             result = await self.service.list_daily_plans(
                 _split_targets(target) if target else None, days=days
             )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return str(exc)
         return _json_text(result)
 
@@ -401,6 +458,7 @@ class LawAssistant(Star):
         subject: str = "",
         question_type: str = "",
         target: str = "",
+        content_ref: str = "",
     ) -> str:
         """生成并预览一题后定向发布；必须用 law_confirm_publish 明确确认。
 
@@ -409,6 +467,7 @@ class LawAssistant(Star):
             subject(string): 方向，可用中文名称。
             question_type(string): 题型；留空随机。
             target(string): 群名、目标 ID，或用逗号分隔的多个群；留空时仅有一个群才自动选择。
+            content_ref(string): law_generate_question 返回的短期内容引用；提供时复用刚才的原题。
         """
         if not self._authorized(event):
             return self._denial(event)
@@ -420,18 +479,24 @@ class LawAssistant(Star):
                 target_selectors=_split_targets(target) if target else None,
                 session_origin=_session_origin(event),
                 actor_id=str(event.get_sender_id()),
+                content_ref=content_ref or None,
             )
         )
 
     @filter.llm_tool(name="law_prepare_publish_case")
     async def law_prepare_publish_case(
-        self, event: AstrMessageEvent, subject: str = "", target: str = ""
+        self,
+        event: AstrMessageEvent,
+        subject: str = "",
+        target: str = "",
+        content_ref: str = "",
     ) -> str:
         """按方向选择官方案例并预览定向发布；必须明确确认。
 
         Args:
             subject(string): 可选案例方向。
             target(string): 群名、目标 ID，或逗号分隔的多个群。
+            content_ref(string): law_get_daily_case 返回的短期内容引用；提供时复用刚才的案例。
         """
         if not self._authorized(event):
             return self._denial(event)
@@ -441,6 +506,7 @@ class LawAssistant(Star):
                 target_selectors=_split_targets(target) if target else None,
                 session_origin=_session_origin(event),
                 actor_id=str(event.get_sender_id()),
+                content_ref=content_ref or None,
             )
         )
 
@@ -615,7 +681,9 @@ class LawAssistant(Star):
             "用法：/law status、/law scan、/law events、/law deadlines、"
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
-            "/law bind、/law publish <id> [群名]、/law confirm <token>、/law help"
+            "/law bind [当前群别名]、/law bind-umo <UMO> [群别名]、"
+            "/law rename <目标> <新别名>、/law publish <id> [群名]、"
+            "/law confirm <token>、/law help"
         )
 
 
@@ -652,6 +720,16 @@ def _split_targets(value: str) -> list[str]:
     ]
 
 
+def _looks_like_umo(value: str) -> bool:
+    candidate = str(value or "").strip()
+    return ":" in candidate and candidate.split(":", 1)[0] in {
+        "aiocqhttp",
+        "qq",
+        "telegram",
+        "discord",
+    }
+
+
 def _parse_question_args(parts: list[str]) -> tuple[str, str, str | None]:
     try:
         from .content import normalize_question_type, normalize_subject
@@ -661,7 +739,18 @@ def _parse_question_args(parts: list[str]) -> tuple[str, str, str | None]:
     origin = "random"
     subject = ""
     question_type: str | None = None
-    for part in parts:
+    remaining = list(parts)
+    if remaining:
+        first = remaining[0].strip().lower()
+        if (
+            first not in {"real", "mock", "random"}
+            and normalize_question_type(remaining[0]) is None
+            and normalize_subject(remaining[0]) is None
+        ):
+            # The command syntax puts origin first. Preserve an unsupported
+            # explicit value so the service can return a parameter error.
+            origin = remaining.pop(0)
+    for part in remaining:
         candidate = part.strip().lower()
         if candidate in {"real", "mock", "random"}:
             origin = candidate

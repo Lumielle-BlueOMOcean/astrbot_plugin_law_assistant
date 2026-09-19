@@ -6,17 +6,17 @@ from typing import Any
 
 if __package__ and "." in __package__:
     from .content import (
-        normalize_origin,
-        normalize_question_type,
-        normalize_selection_mode,
-        normalize_subject,
+        parse_origin,
+        parse_question_type,
+        parse_selection_mode,
+        parse_subject,
     )
 else:
     from content import (
-        normalize_origin,
-        normalize_question_type,
-        normalize_selection_mode,
-        normalize_subject,
+        parse_origin,
+        parse_question_type,
+        parse_selection_mode,
+        parse_subject,
     )
 
 SCHOOL_ROTATION_SUBJECTS = (
@@ -48,6 +48,8 @@ class DailyPlan:
     def from_mapping(
         cls, content_type: str, raw: dict[str, Any] | None = None
     ) -> DailyPlan:
+        if content_type not in {"daily_case", "daily_question"}:
+            raise ValueError(f"unsupported daily content type: {content_type}")
         values = raw or {}
         raw_subjects = values.get("rotation_subjects", [])
         if isinstance(raw_subjects, str) and raw_subjects.strip().lower() in {
@@ -58,37 +60,51 @@ class DailyPlan:
         }:
             raw_subjects = SCHOOL_ROTATION_SUBJECTS
         if not isinstance(raw_subjects, (list, tuple, set)):
-            raw_subjects = ()
-        subjects = tuple(
-            item
-            for item in (normalize_subject(value) for value in raw_subjects)
-            if item is not None
-        )
-        fixed_subject = normalize_subject(
+            raise TypeError("rotation_subjects 必须是至少包含一个方向的列表")
+        subjects: list[str] = []
+        for value in raw_subjects:
+            subject = parse_subject(value)
+            if subject and subject not in subjects:
+                subjects.append(subject)
+        fixed_subject = parse_subject(
             values.get("fixed_subject", values.get("subject"))
         )
-        selection_mode = normalize_selection_mode(
-            values.get("selection_mode", "random")
-        )
+        selection_mode = parse_selection_mode(values.get("selection_mode", "random"))
         if selection_mode == "rotation" and not subjects and fixed_subject:
-            subjects = (fixed_subject,)
+            subjects = [fixed_subject]
+        if selection_mode == "fixed" and fixed_subject is None:
+            raise ValueError("fixed 选择模式必须提供 fixed_subject")
+        if selection_mode == "rotation" and not subjects:
+            raise ValueError("rotation 选择模式必须提供 rotation_subjects")
+        start_date = (
+            str(values["rotation_start_date"]).strip()
+            if values.get("rotation_start_date")
+            else None
+        )
+        if start_date is not None:
+            try:
+                start_date = date.fromisoformat(start_date).isoformat()
+            except ValueError as exc:
+                raise ValueError("rotation_start_date 必须是 YYYY-MM-DD") from exc
+        if selection_mode == "rotation" and start_date is None:
+            raise ValueError("rotation 选择模式必须提供 rotation_start_date")
+        try:
+            start_index = int(values.get("rotation_start_index", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rotation_start_index 必须是非负整数") from exc
+        if start_index < 0:
+            raise ValueError("rotation_start_index 必须是非负整数")
         return cls(
             content_type=content_type,
             enabled=bool(values.get("enabled", False)),
             time=str(values.get("time", "08:00") or "08:00"),
             selection_mode=selection_mode,
             fixed_subject=fixed_subject,
-            rotation_subjects=subjects,
-            rotation_start_date=(
-                str(values["rotation_start_date"]).strip()
-                if values.get("rotation_start_date")
-                else None
-            ),
-            rotation_start_index=max(
-                0, int(values.get("rotation_start_index", 0) or 0)
-            ),
-            question_origin=normalize_origin(values.get("question_origin", "random")),
-            question_type=normalize_question_type(values.get("question_type")),
+            rotation_subjects=tuple(subjects),
+            rotation_start_date=start_date,
+            rotation_start_index=start_index,
+            question_origin=parse_origin(values.get("question_origin", "random")),
+            question_type=parse_question_type(values.get("question_type")),
         )
 
     def subject_for(self, current_date: date) -> str | None:

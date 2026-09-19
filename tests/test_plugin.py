@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -163,13 +164,103 @@ async def test_group_operator_can_bind_current_unified_message_origin(plugin_mod
                 private=False,
                 sender_id="42",
                 unified_msg_origin="aiocqhttp:group:100",
-                message="/law bind",
+                message="/law bind 法硕一群",
             )
         )
     ]
 
     assert "aiocqhttp:group:100" in response[0]
+    assert "法硕一群" in response[0]
     assert plugin.storage.list_targets()[0]["unified_msg_origin"] == (
         "aiocqhttp:group:100"
     )
+    assert plugin.storage.list_targets()[0]["label"] == "法硕一群"
+    renamed = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=True,
+                sender_id="42",
+                message="/law rename 法硕一群 法硕学习群",
+            )
+        )
+    ]
+    assert "法硕学习群" in renamed[0]
+    assert plugin.storage.list_targets()[0]["label"] == "法硕学习群"
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_question_import_command_accepts_quoted_path_and_reports_inventory(
+    plugin_module, tmp_path
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    question_path = tmp_path / "verified questions with spaces.json"
+    question_path.write_text(
+        json.dumps(
+            {
+                "questions": [
+                    {
+                        "source_name": "合法取得题库",
+                        "exam_name": "示例考试",
+                        "exam_year": "2024",
+                        "source_locator": "第1题",
+                        "source_url": "https://example.test/q/1",
+                        "subject": "刑法",
+                        "question_type": "单选",
+                        "stem": "下列说法正确的是？",
+                        "options": ["A", "B"],
+                        "answer": "A",
+                        "answer_source": "official",
+                        "verification_status": "verified",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=True,
+                sender_id="42",
+                message=f'/law question-import "{question_path}"',
+            )
+        )
+    ]
+
+    assert '"success": true' in response[0]
+    assert '"imported_count": 1' in response[0]
+    assert '"count": 1' in response[0]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_confirming_daily_plan_wakes_initially_disabled_plugin_scheduler(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    await plugin.service.bind_target("aiocqhttp:group:100", "一群")
+    assert plugin.scheduler.enabled is False
+
+    event = FakeEvent(private=True, sender_id="42")
+    preview = json.loads(
+        await plugin.law_prepare_daily_plan_update(
+            event,
+            target="一群",
+            content_type="daily_question",
+            enabled="true",
+            question_origin="mock",
+        )
+    )
+    assert preview["ready"] is True
+    confirmed = json.loads(
+        await plugin.law_confirm_daily_plan_update(event, preview["token"])
+    )
+    assert confirmed["success"] is True
+    assert plugin.scheduler.enabled is True
+    assert plugin.scheduler.task is not None
     await plugin.terminate()
