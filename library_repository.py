@@ -286,9 +286,9 @@ class LibraryRepository:
             clauses.append(
                 "(i.title LIKE ? OR i.source_summary LIKE ? OR s.raw_text LIKE ? "
                 "OR c.case_summary LIKE ? OR c.practice_notes_json LIKE ? "
-                "OR q.stem LIKE ? OR q.explanation LIKE ?)"
+                "OR q.stem LIKE ? OR q.explanation LIKE ? OR i.metadata_json LIKE ?)"
             )
-            params.extend([term] * 7)
+            params.extend([term] * 8)
         safe_limit = max(1, min(int(limit), 50))
         params.append(safe_limit)
         rows = self.connection.execute(
@@ -330,7 +330,7 @@ class LibraryRepository:
                 metadata["note"] = str(changes["note"])
                 item_updates.append("metadata_json = ?")
                 params.append(_json(metadata))
-            if item_updates:
+            if item_updates or "practice_notes" in changes or "explanation" in changes:
                 item_updates.append("updated_at = ?")
                 params.append(datetime.now().astimezone().isoformat())
                 params.append(item_id)

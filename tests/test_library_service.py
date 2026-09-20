@@ -200,11 +200,13 @@ async def test_search_fields_limit_no_result_and_protected_update(tmp_path):
         title="人工标题",
         subjects="知识产权",
         structured_json='{"case_summary":"摘要中的争议焦点"}',
+        note="人工备注",
         created_by="42",
         session_origin="private:42",
     )
 
     assert (await service.search_learning_library(query="争议焦点"))["count"] == 1
+    assert (await service.search_learning_library(query="人工备注"))["count"] == 1
     assert (await service.search_learning_library(subject="知产"))["count"] == 1
     assert (await service.search_learning_library(query="不存在"))["items"] == []
     assert (await service.search_learning_library(limit=0))["limit"] == 1
@@ -213,4 +215,37 @@ async def test_search_fields_limit_no_result_and_protected_update(tmp_path):
         {"identity": "verified_real_question"},
     )
     assert protected["error"] == "invalid_update_field"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_note_body_is_preserved_as_structured_learning_content(tmp_path):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text="原始笔记证据",
+        material_type="note",
+        structured_json=json.dumps({"body": "可复用的学习笔记"}),
+        created_by="42",
+        session_origin="private:42",
+    )
+
+    detail = await service.get_learning_item(archived["item_id"])
+    assert detail["item"]["metadata"]["body"] == "可复用的学习笔记"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_detail_fields_for_wrong_item_type(tmp_path):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text="普通学习笔记",
+        material_type="note",
+        created_by="42",
+        session_origin="private:42",
+    )
+
+    result = await service.update_learning_item(
+        archived["item_id"], {"practice_notes": "不应静默丢弃"}
+    )
+    assert result["error"] == "invalid_update"
     storage.close()

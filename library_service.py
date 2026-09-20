@@ -181,7 +181,11 @@ class LibraryService:
                 body = _as_text(structured.get("body")) or raw_text.strip()
                 source_summary = body[:300]
 
-            metadata = {"note": _as_text(note)} if _as_text(note) else {}
+            metadata: dict[str, Any] = {}
+            if normalized_type == "note":
+                metadata["body"] = body
+            if _as_text(note):
+                metadata["note"] = _as_text(note)
             item_payload = {
                 "source_hash": source_hash,
                 "material_type": normalized_type,
@@ -315,7 +319,15 @@ class LibraryService:
                 normalized["practice_notes"] = _as_text_list(changes["practice_notes"])
             if "explanation" in changes:
                 normalized["explanation"] = _as_text(changes["explanation"])
-            updated = self.repository.update(int(item_id), normalized)
+            normalized_id = int(item_id)
+            current = self.repository.get(normalized_id)
+            if current is None:
+                return _error("not_found", f"未找到学习条目：{item_id}")
+            if "practice_notes" in normalized and current.case is None:
+                return _error("invalid_update", "practice_notes 仅适用于案例条目")
+            if "explanation" in normalized and current.question is None:
+                return _error("invalid_update", "explanation 仅适用于题目条目")
+            updated = self.repository.update(normalized_id, normalized)
         except (TypeError, ValueError) as exc:
             return _error("invalid_update", str(exc))
         if updated is None:
