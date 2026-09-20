@@ -59,4 +59,3 @@ The acceptance flow is tested end-to-end with a fake authorized event: archive â
 ## Compatibility and regression
 
 Schema v5 migrates to v6 by creating only the new library tables and indexes. No old `CaseItem`, `RealQuestion`, publication, or daily-plan content is migrated. Existing tests and real AstrBot loader smoke for v4.22.0 and v4.25.0 remain required.
-

@@ -100,4 +100,3 @@
 - [ ] **Step 3: Run real AstrBot v4.22.0 and v4.25.0 compatibility smoke and verify all four new Tools are present.
 - [ ] **Step 4: Inspect the final diff for scope creep, secrets, runtime DB files, and forbidden feature work.
 - [ ] **Step 5: Commit with `feat: add learning library foundation`, push `main`, wait for green GitHub Actions, and report exact SHA, schema version, tools, acceptance results, and deferred scope.
-
