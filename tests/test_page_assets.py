@@ -16,3 +16,27 @@ def test_plugin_page_assets_are_self_contained_and_safe():
     assert "window.AstrBotPluginPage" in javascript
     assert "textContent" in javascript
     assert "../" not in html + javascript + css
+
+
+def test_plugin_page_exposes_all_0_3d_management_entrypoints():
+    javascript = (PAGE_ROOT / "app.js").read_text(encoding="utf-8")
+    for endpoint in (
+        "library/item",
+        "library/update",
+        "reviews",
+        "review/status",
+        "plans/prepare",
+        "plans/confirm",
+        "plans/reset-prepare",
+        "plans/reset-confirm",
+        "target/rename",
+        "target/unbind-prepare",
+        "target/unbind-confirm",
+        "history/daily",
+        "history/publications",
+        "history/reminders",
+        "history/sources",
+    ):
+        assert endpoint in javascript
+    assert "bridge.t(" in javascript
+    assert "window.confirm" not in javascript

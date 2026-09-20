@@ -1031,7 +1031,7 @@ class LawAssistantService:
             "plans": [
                 {
                     "plan": plan.to_mapping(),
-                    "preview": plan.preview(local_today, 7, target_id=target_id),
+                    "preview": plan.preview(local_today, 14, target_id=target_id),
                 }
                 for plan in plans
             ],

@@ -2,7 +2,18 @@
   "pages": {
     "law-assistant": {
       "title": "Lumielle Law Assistant",
-      "description": "Evidence-driven legal learning and activity dashboard"
+      "description": "Evidence-driven legal learning and activity dashboard",
+      "page": {
+        "nav": {"overview": "Overview", "library": "Library", "radar": "Activity Radar", "plans": "Daily Plans", "targets": "Targets", "history": "History"},
+        "actions": {"search": "Search", "view": "View", "save": "Save", "upload": "Upload and preview", "scan": "Scan now", "preview": "Preview changes", "confirm": "Apply", "cancel": "Cancel", "refresh": "Refresh", "rename": "Rename", "unbind": "Unbind", "delete": "Delete"},
+        "library": {"description": "Search evidence, inspect details, edit allowed fields and process review items.", "materials": "Materials", "imports": "File import", "reviews": "Review queue", "searchPlaceholder": "Keyword", "allTypes": "All types", "detail": "Material detail", "editAllowed": "Editable fields", "upload": "File import"},
+        "overview": {"description": "Inspect plugin, source, learning and recent runtime status.", "version": "Plugin version", "currentEvents": "Current events", "currentEventsDetail": "Historical and review items excluded", "cases": "Official cases", "casesDetail": "Available for daily cases", "realQuestions": "Verified questions", "realQuestionsDetail": "Source identity preserved", "targets": "Bound groups", "targetsDetail": "Enabled publish targets", "recent": "Recent daily runs", "recentDescription": "Failures and skips retain their reasons."},
+        "history": {"date": "Date", "type": "Content type", "status": "Status", "subject": "Subject", "reason": "Reason"},
+        "table": {"actions": "Actions"},
+        "messages": {"saved": "Saved"},
+        "error": {"request": "Request failed"},
+        "loading": "Loading…"
+      }
     }
   }
 }

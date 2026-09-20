@@ -10,6 +10,13 @@ from typing import Any
 
 from quart import jsonify, request
 
+PLUGIN_NAME = "astrbot_plugin_law_assistant"
+
+
+def _route(path: str) -> str:
+    """Return a route relative to AstrBot's ``/api/plug`` dispatcher."""
+    return f"/{PLUGIN_NAME}/{path.lstrip('/')}"
+
 
 class LawAssistantWebApi:
     """Translate dashboard requests into LawAssistantService calls.
@@ -90,7 +97,7 @@ class LawAssistantWebApi:
         )
         for route, handler, methods, description in routes:
             context.register_web_api(
-                route,
+                _route(route),
                 self._safe(handler),
                 methods,
                 description,

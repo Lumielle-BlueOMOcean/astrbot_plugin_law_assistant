@@ -2,7 +2,18 @@
   "pages": {
     "law-assistant": {
       "title": "微光·法务助手",
-      "description": "证据驱动的法律学习与活动管理面板"
+      "description": "证据驱动的法律学习与活动管理面板",
+      "page": {
+        "nav": {"overview": "总览", "library": "资料库", "radar": "活动雷达", "plans": "每日计划", "targets": "群与发布", "history": "运行记录"},
+        "actions": {"search": "搜索", "view": "查看", "save": "保存", "upload": "上传并预览", "scan": "立即扫描", "preview": "预览修改", "confirm": "确认应用", "cancel": "取消", "refresh": "刷新", "rename": "改名", "unbind": "解绑", "delete": "删除"},
+        "library": {"description": "搜索资料、查看证据、修改允许字段并处理待复核条目。", "materials": "资料", "imports": "文件导入", "reviews": "待复核", "searchPlaceholder": "关键词", "allTypes": "全部类型", "detail": "资料详情", "editAllowed": "允许修改的字段", "upload": "文件导入"},
+        "overview": {"description": "查看插件、来源、学习资料与最近运行状态。", "version": "插件版本", "currentEvents": "当前活动", "currentEventsDetail": "排除历史与待复核", "cases": "官方案例", "casesDetail": "可用于每日案例", "realQuestions": "核验真题", "realQuestionsDetail": "来源身份独立保存", "targets": "绑定群", "targetsDetail": "启用发布目标", "recent": "最近每日运行", "recentDescription": "失败与跳过记录会保留原因，不会伪装成成功。"},
+        "history": {"date": "日期", "type": "内容类型", "status": "状态", "subject": "方向", "reason": "说明"},
+        "table": {"actions": "操作"},
+        "messages": {"saved": "已保存"},
+        "error": {"request": "请求失败"},
+        "loading": "正在加载…"
+      }
     }
   }
 }

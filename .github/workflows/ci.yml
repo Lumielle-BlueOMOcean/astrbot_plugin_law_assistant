@@ -107,6 +107,9 @@ jobs:
       - name: Run real AstrBot Plugin Page discovery smoke
         if: matrix.version == '4.25.0'
         run: python tests/page_discovery_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+      - name: Run real AstrBot Plugin API route contract smoke
+        if: matrix.version == '4.25.0'
+        run: python tests/web_api_route_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
       - name: Upload release ZIP artifact
         if: matrix.version == '4.25.0'
         uses: actions/upload-artifact@v4

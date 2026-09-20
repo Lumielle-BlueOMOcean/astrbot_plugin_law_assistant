@@ -24,9 +24,17 @@ def test_page_discovery_smoke_uses_real_astrbot_page_discovery() -> None:
     assert "Path(...).exists" not in smoke
 
 
+def test_web_api_route_smoke_uses_real_astrbot_matcher() -> None:
+    smoke = (ROOT / "tests" / "web_api_route_smoke.py").read_text()
+    assert "_match_registered_web_api" in smoke
+    assert "astrbot_plugin_law_assistant" in smoke
+    assert "EXPECTED_ROUTES" in smoke
+
+
 def test_ci_contains_both_required_exact_commits() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
 
     assert COMMIT_422 in workflow
     assert COMMIT_425 in workflow
     assert "continue-on-error" not in workflow
+    assert "web_api_route_smoke.py" in workflow
