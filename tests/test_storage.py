@@ -85,7 +85,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 6
+    assert storage.schema_version == SCHEMA_VERSION == 7
     assert storage.count_events() == 0
     storage.close()
 
@@ -104,7 +104,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 6",
+        match=r"schema version 99 is newer than supported version 7",
     ):
         SQLiteStorage(db_path)
 
@@ -189,7 +189,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 6
+    assert storage.schema_version == SCHEMA_VERSION == 7
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -234,7 +234,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 6
+    assert storage.schema_version == SCHEMA_VERSION == 7
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -329,11 +329,11 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 6
+    assert reopened.schema_version == 7
     reopened.close()
 
 
-def test_storage_runs_the_v3_to_v6_migration_path(tmp_path) -> None:
+def test_storage_runs_the_v3_to_v7_migration_path(tmp_path) -> None:
     db_path = tmp_path / "v3.sqlite3"
     storage = SQLiteStorage(db_path)
     storage.close()
@@ -344,7 +344,101 @@ def test_storage_runs_the_v3_to_v6_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 6
+    assert migrated.schema_version == SCHEMA_VERSION == 7
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()
+
+
+def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None:
+    db_path = tmp_path / "v6-library.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key, value) VALUES ('version', '6');
+            CREATE TABLE library_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                session_origin TEXT NOT NULL,
+                original_filename TEXT,
+                mime_type TEXT,
+                storage_path TEXT,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(created_by, content_hash)
+            );
+            CREATE TABLE learning_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_type TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                item_hash TEXT NOT NULL,
+                title TEXT NOT NULL,
+                subjects_json TEXT NOT NULL,
+                verification_status TEXT NOT NULL,
+                source_summary TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(created_by, item_hash)
+            );
+            CREATE TABLE learning_item_sources (
+                item_id INTEGER NOT NULL REFERENCES learning_items(id) ON DELETE CASCADE,
+                source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+                locator TEXT NOT NULL,
+                relationship TEXT NOT NULL,
+                PRIMARY KEY(item_id, source_id, relationship)
+            );
+            INSERT INTO library_sources(
+                id, source_kind, title, raw_text, source_url, content_hash,
+                created_at, created_by, session_origin, metadata_json
+            ) VALUES (
+                7, 'user_text', '旧来源', '旧正文', '', 'same-hash',
+                '2026-09-21T00:00:00+00:00', '42', 'private:42', '{}'
+            );
+            INSERT INTO learning_items(
+                id, item_type, identity, item_hash, title, subjects_json,
+                verification_status, source_summary, created_at, updated_at,
+                created_by, metadata_json
+            ) VALUES (
+                9, 'case', 'user_case', 'item-hash', '旧条目', '[]',
+                'unverified', '旧摘要', '2026-09-21T00:00:00+00:00',
+                '2026-09-21T00:00:00+00:00', '42', '{}'
+            );
+            INSERT INTO learning_item_sources(item_id, source_id, locator, relationship)
+            VALUES (9, 7, '', 'primary_evidence');
+            """
+        )
+
+    storage = SQLiteStorage(db_path)
+
+    assert storage.schema_version == SCHEMA_VERSION == 7
+    assert [
+        tuple(row)
+        for row in storage.connection.execute(
+            "SELECT item_id, source_id FROM learning_item_sources"
+        ).fetchall()
+    ] == [(9, 7)]
+    storage.connection.execute(
+        """
+        INSERT INTO library_sources(
+            source_kind, title, raw_text, source_url, content_hash,
+            created_at, created_by, session_origin, metadata_json
+        ) VALUES ('user_text', '新来源', '旧正文', 'https://example.test/case',
+                  'same-hash', '2026-09-21T00:00:00+00:00', '42', 'private:42', '{}')
+        """
+    )
+    storage.connection.commit()
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM library_sources WHERE content_hash = 'same-hash'"
+        ).fetchone()[0]
+        == 2
+    )
+    storage.close()

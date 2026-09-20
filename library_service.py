@@ -34,6 +34,10 @@ _SEARCH_TYPES = {
     "mock_question": "question",
     "note": "note",
 }
+_SEARCH_IDENTITIES = {
+    "real_question_candidate": "real_question_candidate",
+    "mock_question": "mock_question",
+}
 _SPLIT_RE = re.compile(r"[,，、;；/|]+")
 
 
@@ -260,6 +264,7 @@ class LibraryService:
         items = self.repository.search(
             query=str(query or "").strip(),
             item_type=_SEARCH_TYPES.get(normalized_type, ""),
+            identity=_SEARCH_IDENTITIES.get(normalized_type, ""),
             subject=normalized_subject or "",
             limit=safe_limit,
         )

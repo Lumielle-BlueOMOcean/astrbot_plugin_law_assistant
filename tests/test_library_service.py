@@ -113,6 +113,108 @@ async def test_mock_question_is_searchable_and_complete_after_archive(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_question_search_separates_real_candidates_and_mock_questions(tmp_path):
+    storage, service = _service(tmp_path)
+
+    real = await service.archive_learning_material(
+        raw_text="待核验真题原文",
+        material_type="real_question_candidate",
+        title="待核验题目",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "单选",
+                "stem": "待核验题干",
+                "options": ["A", "B"],
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+    mock = await service.archive_learning_material(
+        raw_text="原创模拟题原文",
+        material_type="mock_question",
+        title="模拟题目",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "单选",
+                "stem": "模拟题干",
+                "options": ["A", "B"],
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+
+    all_questions = await service.search_learning_library(material_type="question")
+    real_only = await service.search_learning_library(
+        material_type="real_question_candidate"
+    )
+    mock_only = await service.search_learning_library(material_type="mock_question")
+
+    assert {item["id"] for item in all_questions["items"]} == {
+        real["item_id"],
+        mock["item_id"],
+    }
+    assert [item["id"] for item in real_only["items"]] == [real["item_id"]]
+    assert [item["id"] for item in mock_only["items"]] == [mock["item_id"]]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_item_keeps_new_source_url_and_deduplicates_exact_source(
+    tmp_path,
+):
+    storage, service = _service(tmp_path)
+    raw_text = "官方案例原文，先收藏时尚未补充链接"
+    structured = json.dumps({"case_summary": "同一案例摘要"}, ensure_ascii=False)
+
+    first = await service.archive_learning_material(
+        raw_text=raw_text,
+        material_type="case",
+        title="官方案例",
+        subjects="知识产权",
+        structured_json=structured,
+        created_by="42",
+        session_origin="private:42",
+    )
+    second = await service.archive_learning_material(
+        raw_text=raw_text,
+        material_type="case",
+        title="官方案例",
+        subjects="知识产权",
+        source_url="https://example.test/official-case",
+        structured_json=structured,
+        created_by="42",
+        session_origin="private:42",
+    )
+    third = await service.archive_learning_material(
+        raw_text=raw_text,
+        material_type="case",
+        title="官方案例",
+        subjects="知识产权",
+        source_url="https://example.test/official-case",
+        structured_json=structured,
+        created_by="42",
+        session_origin="private:42",
+    )
+
+    assert second["item_id"] == first["item_id"]
+    assert second["duplicate"] is True
+    assert third["source_id"] == second["source_id"]
+    detail = await service.get_learning_item(first["item_id"])
+    assert {source["source_url"] for source in detail["sources"]} == {
+        "",
+        "https://example.test/official-case",
+    }
+    assert len(detail["sources"]) == 2
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_same_source_does_not_overwrite_distinct_items(tmp_path):
     storage, service = _service(tmp_path)
     raw_text = "同一份原始案例正文"

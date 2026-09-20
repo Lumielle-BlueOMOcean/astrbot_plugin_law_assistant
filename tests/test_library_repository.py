@@ -44,10 +44,10 @@ def _item(
     )
 
 
-def test_new_database_migrates_to_v6_and_creates_library_tables(tmp_path) -> None:
+def test_new_database_migrates_to_v7_and_creates_library_tables(tmp_path) -> None:
     storage = SQLiteStorage(tmp_path / "library.sqlite3")
 
-    assert storage.schema_version == SCHEMA_VERSION == 6
+    assert storage.schema_version == SCHEMA_VERSION == 7
     tables = {
         row[0]
         for row in storage.connection.execute(

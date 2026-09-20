@@ -96,7 +96,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `6`。v5→v6 只建立学习资料库表，不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容；安装开发版前可按部署说明备份并重新初始化。
+当前 schema version 为 `7`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。安装开发版前可按部署说明备份运行时数据库。
 
 该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
 

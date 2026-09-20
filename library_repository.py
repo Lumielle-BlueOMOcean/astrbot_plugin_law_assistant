@@ -88,9 +88,9 @@ class LibraryRepository:
             source_row = self.connection.execute(
                 """
                 SELECT * FROM library_sources
-                WHERE created_by = ? AND content_hash = ?
+                WHERE created_by = ? AND content_hash = ? AND source_url = ?
                 """,
-                (source.created_by, source.content_hash),
+                (source.created_by, source.content_hash, source.source_url),
             ).fetchone()
             if source_row is None:
                 cursor = self.connection.execute(
@@ -128,6 +128,14 @@ class LibraryRepository:
                 (item.created_by, item.item_hash),
             ).fetchone()
             if existing is not None:
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO learning_item_sources(
+                        item_id, source_id, locator, relationship
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (int(existing["id"]), source_id, "", "primary_evidence"),
+                )
                 return LibraryArchiveResult(
                     source_id=source_id,
                     item_id=int(existing["id"]),
@@ -270,6 +278,7 @@ class LibraryRepository:
         *,
         query: str = "",
         item_type: str = "",
+        identity: str = "",
         subject: str = "",
         limit: int = 10,
     ) -> list[LearningItem]:
@@ -278,6 +287,9 @@ class LibraryRepository:
         if item_type:
             clauses.append("i.item_type = ?")
             params.append(item_type)
+        if identity:
+            clauses.append("i.identity = ?")
+            params.append(identity)
         if subject:
             clauses.append("i.subjects_json LIKE ?")
             params.append(f"%{subject}%")

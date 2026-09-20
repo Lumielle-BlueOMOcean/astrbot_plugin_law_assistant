@@ -18,7 +18,7 @@ else:
     from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -469,6 +469,90 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
+    """Allow one evidence hash to retain one row per distinct source URL."""
+    if not _table_exists(connection, "library_sources"):
+        return
+
+    source_rows = connection.execute(
+        "SELECT * FROM library_sources ORDER BY id"
+    ).fetchall()
+    links = connection.execute(
+        """
+        SELECT item_id, source_id, locator, relationship
+        FROM learning_item_sources
+        ORDER BY item_id, source_id, relationship
+        """
+    ).fetchall()
+    connection.execute(
+        """
+        CREATE TABLE library_sources_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            session_origin TEXT NOT NULL,
+            original_filename TEXT,
+            mime_type TEXT,
+            storage_path TEXT,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(created_by, content_hash, source_url)
+        )
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO library_sources_v7(
+            id, source_kind, title, raw_text, source_url, content_hash,
+            created_at, created_by, session_origin, original_filename,
+            mime_type, storage_path, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["id"],
+                row["source_kind"],
+                row["title"],
+                row["raw_text"],
+                row["source_url"],
+                row["content_hash"],
+                row["created_at"],
+                row["created_by"],
+                row["session_origin"],
+                row["original_filename"],
+                row["mime_type"],
+                row["storage_path"],
+                row["metadata_json"],
+            )
+            for row in source_rows
+        ],
+    )
+    connection.execute("DROP TABLE library_sources")
+    connection.execute("ALTER TABLE library_sources_v7 RENAME TO library_sources")
+    connection.execute(
+        "CREATE INDEX idx_library_sources_hash ON library_sources(content_hash)"
+    )
+    connection.executemany(
+        """
+        INSERT INTO learning_item_sources(item_id, source_id, locator, relationship)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                row["item_id"],
+                row["source_id"],
+                row["locator"],
+                row["relationship"],
+            )
+            for row in links
+        ],
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -476,6 +560,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     3: _migrate_3_to_4,
     4: _migrate_4_to_5,
     5: _migrate_5_to_6,
+    6: _migrate_6_to_7,
 }
 
 
