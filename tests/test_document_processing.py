@@ -61,6 +61,40 @@ def test_pdf_extracts_page_locators(tmp_path):
     assert error.value.code == "ocr_required"
 
 
+def test_text_pdf_extracts_text_and_page_locator(tmp_path):
+    pypdf = pytest.importorskip("pypdf")
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = pypdf.PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {
+            NameObject("/Font"): DictionaryObject(
+                {NameObject("/F1"): writer._add_object(font)}
+            )
+        }
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 12 Tf 20 180 Td (Page one text) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    path = tmp_path / "text.pdf"
+    path.write_bytes(buffer.getvalue())
+
+    document = extract_document(path)
+
+    assert "Page one text" in document.text
+    assert document.segments[0].locator == "第1页"
+
+
 def test_multiple_questions_split_with_answers_and_locator(tmp_path):
     path = tmp_path / "试卷.txt"
     path.write_text(
