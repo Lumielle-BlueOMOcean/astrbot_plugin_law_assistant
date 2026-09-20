@@ -100,8 +100,14 @@ class PluginConfig:
         question_rotation_start_date = _normalize_date(
             values.get("daily_question_rotation_start_date")
         )
-        question_type_selection_mode = normalize_selection_mode(
-            values.get("daily_question_type_selection_mode", "random")
+        legacy_question_type = normalize_question_type(
+            values.get("daily_question_type")
+        )
+        raw_question_type_mode = values.get("daily_question_type_selection_mode")
+        question_type_selection_mode = (
+            "fixed"
+            if raw_question_type_mode is None and legacy_question_type
+            else normalize_selection_mode(raw_question_type_mode or "random")
         )
         question_type_rotation_types = _normalize_question_types(
             values.get("daily_question_rotation_types", [])
@@ -181,7 +187,7 @@ class PluginConfig:
             daily_question_fixed_type=normalize_question_type(
                 values.get(
                     "daily_question_fixed_type",
-                    values.get("daily_question_type"),
+                    legacy_question_type,
                 )
             ),
             daily_question_rotation_types=question_type_rotation_types,

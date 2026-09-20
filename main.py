@@ -870,6 +870,7 @@ class LawAssistant(Star):
             "source_count": result.source_count,
             "discovered_count": result.discovered_count,
             "upserted_count": result.upserted_count,
+            "disabled_sources": list(getattr(result, "disabled_sources", ())),
             "failure_count": len(result.failures),
             "failures": [
                 {"source_key": failure.source_key, "error": failure.error}
@@ -891,7 +892,8 @@ class LawAssistant(Star):
         return (
             "扫描完成："
             f"sources={result.source_count}，discovered={result.discovered_count}，"
-            f"upserted={result.upserted_count}，failures={len(result.failures)}"
+            f"upserted={result.upserted_count}，failures={len(result.failures)}，"
+            f"disabled={len(getattr(result, 'disabled_sources', ()))}"
         )
 
     @staticmethod

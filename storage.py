@@ -1789,6 +1789,21 @@ class SQLiteStorage:
             for row in rows
         ]
 
+    def list_sent_content_keys(
+        self, target_id: int, content_type: str
+    ) -> set[tuple[str, str]]:
+        """Return successful source identities already sent to one target."""
+        rows = self._connection.execute(
+            """
+            SELECT source_kind, source_item_key
+            FROM daily_contents
+            WHERE target_id = ? AND content_type = ? AND status = 'sent'
+              AND source_kind IS NOT NULL AND source_item_key IS NOT NULL
+            """,
+            (target_id, content_type),
+        ).fetchall()
+        return {(str(row["source_kind"]), str(row["source_item_key"])) for row in rows}
+
     def published_case_ids(self) -> set[int]:
         rows = self._connection.execute(
             "SELECT DISTINCT source_item_id FROM daily_contents "
@@ -2024,8 +2039,10 @@ def _real_question_from_row(row: sqlite3.Row) -> RealQuestion:
 
 def _daily_plan_from_row(row: sqlite3.Row) -> DailyPlan:
     legacy_question_type = row["question_type"]
-    fixed_question_type = row["fixed_question_type"] or legacy_question_type
     question_type_mode = row["question_type_selection_mode"]
+    fixed_question_type = row["fixed_question_type"]
+    if question_type_mode == "fixed" and not fixed_question_type:
+        fixed_question_type = legacy_question_type
     if question_type_mode == "fixed" and fixed_question_type is None:
         question_type_mode = "random"
     return DailyPlan(

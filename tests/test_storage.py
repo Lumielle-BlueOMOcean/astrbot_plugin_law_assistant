@@ -129,6 +129,50 @@ def test_storage_deterministically_upserts_same_source_item(tmp_path) -> None:
     storage.close()
 
 
+def test_storage_lists_only_successful_daily_content_by_target_and_identity(tmp_path):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    storage.bind_target("aiocqhttp:group:1", "一群")
+    storage.bind_target("aiocqhttp:group:2", "二群")
+    first = storage.claim_daily_content(
+        content_date="2026-09-21",
+        target_id=1,
+        content_type="daily_question",
+        body={"question": "A"},
+        source_kind="real_question",
+        source_item_key="1",
+    )
+    assert first is not None
+    storage.finish_daily_content(first, success=True)
+    failed = storage.claim_daily_content(
+        content_date="2026-09-22",
+        target_id=1,
+        content_type="daily_question",
+        body={"question": "B"},
+        source_kind="real_question",
+        source_item_key="2",
+    )
+    assert failed is not None
+    storage.finish_daily_content(failed, success=False, error_summary="network")
+    other_target = storage.claim_daily_content(
+        content_date="2026-09-21",
+        target_id=2,
+        content_type="daily_question",
+        body={"question": "C"},
+        source_kind="real_question",
+        source_item_key="3",
+    )
+    assert other_target is not None
+    storage.finish_daily_content(other_target, success=True)
+
+    assert storage.list_sent_content_keys(1, "daily_question") == {
+        ("real_question", "1")
+    }
+    assert storage.list_sent_content_keys(2, "daily_question") == {
+        ("real_question", "3")
+    }
+    assert storage.list_sent_content_keys(1, "daily_case") == set()
+
+
 def test_storage_preserves_first_discovered_at_on_upsert(tmp_path) -> None:
     storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
     first_discovered = datetime(2026, 9, 17, 8, 0, tzinfo=timezone.utc)

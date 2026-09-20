@@ -94,6 +94,25 @@ def test_config_normalizes_daily_plan_subjects_and_dates() -> None:
     assert config.daily_question_subject == "economic_law"
 
 
+def test_legacy_question_type_without_new_mode_remains_fixed() -> None:
+    config = PluginConfig.from_mapping({"daily_question_type": "多选"})
+
+    assert config.daily_question_type_selection_mode == "fixed"
+    assert config.daily_question_fixed_type == "multiple_choice"
+
+
+def test_explicit_random_question_type_mode_wins_over_legacy_type() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "daily_question_type": "多选",
+            "daily_question_type_selection_mode": "random",
+        }
+    )
+
+    assert config.daily_question_type_selection_mode == "random"
+    assert config.daily_question_fixed_type == "multiple_choice"
+
+
 def test_config_keeps_missing_rotation_anchor_unset_for_persistence_layer() -> None:
     config = PluginConfig.from_mapping(
         {

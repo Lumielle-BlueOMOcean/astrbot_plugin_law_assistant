@@ -4,12 +4,17 @@ from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from activity_radar import (
     canonical_event_key,
     derive_radar_status,
     radar_policy_for,
 )
-from models import EventDate, LegalEvent
+from models import EventDate, LegalEvent, SourceDocument
+from service import LawAssistantService
+from storage import SQLiteStorage
+from tests.fakes import FakeAdapter, FakeExtractor, RecordingPublisher, make_event
 
 ZONE = ZoneInfo("Asia/Shanghai")
 
@@ -115,3 +120,115 @@ def test_configured_source_can_be_allowed_to_auto_publish():
     )
 
     assert radar_policy_for("extra:1", config).auto_publish_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_scan_skips_sources_with_discovery_disabled_and_reports_them(tmp_path):
+    disabled = FakeAdapter(
+        "extra:disabled",
+        [
+            SourceDocument(
+                source_key="extra:disabled",
+                source_item_key="event-1",
+                url="https://example.test/disabled",
+                title="Disabled source",
+                content="should not be fetched",
+                fetched_at="2026-09-21T00:00:00+00:00",
+            )
+        ],
+    )
+    enabled = FakeAdapter(
+        "extra:enabled",
+        [
+            SourceDocument(
+                source_key="extra:enabled",
+                source_item_key="event-2",
+                url="https://example.test/enabled",
+                title="Enabled source",
+                content="can be fetched",
+                fetched_at="2026-09-21T00:00:00+00:00",
+            )
+        ],
+    )
+    config = SimpleNamespace(
+        radar_auto_publish_sources=(),
+        auto_publish_events=True,
+        radar_source_policies=(
+            {
+                "key": "extra:disabled",
+                "discover_enabled": False,
+                "auto_publish_enabled": True,
+            },
+            {
+                "key": "extra:enabled",
+                "discover_enabled": True,
+                "auto_publish_enabled": False,
+            },
+        ),
+    )
+    service = LawAssistantService(
+        SQLiteStorage(tmp_path / "runtime.sqlite3"),
+        sources=[
+            (
+                disabled,
+                FakeExtractor(
+                    {
+                        "event-1": [
+                            make_event(
+                                source_key="extra:disabled",
+                                source_item_key="event-1",
+                            )
+                        ]
+                    }
+                ),
+            ),
+            (
+                enabled,
+                FakeExtractor(
+                    {
+                        "event-2": [
+                            make_event(
+                                source_key="extra:enabled",
+                                source_item_key="event-2",
+                            )
+                        ]
+                    }
+                ),
+            ),
+        ],
+        config=config,
+        publisher=RecordingPublisher(),
+    )
+
+    result = await service.scan_events()
+
+    assert disabled.started.is_set() is False
+    assert enabled.started.is_set() is True
+    assert result.disabled_sources == ("extra:disabled",)
+    assert result.discovered_count == 1
+    assert service.storage.get_event_by_key("extra:disabled", "event-1") is None
+    assert service.storage.get_event_by_key("extra:enabled", "event-2") is not None
+    assert service.publisher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_source_does_not_remove_existing_history(tmp_path):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    existing = make_event(source_key="extra:disabled", source_item_key="event-1")
+    storage.upsert_event(existing)
+    adapter = FakeAdapter("extra:disabled", error=RuntimeError("must not fetch"))
+    service = LawAssistantService(
+        storage,
+        sources=[(adapter, FakeExtractor())],
+        config=SimpleNamespace(
+            radar_auto_publish_sources=(),
+            radar_source_policies=(
+                {"key": "extra:disabled", "discover_enabled": False},
+            ),
+        ),
+    )
+
+    result = await service.scan_events()
+
+    assert result.failures == ()
+    assert storage.get_event_by_key("extra:disabled", "event-1") is not None

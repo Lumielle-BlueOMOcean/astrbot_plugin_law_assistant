@@ -50,6 +50,7 @@ class LearningContentProvider:
         date: str | None = None,
         content_type: str = "daily_case",
         session_origin: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         requested_subject = _parse_subject(subject)
         date_value = date or "1970-01-01"
@@ -58,13 +59,25 @@ class LearningContentProvider:
                 subject=requested_subject or "", limit=500
             )
             bundles = [bundle for bundle in bundles if bundle.item.active]
+            had_matching = bool(bundles)
+            bundles = [
+                bundle
+                for bundle in bundles
+                if not _is_used(used_content_keys, "official_case", bundle.item.id)
+            ]
             if not bundles:
                 return {
                     "available": False,
                     "reason": (
-                        "暂无匹配方向的独立官方案例"
+                        "匹配方向的独立官方案例已全部发送过"
+                        if used_content_keys and had_matching and requested_subject
+                        else "暂无匹配方向的独立官方案例"
                         if requested_subject
-                        else "暂无已存储的独立官方案例"
+                        else (
+                            "已存储的独立官方案例已全部发送过"
+                            if used_content_keys and had_matching
+                            else "暂无已存储的独立官方案例"
+                        )
                     ),
                 }
             selected = _select_for_day(bundles, date_value)
@@ -80,12 +93,26 @@ class LearningContentProvider:
                 for item in items
                 if subject_matches(tuple(item.subjects), requested_subject)
             ]
+        had_matching = bool(items)
+        items = [
+            item
+            for item in items
+            if not _is_used(used_content_keys, "official_case", item.source_item_key)
+        ]
         if not items:
             return {
                 "available": False,
-                "reason": "暂无匹配方向的官方案例"
-                if requested_subject
-                else "暂无已存储的官方案例",
+                "reason": (
+                    "匹配方向的官方案例已全部发送过"
+                    if used_content_keys and had_matching and requested_subject
+                    else "暂无匹配方向的官方案例"
+                    if requested_subject
+                    else (
+                        "已存储的官方案例已全部发送过"
+                        if used_content_keys and had_matching
+                        else "暂无已存储的官方案例"
+                    )
+                ),
             }
         selected = _select_for_day(items, date_value)
         if self.llm_service is None:
@@ -125,6 +152,7 @@ class LearningContentProvider:
         session_origin: str | None = None,
         source_name: str | None = None,
         exam_year: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         request = QuestionRequest.from_values(
             origin=origin,
@@ -133,18 +161,35 @@ class LearningContentProvider:
             source_name=source_name,
             exam_year=exam_year,
         )
-        real_candidates = self.storage.list_real_questions(
+        all_real_candidates = self.storage.list_real_questions(
             subject=request.subject,
             question_type=request.question_type,
             source_name=request.source_name,
             exam_year=request.exam_year,
         )
-        mock_candidates = self._mock_question_bundles(
+        real_candidates = [
+            question
+            for question in all_real_candidates
+            if not _is_used(used_content_keys, "real_question", question.id)
+        ]
+        all_mock_candidates = self._mock_question_bundles(
             request.subject, request.question_type
         )
+        mock_candidates = [
+            bundle
+            for bundle in all_mock_candidates
+            if not _is_used(used_content_keys, "library_mock", bundle.item.id)
+        ]
         if request.origin == "real":
             if not real_candidates:
-                return {"available": False, "reason": "暂无匹配的已核验真题"}
+                return {
+                    "available": False,
+                    "reason": (
+                        "匹配的已核验真题已全部发送过"
+                        if used_content_keys and all_real_candidates
+                        else "暂无匹配的已核验真题"
+                    ),
+                }
             return _real_question_result(self.rng.choice(real_candidates))
 
         selected_origin = request.origin
@@ -157,9 +202,15 @@ class LearningContentProvider:
             if not available_origins:
                 return {
                     "available": False,
-                    "reason": "LLM provider unavailable"
-                    if self.llm_service is None
-                    else "暂无可用题目",
+                    "reason": (
+                        "匹配的题目库存已全部发送过，且没有可用 LLM Provider"
+                        if used_content_keys
+                        and (all_real_candidates or all_mock_candidates)
+                        and self.llm_service is None
+                        else "LLM provider unavailable"
+                        if self.llm_service is None
+                        else "暂无可用题目"
+                    ),
                 }
             selected_origin = self.rng.choice(available_origins)
 
@@ -176,10 +227,24 @@ class LearningContentProvider:
             return _with_random_note(result, request.origin, real_candidates)
         if selected_origin == "real":
             if not real_candidates:
-                return {"available": False, "reason": "暂无匹配的已核验真题"}
+                return {
+                    "available": False,
+                    "reason": (
+                        "匹配的已核验真题已全部发送过"
+                        if used_content_keys and all_real_candidates
+                        else "暂无匹配的已核验真题"
+                    ),
+                }
             return _real_question_result(self.rng.choice(real_candidates))
         if self.llm_service is None:
-            return {"available": False, "reason": "暂无可用的持久化模拟题"}
+            return {
+                "available": False,
+                "reason": (
+                    "匹配的模拟题已全部发送过，且没有可用 LLM Provider"
+                    if used_content_keys and all_mock_candidates
+                    else "暂无可用的持久化模拟题"
+                ),
+            }
 
         selected_subject = request.subject or self.rng.choice(
             (
@@ -397,6 +462,16 @@ def _parse_subject(value: Any) -> str | None:
 def _select_for_day(items: list[Any], date_value: str) -> Any:
     digest = hashlib.sha256(str(date_value).encode("utf-8")).digest()
     return items[int.from_bytes(digest[:8], "big") % len(items)]
+
+
+def _is_used(
+    used_content_keys: set[tuple[str, str]] | None,
+    source_kind: str,
+    source_item_key: Any,
+) -> bool:
+    if used_content_keys is None:
+        return False
+    return (source_kind, str(source_item_key)) in used_content_keys
 
 
 def _first_subject(subjects: Any) -> str | None:

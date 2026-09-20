@@ -82,10 +82,12 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 - `case_source_court_enabled` / `case_source_spp_enabled`：官方案例来源开关。
 - `law_update_enabled`：法规更新来源开关，默认关闭。
 - `auto_publish_events`：默认关闭；只有管理员明确配置后才自动发布。
+- `radar_source_policies`：按来源分别控制 `discover_enabled` 与 `auto_publish_enabled`；停用发现不会抓取或删除已有历史活动。
 - `deadline_reminder_days` / `deadline_same_day_enabled`：DDL 提醒策略。
 - `llm_provider_id`：可选；留空按当前会话或宿主默认 provider。
 - `daily_question_origin` / `daily_question_subject` / `daily_question_type`：全局每日一题默认来源、方向和题型，默认均为随机。
 - `daily_question_type_selection_mode`、`daily_question_fixed_type`、`daily_question_rotation_types`、`daily_question_type_rotation_start_date`、`daily_question_type_rotation_start_index`：每日一题独立的题型模式；方向轮换与题型轮换分别按本地日期计算。
+- 若旧配置只有 `daily_question_type`，继续按固定题型解释；一旦明确设置新的题型模式，`random` 或 `rotation` 优先，旧固定字段不会覆盖新模式。`rotation` 必须提供有效题型列表。
 - `daily_case_selection_mode`、`daily_question_selection_mode`：`random`、`fixed` 或 `rotation`。
 - `*_rotation_subjects`、`*_rotation_start_date`、`*_rotation_start_index`：案例和题目各自独立的有序轮换列表及起点。
 
@@ -94,6 +96,8 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 内置学校四方向预设的顺序是：知识产权 → 民商法 → 司法实务 → 经济法。预设不是默认行为，需在配置或确认计划变更时主动应用。
 
 群级计划保存于运行时 SQLite：群级有明确值时只覆盖对应群、对应内容类型；未覆盖的内容类型继续继承全局默认。计划变更必须先预览，再使用确认 token 保存。
+
+每日案例和每日一题的 scheduler 会分别按目标群读取成功发送历史，只排除该群、该内容类型中已经成功发送的 `(source_kind, source_item_key)`；失败或跳过记录不会消耗库存，不同来源即使整数 ID 相同也不会互相排除。手动查询和“刚才这条内容”的发布引用不受该历史过滤影响。
 
 运行时数据库只写入：
 

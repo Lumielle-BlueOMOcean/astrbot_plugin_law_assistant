@@ -78,6 +78,7 @@ class ScanResult:
     failures: tuple[ScanFailure, ...]
     duration_seconds: float
     skipped: bool = False
+    disabled_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,9 +199,17 @@ class LawAssistantService:
             discovered_count = 0
             upserted_count = 0
             failures: list[ScanFailure] = []
+            disabled_sources: list[str] = []
             new_event_ids: list[int] = []
             for adapter, extractor in self.sources:
                 source_key = str(getattr(adapter, "key", adapter.__class__.__name__))
+                policy = radar_policy_for(source_key, self.config)
+                if not policy.discover_enabled:
+                    disabled_sources.append(source_key)
+                    self.logger.info(
+                        "Law Assistant source %s discovery is disabled", source_key
+                    )
+                    continue
                 source_started = self._now_utc()
                 source_discovered = 0
                 try:
@@ -322,6 +331,7 @@ class LawAssistantService:
                 upserted_count=upserted_count,
                 failures=tuple(failures),
                 duration_seconds=duration,
+                disabled_sources=tuple(disabled_sources),
             )
 
     async def scan_cases(self, trigger: str = "manual") -> dict[str, Any]:
@@ -1342,9 +1352,11 @@ class LawAssistantService:
     async def get_daily_case(
         self,
         *,
+        date: str | None = None,
         subject: str | None = None,
         session_origin: str | None = None,
         actor_id: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         try:
             parse_subject(subject)
@@ -1358,7 +1370,10 @@ class LawAssistantService:
             return {"available": False, "reason": "daily case service unavailable"}
         try:
             result = await self.learning_service.daily_case(
-                subject=subject, session_origin=session_origin
+                date=date,
+                subject=subject,
+                session_origin=session_origin,
+                used_content_keys=used_content_keys,
             )
         except ValueError as exc:
             return {
@@ -1479,6 +1494,7 @@ class LawAssistantService:
         exam_year: str | None = None,
         session_origin: str | None = None,
         actor_id: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         try:
             parse_origin(origin)
@@ -1500,6 +1516,7 @@ class LawAssistantService:
                 source_name=source_name,
                 exam_year=exam_year,
                 session_origin=session_origin,
+                used_content_keys=used_content_keys,
             )
         except ValueError as exc:
             return {
@@ -1597,12 +1614,23 @@ class LawAssistantService:
             ):
                 continue
             if content_type == "daily_case":
-                content = await self.get_daily_case(subject=selected_subject)
+                used_content_keys = self.storage.list_sent_content_keys(
+                    target["id"], content_type
+                )
+                content = await self.get_daily_case(
+                    date=content_date,
+                    subject=selected_subject,
+                    used_content_keys=used_content_keys,
+                )
             else:
+                used_content_keys = self.storage.list_sent_content_keys(
+                    target["id"], content_type
+                )
                 content = await self.generate_question(
                     selected_subject or "",
                     origin=resolved["origin"] or "random",
                     question_type=selected_question_type,
+                    used_content_keys=used_content_keys,
                 )
             if not content.get("available"):
                 reason = str(content.get("reason", "没有匹配内容"))

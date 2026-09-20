@@ -99,3 +99,43 @@ def test_question_request_keeps_real_constraints() -> None:
     assert request.origin == "real"
     assert request.subject == "criminal_law"
     assert request.question_type == "multiple_choice"
+
+
+def test_explicit_question_type_random_wins_over_legacy_fixed_type() -> None:
+    plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_type": "multiple_choice",
+            "question_type_selection_mode": "random",
+        },
+    )
+
+    assert plan.question_type_selection_mode == "random"
+    assert plan.question_type == "multiple_choice"
+
+
+def test_explicit_question_type_rotation_does_not_use_legacy_fixed_type() -> None:
+    with pytest.raises(
+        ValueError, match="rotation 题型模式必须提供 rotation_question_types"
+    ):
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "question_type": "multiple_choice",
+                "question_type_selection_mode": "rotation",
+                "question_type_rotation_start_date": "2026-09-21",
+            },
+        )
+
+
+def test_explicit_question_type_fixed_can_use_legacy_type() -> None:
+    plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_type": "multiple_choice",
+            "question_type_selection_mode": "fixed",
+        },
+    )
+
+    assert plan.question_type_selection_mode == "fixed"
+    assert plan.fixed_question_type == "multiple_choice"

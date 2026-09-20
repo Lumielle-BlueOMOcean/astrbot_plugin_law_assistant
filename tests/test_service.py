@@ -583,3 +583,106 @@ async def test_daily_question_skip_does_not_advance_calendar_rotation(tmp_path) 
     assert second["daily_question_sent"] == 1
     assert calls == ["intellectual_property", "economic_law"]
     assert len(storage.list_daily_contents()) == 2
+
+
+@pytest.mark.asyncio
+async def test_daily_question_history_is_target_scoped_and_passed_to_provider(tmp_path):
+    now = datetime(2026, 10, 3, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    publisher = RecordingPublisher()
+    target = storage.bind_target("aiocqhttp:group:100", "测试群")
+    prior = storage.claim_daily_content(
+        content_date="2026-10-02",
+        target_id=target["id"],
+        content_type="daily_question",
+        body={"question": "A"},
+        source_kind="real_question",
+        source_item_key="A",
+    )
+    assert prior is not None
+    storage.finish_daily_content(prior, success=True)
+
+    calls: list[dict[str, object]] = []
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["used_content_keys"] == {("real_question", "A")}
+            return {
+                "available": True,
+                "origin": "real",
+                "subject": kwargs["subject"],
+                "question_type": kwargs["question_type"],
+                "question_id": 2,
+                "source_kind": "real_question",
+                "source_item_key": "B",
+                "content": {
+                    "question": "未发送真题 B",
+                    "options": ["A", "B"],
+                    "answer": "A",
+                    "explanation": "解析",
+                },
+            }
+
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    storage.upsert_daily_plan(
+        DailyPlan(
+            content_type="daily_question",
+            enabled=True,
+            time="08:00",
+            selection_mode="fixed",
+            fixed_subject="criminal_law",
+            question_origin="real",
+            question_type_selection_mode="fixed",
+            fixed_question_type="single_choice",
+        ),
+        target["id"],
+    )
+
+    result = await service.run_scheduled_jobs(now=now)
+
+    assert result["daily_question_sent"] == 1
+    assert len(calls) == 1
+    sent = storage.list_daily_contents()[0]
+    assert sent["source_item_key"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_daily_plan_fixed_to_random_survives_preview_confirmation_and_reload(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    target = await service.bind_target("aiocqhttp:group:100", "测试群")
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {"question_type": "multiple_choice"},
+        ),
+        target["id"],
+    )
+
+    preview = await service.prepare_daily_plan_update(
+        target_selectors=["测试群"],
+        content_type="daily_question",
+        changes={"question_type_selection_mode": "random"},
+    )
+
+    assert preview["ready"] is True
+    assert preview["plans"][0]["plan"]["question_type_selection_mode"] == "random"
+    assert (await service.confirm_daily_plan_update(preview["token"]))[
+        "success"
+    ] is True
+    reloaded = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    loaded = reloaded.get_daily_plan(target["id"], "daily_question")
+    assert loaded is not None
+    assert loaded.question_type_selection_mode == "random"

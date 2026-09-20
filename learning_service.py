@@ -68,6 +68,7 @@ class LearningService:
         date: str | None = None,
         subject: str | None = None,
         session_origin: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         requested_date = (
             date or datetime.now(ZoneInfo(self.timezone_name)).date().isoformat()
@@ -76,6 +77,7 @@ class LearningService:
             subject=subject,
             date=requested_date,
             session_origin=session_origin,
+            used_content_keys=used_content_keys,
         )
 
     async def generate_question(
@@ -87,6 +89,7 @@ class LearningService:
         source_name: str | None = None,
         exam_year: str | None = None,
         session_origin: str | None = None,
+        used_content_keys: set[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         return await self._provider().select_question(
             origin=origin,
@@ -95,6 +98,7 @@ class LearningService:
             source_name=source_name,
             exam_year=exam_year,
             session_origin=session_origin,
+            used_content_keys=used_content_keys,
         )
 
     def import_real_questions(

@@ -124,13 +124,13 @@ class DailyPlan:
         else:
             type_mode = parse_selection_mode(raw_type_mode)
         raw_fixed_question_type = values.get("fixed_question_type")
-        if raw_fixed_question_type in (None, "") and question_type:
+        if (
+            type_mode == "fixed"
+            and raw_fixed_question_type in (None, "")
+            and question_type
+        ):
             raw_fixed_question_type = question_type
-            if raw_type_mode in (None, "random"):
-                type_mode = "fixed"
         fixed_question_type = parse_question_type(raw_fixed_question_type)
-        if type_mode == "rotation" and not question_types and fixed_question_type:
-            question_types = [fixed_question_type]
         if type_mode == "fixed" and fixed_question_type is None:
             raise ValueError("fixed 题型模式必须提供 fixed_question_type")
         if type_mode == "rotation" and not question_types:
