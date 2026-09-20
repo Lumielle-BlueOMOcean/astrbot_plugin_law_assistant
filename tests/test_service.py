@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from daily_plans import DailyPlan
 from models import CaseItem, SourceDocument
 from service import LawAssistantService
 from storage import SQLiteStorage
@@ -302,7 +303,11 @@ async def test_publish_requires_confirmation_and_is_idempotent(tmp_path) -> None
     service = LawAssistantService(
         storage,
         publisher=publisher,
-        config=SimpleNamespace(auto_publish_events=True),
+        config=SimpleNamespace(
+            auto_publish_events=True,
+            timezone="Asia/Shanghai",
+            radar_auto_publish_sources=("fake",),
+        ),
         clock=lambda: now,
     )
     await service.bind_target("aiocqhttp:group:100", "测试群")
@@ -452,3 +457,129 @@ async def test_daily_content_is_idempotent_per_local_day_and_target(tmp_path) ->
     assert second["daily_case_sent"] == 0
     assert "events" not in first
     assert len(storage.list_daily_contents()) == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_question_uses_independent_subject_and_type_resolver_and_history(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 10, 2, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    publisher = RecordingPublisher()
+    calls: list[dict[str, object]] = []
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "available": True,
+                "origin": "mock",
+                "subject": kwargs["subject"],
+                "question_type": kwargs["question_type"],
+                "question_id": 42,
+                "source_kind": "library_mock",
+                "source_item_key": "42",
+                "content": {
+                    "question": "每日题目",
+                    "options": ["A", "B"],
+                    "answer": "A",
+                    "explanation": "解析",
+                },
+            }
+
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    target = await service.bind_target("aiocqhttp:group:100", "测试群")
+    storage.upsert_daily_plan(
+        DailyPlan(
+            content_type="daily_question",
+            enabled=True,
+            time="08:00",
+            selection_mode="rotation",
+            rotation_subjects=("intellectual_property", "economic_law"),
+            rotation_start_date="2026-10-01",
+            question_origin="mock",
+            question_type_selection_mode="rotation",
+            rotation_question_types=("single_choice", "multiple_choice", "true_false"),
+            question_type_rotation_start_date="2026-10-02",
+        ),
+        target["id"],
+    )
+
+    result = await service.run_scheduled_jobs(now=now)
+
+    assert result["daily_question_sent"] == 1
+    assert len(calls) == 1
+    assert {key: calls[0][key] for key in ("subject", "origin", "question_type")} == {
+        "subject": "economic_law",
+        "origin": "mock",
+        "question_type": "single_choice",
+    }
+    history = storage.list_daily_contents()[0]
+    assert history["source_kind"] == "library_mock"
+    assert history["source_item_key"] == "42"
+    assert history["resolved_subject"] == "economic_law"
+    assert history["resolved_question_type"] == "single_choice"
+    assert history["resolved_origin"] == "mock"
+
+
+@pytest.mark.asyncio
+async def test_daily_question_skip_does_not_advance_calendar_rotation(tmp_path) -> None:
+    current = [datetime(2026, 10, 1, 9, tzinfo=ZoneInfo("Asia/Shanghai"))]
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    publisher = RecordingPublisher()
+    calls: list[str] = []
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            calls.append(kwargs["subject"])
+            if len(calls) == 1:
+                return {"available": False, "reason": "暂无匹配的模拟题"}
+            return {
+                "available": True,
+                "origin": "mock",
+                "subject": kwargs["subject"],
+                "question_type": kwargs["question_type"],
+                "content": {
+                    "question": "第二天题目",
+                    "options": ["A", "B"],
+                    "answer": "A",
+                    "explanation": "解析",
+                },
+            }
+
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: current[0],
+    )
+    target = await service.bind_target("aiocqhttp:group:101", "测试群")
+    storage.upsert_daily_plan(
+        DailyPlan(
+            content_type="daily_question",
+            enabled=True,
+            time="08:00",
+            selection_mode="rotation",
+            rotation_subjects=("intellectual_property", "economic_law"),
+            rotation_start_date="2026-10-01",
+            question_origin="mock",
+            question_type="single_choice",
+        ),
+        target["id"],
+    )
+
+    first = await service.run_scheduled_jobs(now=current[0])
+    current[0] = datetime(2026, 10, 2, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+    second = await service.run_scheduled_jobs(now=current[0])
+
+    assert first["daily_question_sent"] == 0
+    assert second["daily_question_sent"] == 1
+    assert calls == ["intellectual_property", "economic_law"]
+    assert len(storage.list_daily_contents()) == 2

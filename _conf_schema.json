@@ -35,6 +35,36 @@
     "default": [],
     "description": "可选的同主机通知列表页 URL。"
   },
+  "radar_keywords": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "活动雷达额外活动关键词；与内置规则合并。"
+  },
+  "radar_action_keywords": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "活动雷达额外报名/参与关键词；与内置规则合并。"
+  },
+  "radar_historical_keywords": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "活动雷达额外历史/结果关键词；与内置规则合并。"
+  },
+  "radar_auto_publish_sources": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "允许自动发布的额外来源 key；普通额外来源默认只发现不自动发布。"
+  },
+  "radar_source_policies": {
+    "type": "list",
+    "items": {"type": "object"},
+    "default": [],
+    "description": "活动雷达来源策略，可设置 key、display_name、discover_enabled 和 auto_publish_enabled。"
+  },
   "auto_publish_events": {
     "type": "bool",
     "default": false,
@@ -124,6 +154,33 @@
     "type": "string",
     "default": "",
     "description": "每日一题题型；留空表示随机。"
+  },
+  "daily_question_type_selection_mode": {
+    "type": "string",
+    "default": "random",
+    "description": "每日一题题型模式：random、fixed 或 rotation。"
+  },
+  "daily_question_fixed_type": {
+    "type": "string",
+    "default": "",
+    "description": "每日一题固定题型；留空表示随机或使用题型轮换。"
+  },
+  "daily_question_rotation_types": {
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "description": "每日一题题型轮换的有序列表。"
+  },
+  "daily_question_type_rotation_start_date": {
+    "type": "string",
+    "default": "",
+    "description": "每日一题题型轮换起始日期 YYYY-MM-DD；留空时首次启用按配置时区建立持久化锚点。"
+  },
+  "daily_question_type_rotation_start_index": {
+    "type": "int",
+    "default": 0,
+    "minimum": 0,
+    "description": "每日一题题型轮换的起始位置。"
   },
   "daily_question_rotation_subjects": {
     "type": "list",

@@ -71,6 +71,9 @@ class LawAssistant(Star):
                 EventExtractor(
                     timezone_name=self.plugin_config.timezone,
                     llm_service=llm_service,
+                    activity_keywords=self.plugin_config.radar_keywords,
+                    action_keywords=self.plugin_config.radar_action_keywords,
+                    historical_keywords=self.plugin_config.radar_historical_keywords,
                 ),
             )
         ]
@@ -82,6 +85,9 @@ class LawAssistant(Star):
                     EventExtractor(
                         timezone_name=self.plugin_config.timezone,
                         llm_service=llm_service,
+                        activity_keywords=self.plugin_config.radar_keywords,
+                        action_keywords=self.plugin_config.radar_action_keywords,
+                        historical_keywords=self.plugin_config.radar_historical_keywords,
                     ),
                 )
             )
@@ -226,7 +232,18 @@ class LawAssistant(Star):
                 await _scan_service(self.service, "command", _session_origin(event))
             )
         elif subcommand == "events":
-            text = self._format_events(await self.service.list_events(limit=20))
+            radar_status, event_type, keyword = _parse_event_args(parts[2:])
+            try:
+                text = self._format_events(
+                    await self.service.list_events(
+                        limit=20,
+                        radar_status=radar_status,
+                        event_type=event_type,
+                        keyword=keyword,
+                    )
+                )
+            except ValueError as exc:
+                text = str(exc)
         elif subcommand == "event" and len(parts) > 2:
             text = _json_text(await self.service.get_event(_safe_int(parts[2])))
         elif subcommand == "deadlines":
@@ -382,15 +399,38 @@ class LawAssistant(Star):
         return json.dumps(self._scan_dict(result), ensure_ascii=False, sort_keys=True)
 
     @filter.llm_tool(name="law_list_events")
-    async def law_list_events(self, event: AstrMessageEvent, limit: int = 20) -> str:
+    async def law_list_events(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 20,
+        radar_status: str = "current",
+        event_type: str = "",
+        keyword: str = "",
+    ) -> str:
         """列出已发现的法律活动。
 
         Args:
             limit(number): 返回的最大活动数量，默认 20。
+            radar_status(string): current、needs_review、historical 或 all，默认 current。
+            event_type(string): 可选活动类型过滤。
+            keyword(string): 可选标题、主办方或资格关键词过滤。
         """
         if not self._authorized(event):
             return self._denial(event)
-        events = await self.service.list_events(limit=limit)
+        try:
+            try:
+                events = await self.service.list_events(
+                    limit=limit,
+                    radar_status=radar_status or "current",
+                    event_type=event_type or None,
+                    keyword=keyword or None,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                events = await self.service.list_events(limit=limit)
+        except ValueError as exc:
+            return str(exc)
         return json.dumps([_event_dict(item) for item in events], ensure_ascii=False)
 
     @filter.llm_tool(name="law_get_event")
@@ -859,14 +899,16 @@ class LawAssistant(Star):
         if not events:
             return "当前尚未发现法律活动。"
         return "\n".join(
-            f"{item.id}. {item.title}（{item.status}）\n{item.source_url}"
+            f"{item.id}. {item.title}（{item.metadata.get('radar_status', item.status)}）\n"
+            f"主办方：{item.organizer or '未提供'}\n{item.source_url}"
             for item in events
         )
 
     @staticmethod
     def _help_text() -> str:
         return (
-            "用法：/law status、/law scan、/law events、/law deadlines、"
+            "用法：/law status、/law scan、/law events [current|needs_review|historical|all]、"
+            "/law deadlines、"
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
             "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
@@ -908,6 +950,34 @@ def _split_targets(value: str) -> list[str]:
         .split(",")
         if item.strip()
     ]
+
+
+def _parse_event_args(parts: list[str]) -> tuple[str, str | None, str | None]:
+    status = "current"
+    event_type: str | None = None
+    keyword: str | None = None
+    statuses = {"current", "needs_review", "historical", "all", "review"}
+    event_types = {
+        "competition",
+        "call_for_submissions",
+        "forum",
+        "training",
+        "internship",
+        "activity",
+        "moot_court",
+        "conference",
+        "recruitment",
+    }
+    for value in parts:
+        candidate = str(value).strip()
+        lowered = candidate.casefold()
+        if lowered in statuses:
+            status = "needs_review" if lowered == "review" else lowered
+        elif lowered in event_types:
+            event_type = lowered
+        elif candidate:
+            keyword = candidate if keyword is None else f"{keyword} {candidate}"
+    return status, event_type, keyword
 
 
 def _looks_like_umo(value: str) -> bool:
@@ -999,6 +1069,7 @@ def _event_dict(event: Any) -> dict[str, Any]:
         "event_type": event.event_type,
         "eligibility": event.eligibility,
         "status": event.status,
+        "radar_status": event.metadata.get("radar_status"),
         "revision": event.revision,
         "dates": [
             {

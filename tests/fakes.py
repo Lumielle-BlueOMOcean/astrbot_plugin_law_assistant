@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from models import EventDate, LegalEvent
@@ -32,7 +32,7 @@ def make_event(
         dates=(
             EventDate(
                 kind="registration_deadline",
-                datetime=now,
+                datetime=now + timedelta(days=7),
                 timezone="Asia/Shanghai",
                 label="报名截止",
                 evidence_text="报名截止：2026-10-01",

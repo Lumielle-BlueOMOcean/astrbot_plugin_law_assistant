@@ -5,14 +5,16 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 ## Implemented
 
 - AstrBot 插件生命周期、`aiocqhttp` 支持、私聊 `/law` 命令和 LLM Tools。
-- 法律硕士活动来源：China-JM 通知列表，以及可配置的同主机通知列表页。
+- 法律硕士活动来源：China-JM 通知列表，以及可配置的同主机通知列表页；活动雷达按确认日期和历史信号动态区分 `current`、`needs_review`、`historical`，不会把刚发现的旧通知当成当前活动。
 - HTML/PDF 异步抓取、编码处理、公告正文提取和规则优先的活动识别。
 - 报名/投稿截止、初赛、复赛、决赛等多节点时间线；原文 evidence 和确认状态随事件保存。
 - SQLite schema migration、来源文档、事件 revision、确定性 upsert 和首次发现时间保留。
 - 最高人民法院/最高人民检察院案例列表接口与案例学习内容接口（需要可用 LLM provider 才生成解读）。
+- 跨来源活动保留独立来源记录，并以强证据 canonical key 关联；自动活动发布只接受 operator 预授权来源、当前状态和已确认截止日期。
 - 真题 JSON 导入、核验状态、考试定位、答案来源和方向/题型检索；仓库不内置未经授权的商业题库。
 - 真题、模拟题和官方案例使用独立身份标注；模拟题不会被标为官方真题，缺少答案证据时不会由 LLM 冒充官方答案。
 - 学习资料库基础：私聊中明确要求收藏的文本资料会保存原文、确定性 hash、归属人和结构化学习条目；支持 `user_case`、`real_question_candidate`、持久化 `mock_question` 和 `note`。
+- 每日内容统一经过 `LearningContentProvider`：优先从 active 官方案例、verified 真题和持久化模拟题库存选择；库存没有匹配模拟题时，才校验并保存新的 AI 原创模拟题。
 - 学习资料库支持 Agent Tool 搜索、读取和有限人工更新；同一原文可以复用 Source，但不同整理结果、方向和备注不会互相覆盖。
 - 受控目录资料导入：管理员可导入 UTF-8/常见中文编码 TXT、标准 DOCX 和文本型 PDF；原件保存在插件数据目录，提取文本保留页码/段落/行号定位，题目和案例按可确定边界拆成独立条目并返回待复核统计。
 - 最高法/最高检受信来源的合集文章会通过独立官方案例入口按原文案例标题拆分；每日一案优先使用独立 `official_case`，并通过统一学习卡片长度预算阻止过长内容发送。
@@ -31,7 +33,7 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG 和 dashboard。
 - 更广泛的题库内容和需要用户授权的真实题目数据；本仓库当前不声称拥有完整真题库。
 - 直接接收 QQ 文件附件、旧版 DOC、扫描 PDF/OCR、完整 WebUI，以及 `real_question_candidate` 到 `verified_real_question` 的人工审核流。
-- 新资料库尚未接管每日案例/每日一题；当前每日任务仍使用现有官方案例和 verified real question 体系。
+- 扫描源之外的真实题库和真实案例数量取决于运行时导入/抓取结果；仓库不内置未经授权的题库内容。
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG、dashboard、特殊 OneBot 消息和 Nexus runtime integration。
 
 ## Architecture
@@ -83,6 +85,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 - `deadline_reminder_days` / `deadline_same_day_enabled`：DDL 提醒策略。
 - `llm_provider_id`：可选；留空按当前会话或宿主默认 provider。
 - `daily_question_origin` / `daily_question_subject` / `daily_question_type`：全局每日一题默认来源、方向和题型，默认均为随机。
+- `daily_question_type_selection_mode`、`daily_question_fixed_type`、`daily_question_rotation_types`、`daily_question_type_rotation_start_date`、`daily_question_type_rotation_start_index`：每日一题独立的题型模式；方向轮换与题型轮换分别按本地日期计算。
 - `daily_case_selection_mode`、`daily_question_selection_mode`：`random`、`fixed` 或 `rotation`。
 - `*_rotation_subjects`、`*_rotation_start_date`、`*_rotation_start_index`：案例和题目各自独立的有序轮换列表及起点。
 
@@ -98,7 +101,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `8`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
+当前 schema version 为 `9`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
 
 该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
 
@@ -136,6 +139,8 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 群内 `/law bind 法硕一群` 会把当前群的真实 `unified_msg_origin` 与别名一起保存；私聊绑定其他目标必须使用明确的 `/law bind-umo <unified_msg_origin> [群别名]`，插件不会根据群名猜 UMO。已绑定群可用 `/law rename <目标群名或 ID> <新别名>` 改名，或在当前群使用 `/law rename <新别名>`。
 
 自然语言可以直接说“给我一道知识产权真题多选题”“给我一个刑法案例”“把这道题发到一群和二群”“看看未来七天一群的安排”。`law_get_daily_case` 与 `law_generate_question` 返回短期、绑定操作者和私聊会话的 `content_ref`；随后发布 Tool 传入该引用即可发布刚才看到的同一条内容，不会重新随机或生成。若明确要求重新出题，则不传引用。所有 Tool 仍执行私聊、Admin/operator 权限检查。
+
+每日案例和每日一题的方向、题型与来源约束由同一个日期解析器计算，但两项任务完全独立。`random` 使用稳定的日期/目标哈希；`rotation` 使用配置时区的日历日期、各自的起始日期和有序列表；没有匹配内容时严格跳过并记录原因，不静默换方向、题型或来源。计划预览不会生成内容，确认后才保存。
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 

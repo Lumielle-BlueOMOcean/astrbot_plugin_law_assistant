@@ -275,6 +275,10 @@ class LibraryService:
         ):
             if _as_text(structured.get(key)):
                 metadata[key] = _as_text(structured[key])
+        if normalized_type in {"real_question_candidate", "mock_question"}:
+            for key in ("questions", "issues", "source_note"):
+                if structured.get(key) not in (None, "", [], {}):
+                    metadata[key] = structured[key]
         item_payload = (
             item_hash_seed
             if item_hash_seed is not None

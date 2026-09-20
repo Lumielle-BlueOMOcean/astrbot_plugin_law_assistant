@@ -59,6 +59,15 @@ ACTION_KEYWORDS = (
     "研究生",
     "招募",
 )
+HISTORICAL_KEYWORDS = (
+    "已结束",
+    "获奖名单",
+    "赛事回顾",
+    "圆满举办",
+    "往届",
+    "决赛结果",
+    "颁奖典礼",
+)
 IRRELEVANT_TITLE_KEYWORDS = ("绿化维护", "设备维护", "停电通知", "食堂安排")
 
 
@@ -71,11 +80,23 @@ class EventExtractor:
         timezone_name: str = "Asia/Shanghai",
         now: Any | None = None,
         llm_service: Any | None = None,
+        activity_keywords: tuple[str, ...] = (),
+        action_keywords: tuple[str, ...] = (),
+        historical_keywords: tuple[str, ...] = (),
     ) -> None:
         self.timezone_name = timezone_name
         self.zone = ZoneInfo(timezone_name)
         self.now = now or (lambda: datetime.now(self.zone))
         self.llm_service = llm_service
+        self.activity_keywords = tuple(
+            dict.fromkeys((*EVENT_KEYWORDS, *activity_keywords))
+        )
+        self.action_keywords = tuple(
+            dict.fromkeys((*ACTION_KEYWORDS, *action_keywords))
+        )
+        self.historical_keywords = tuple(
+            dict.fromkeys((*HISTORICAL_KEYWORDS, *historical_keywords))
+        )
 
     async def extract(
         self,
@@ -84,7 +105,12 @@ class EventExtractor:
         session_origin: str | None = None,
     ) -> list[LegalEvent]:
         text = html_to_text(document.content) or document.content
-        if not _is_relevant(document.title, text):
+        if not _is_relevant(
+            document.title,
+            text,
+            activity_keywords=self.activity_keywords,
+            action_keywords=self.action_keywords,
+        ):
             return []
 
         published_at = extract_publication_datetime(
@@ -126,6 +152,13 @@ class EventExtractor:
                 "source_type": "html",
                 "extraction": "rules_first",
                 "attachments": list(document.attachments),
+                "published_year": publication_year,
+                "participation_evidence": any(
+                    word in text for word in self.action_keywords
+                ),
+                "historical_signals": [
+                    word for word in self.historical_keywords if word in text
+                ],
             },
             dates=tuple(dates),
             registration_method=_registration_method(text),
@@ -147,12 +180,18 @@ class EventExtractor:
         return [event]
 
 
-def _is_relevant(title: str, text: str) -> bool:
+def _is_relevant(
+    title: str,
+    text: str,
+    *,
+    activity_keywords: tuple[str, ...] = EVENT_KEYWORDS,
+    action_keywords: tuple[str, ...] = ACTION_KEYWORDS,
+) -> bool:
     if any(word in title for word in IRRELEVANT_TITLE_KEYWORDS):
         return False
     combined = f"{title}\n{text}"
-    return any(word in combined for word in EVENT_KEYWORDS) and any(
-        word in combined for word in ACTION_KEYWORDS
+    return any(word in combined for word in activity_keywords) and any(
+        word in combined for word in action_keywords
     )
 
 

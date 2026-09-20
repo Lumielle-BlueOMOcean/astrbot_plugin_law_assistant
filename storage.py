@@ -18,7 +18,7 @@ else:
     from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -590,6 +590,100 @@ def _migrate_7_to_8(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_8_to_9(connection: sqlite3.Connection) -> None:
+    """Add independent question-type plans and stable daily/source identities."""
+    if not _table_exists(connection, "daily_plans"):
+        connection.execute(
+            """
+            CREATE TABLE daily_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER,
+                content_type TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                time TEXT NOT NULL,
+                selection_mode TEXT NOT NULL,
+                fixed_subject TEXT,
+                rotation_subjects_json TEXT NOT NULL,
+                rotation_start_date TEXT,
+                rotation_start_index INTEGER NOT NULL,
+                question_origin TEXT NOT NULL,
+                question_type TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+    if not _table_exists(connection, "daily_contents"):
+        connection.execute(
+            """
+            CREATE TABLE daily_contents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_date TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                source_item_id INTEGER,
+                body_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_summary TEXT,
+                UNIQUE(content_date, target_id, content_type)
+            )
+            """
+        )
+    for column, definition in (
+        ("question_type_selection_mode", "TEXT NOT NULL DEFAULT 'random'"),
+        ("fixed_question_type", "TEXT"),
+        ("rotation_question_types", "TEXT NOT NULL DEFAULT '[]'"),
+        ("question_type_rotation_start_date", "TEXT"),
+        ("question_type_rotation_start_index", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        _add_column_if_missing(connection, "daily_plans", column, definition)
+    connection.execute(
+        """
+        UPDATE daily_plans
+        SET question_type_selection_mode = CASE
+                WHEN question_type IS NULL OR trim(question_type) = '' THEN 'random'
+                ELSE 'fixed'
+            END,
+            fixed_question_type = CASE
+                WHEN question_type IS NULL OR trim(question_type) = ''
+                THEN fixed_question_type
+                ELSE question_type
+            END
+        WHERE question_type_selection_mode = 'random'
+           OR fixed_question_type IS NULL
+        """
+    )
+    for column, definition in (
+        ("source_kind", "TEXT"),
+        ("source_item_key", "TEXT"),
+        ("resolved_subject", "TEXT"),
+        ("resolved_question_type", "TEXT"),
+        ("resolved_origin", "TEXT"),
+    ):
+        _add_column_if_missing(connection, "daily_contents", column, definition)
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS event_relations (
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            related_event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            canonical_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(event_id, related_event_id),
+            CHECK(event_id <> related_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_relations_canonical
+            ON event_relations(canonical_key);
+        CREATE TABLE IF NOT EXISTS canonical_publications (
+            canonical_key TEXT NOT NULL,
+            target_id INTEGER,
+            first_published_at TEXT NOT NULL,
+            PRIMARY KEY(canonical_key, target_id)
+        );
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -599,6 +693,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: _migrate_5_to_6,
     6: _migrate_6_to_7,
     7: _migrate_7_to_8,
+    8: _migrate_8_to_9,
 }
 
 
@@ -634,7 +729,11 @@ class SQLiteStorage:
         return self._connection
 
     def get_rotation_anchor(self, content_type: str) -> str | None:
-        if content_type not in {"daily_case", "daily_question"}:
+        if content_type not in {
+            "daily_case",
+            "daily_question",
+            "daily_question_type",
+        }:
             raise ValueError(f"unsupported daily content type: {content_type}")
         row = self._connection.execute(
             "SELECT value FROM schema_meta WHERE key = ?",
@@ -643,7 +742,11 @@ class SQLiteStorage:
         return str(row["value"]) if row else None
 
     def set_rotation_anchor(self, content_type: str, value: str) -> None:
-        if content_type not in {"daily_case", "daily_question"}:
+        if content_type not in {
+            "daily_case",
+            "daily_question",
+            "daily_question_type",
+        }:
             raise ValueError(f"unsupported daily content type: {content_type}")
         self._connection.execute(
             """
@@ -978,6 +1081,68 @@ class SQLiteStorage:
         ).fetchone()
         return self._event_from_row(row) if row else None
 
+    def record_event_relation(
+        self, event_id: int, related_event_id: int, canonical_key: str
+    ) -> None:
+        if event_id == related_event_id:
+            return
+        now = _serialize_datetime(DateTime.now(timezone.utc))
+        self._connection.executemany(
+            """
+            INSERT OR IGNORE INTO event_relations(
+                event_id, related_event_id, canonical_key, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [
+                (event_id, related_event_id, canonical_key, now),
+                (related_event_id, event_id, canonical_key, now),
+            ],
+        )
+        self._connection.commit()
+
+    def related_events(self, event_id: int) -> list[LegalEvent]:
+        rows = self._connection.execute(
+            """
+            SELECT DISTINCT e.*
+            FROM events AS e
+            JOIN event_relations AS relation
+              ON relation.related_event_id = e.id
+            WHERE relation.event_id = ? OR e.id = ?
+            ORDER BY e.id
+            """,
+            (event_id, event_id),
+        ).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def record_canonical_publication(
+        self, canonical_key: str, target_id: int | None = None
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO canonical_publications(
+                canonical_key, target_id, first_published_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                canonical_key,
+                target_id,
+                _serialize_datetime(DateTime.now(timezone.utc)),
+            ),
+        )
+        self._connection.commit()
+
+    def has_canonical_publication(
+        self, canonical_key: str, target_id: int | None = None
+    ) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM canonical_publications
+            WHERE canonical_key = ? AND (target_id = ? OR target_id IS NULL)
+            """,
+            (canonical_key, target_id),
+        ).fetchone()
+        return row is not None
+
     def count_events(self) -> int:
         row = self._connection.execute(
             "SELECT COUNT(*) AS count FROM events"
@@ -1295,8 +1460,11 @@ class SQLiteStorage:
             INSERT INTO daily_plans(
                 target_id, content_type, enabled, time, selection_mode, fixed_subject,
                 rotation_subjects_json, rotation_start_date, rotation_start_index,
-                question_origin, question_type, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                question_origin, question_type, question_type_selection_mode,
+                fixed_question_type, rotation_question_types,
+                question_type_rotation_start_date, question_type_rotation_start_index,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO UPDATE SET
                 enabled = excluded.enabled, time = excluded.time,
                 selection_mode = excluded.selection_mode, fixed_subject = excluded.fixed_subject,
@@ -1304,6 +1472,11 @@ class SQLiteStorage:
                 rotation_start_date = excluded.rotation_start_date,
                 rotation_start_index = excluded.rotation_start_index,
                 question_origin = excluded.question_origin, question_type = excluded.question_type,
+                question_type_selection_mode = excluded.question_type_selection_mode,
+                fixed_question_type = excluded.fixed_question_type,
+                rotation_question_types = excluded.rotation_question_types,
+                question_type_rotation_start_date = excluded.question_type_rotation_start_date,
+                question_type_rotation_start_index = excluded.question_type_rotation_start_index,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1318,6 +1491,11 @@ class SQLiteStorage:
                 plan.rotation_start_index,
                 plan.question_origin,
                 plan.question_type,
+                plan.question_type_selection_mode,
+                plan.fixed_question_type,
+                json.dumps(plan.rotation_question_types, ensure_ascii=False),
+                plan.question_type_rotation_start_date,
+                plan.question_type_rotation_start_index,
                 now,
             ),
         )
@@ -1506,13 +1684,19 @@ class SQLiteStorage:
         content_type: str,
         body: dict[str, Any],
         source_item_id: int | None = None,
+        source_kind: str | None = None,
+        source_item_key: str | None = None,
+        resolved_subject: str | None = None,
+        resolved_question_type: str | None = None,
+        resolved_origin: str | None = None,
     ) -> int | None:
         cursor = self._connection.execute(
             """
             INSERT OR IGNORE INTO daily_contents(
                 content_date, target_id, content_type, source_item_id,
-                body_json, status, attempted_at
-            ) VALUES (?, ?, ?, ?, ?, 'claimed', ?)
+                body_json, status, attempted_at, source_kind, source_item_key,
+                resolved_subject, resolved_question_type, resolved_origin
+            ) VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?)
             """,
             (
                 content_date,
@@ -1521,6 +1705,11 @@ class SQLiteStorage:
                 source_item_id,
                 json.dumps(body, ensure_ascii=False, sort_keys=True),
                 _serialize_datetime(DateTime.now(timezone.utc)),
+                source_kind,
+                source_item_key,
+                resolved_subject,
+                resolved_question_type,
+                resolved_origin,
             ),
         )
         self._connection.commit()
@@ -1544,6 +1733,8 @@ class SQLiteStorage:
         content_type: str,
         reason: str,
         subject: str | None = None,
+        resolved_question_type: str | None = None,
+        resolved_origin: str | None = None,
     ) -> int | None:
         body = {"skipped": True, "reason": reason, "subject": subject}
         return self.claim_daily_content(
@@ -1551,6 +1742,9 @@ class SQLiteStorage:
             target_id=target_id,
             content_type=content_type,
             body=body,
+            resolved_subject=subject,
+            resolved_question_type=resolved_question_type,
+            resolved_origin=resolved_origin,
         )
 
     def finish_daily_content(
@@ -1829,6 +2023,11 @@ def _real_question_from_row(row: sqlite3.Row) -> RealQuestion:
 
 
 def _daily_plan_from_row(row: sqlite3.Row) -> DailyPlan:
+    legacy_question_type = row["question_type"]
+    fixed_question_type = row["fixed_question_type"] or legacy_question_type
+    question_type_mode = row["question_type_selection_mode"]
+    if question_type_mode == "fixed" and fixed_question_type is None:
+        question_type_mode = "random"
     return DailyPlan(
         content_type=row["content_type"],
         enabled=bool(row["enabled"]),
@@ -1839,7 +2038,14 @@ def _daily_plan_from_row(row: sqlite3.Row) -> DailyPlan:
         rotation_start_date=row["rotation_start_date"],
         rotation_start_index=int(row["rotation_start_index"]),
         question_origin=row["question_origin"],
-        question_type=row["question_type"],
+        question_type=legacy_question_type,
+        question_type_selection_mode=question_type_mode,
+        fixed_question_type=fixed_question_type,
+        rotation_question_types=tuple(json.loads(row["rotation_question_types"])),
+        question_type_rotation_start_date=row["question_type_rotation_start_date"],
+        question_type_rotation_start_index=int(
+            row["question_type_rotation_start_index"]
+        ),
     )
 
 

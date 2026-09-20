@@ -85,7 +85,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 8
+    assert storage.schema_version == SCHEMA_VERSION == 9
     assert storage.count_events() == 0
     storage.close()
 
@@ -104,7 +104,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 8",
+        match=r"schema version 99 is newer than supported version 9",
     ):
         SQLiteStorage(db_path)
 
@@ -157,6 +157,71 @@ def test_storage_preserves_first_discovered_at_on_upsert(tmp_path) -> None:
     storage.close()
 
 
+def test_schema_v9_adds_daily_axes_and_stable_content_identity(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    daily_columns = {
+        row[1] for row in storage.connection.execute("PRAGMA table_info(daily_plans)")
+    }
+    history_columns = {
+        row[1]
+        for row in storage.connection.execute("PRAGMA table_info(daily_contents)")
+    }
+
+    assert storage.schema_version == SCHEMA_VERSION == 9
+    assert {
+        "question_type_selection_mode",
+        "fixed_question_type",
+        "rotation_question_types",
+        "question_type_rotation_start_date",
+        "question_type_rotation_start_index",
+    } <= daily_columns
+    assert {
+        "source_kind",
+        "source_item_key",
+        "resolved_subject",
+        "resolved_question_type",
+        "resolved_origin",
+    } <= history_columns
+
+    target = storage.bind_target("aiocqhttp:group:1", "一群")
+    history_id = storage.claim_daily_content(
+        content_date="2026-09-21",
+        target_id=target["id"],
+        content_type="daily_question",
+        body={"question": "题干"},
+        source_kind="library_mock",
+        source_item_key="42",
+        resolved_subject="criminal_law",
+        resolved_question_type="multiple_choice",
+        resolved_origin="mock",
+    )
+    record = storage.list_daily_contents()[0]
+    assert history_id is not None
+    assert record["source_kind"] == "library_mock"
+    assert record["source_item_key"] == "42"
+    assert record["resolved_question_type"] == "multiple_choice"
+    storage.close()
+
+
+def test_event_relation_preserves_both_sources_and_canonical_publication_state(
+    tmp_path,
+) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    first_id = storage.upsert_event(make_event(source_key="china_jm"))
+    second_id = storage.upsert_event(
+        replace(make_event(source_key="extra:1"), source_item_key="mirror-1")
+    )
+
+    storage.record_event_relation(first_id, second_id, "canonical-hash")
+
+    related = storage.related_events(second_id)
+    assert {item.id for item in related} == {first_id, second_id}
+    assert storage.has_canonical_publication("canonical-hash") is False
+    storage.record_canonical_publication("canonical-hash")
+    assert storage.has_canonical_publication("canonical-hash") is True
+    storage.close()
+
+
 def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> None:
     db_path = tmp_path / "existing-v1.sqlite3"
     _create_v1_database(db_path)
@@ -189,7 +254,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 8
+    assert storage.schema_version == SCHEMA_VERSION == 9
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -234,7 +299,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 8
+    assert storage.schema_version == SCHEMA_VERSION == 9
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -329,7 +394,33 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 8
+    assert reopened.schema_version == 9
+    reopened.close()
+
+
+def test_storage_round_trips_independent_question_type_plan(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    plan = DailyPlan(
+        content_type="daily_question",
+        enabled=True,
+        selection_mode="rotation",
+        rotation_subjects=("intellectual_property", "economic_law"),
+        rotation_start_date="2026-09-21",
+        question_origin="real",
+        question_type_selection_mode="rotation",
+        rotation_question_types=("multiple_choice", "case_analysis"),
+        question_type_rotation_start_date="2026-09-22",
+        question_type_rotation_start_index=1,
+    )
+    storage.upsert_daily_plan(plan)
+
+    reopened = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    loaded = reopened.get_daily_plan(None, "daily_question")
+    assert loaded is not None
+    assert loaded.question_type_selection_mode == "rotation"
+    assert loaded.rotation_question_types == ("multiple_choice", "case_analysis")
+    assert loaded.question_type_rotation_start_date == "2026-09-22"
+    assert loaded.question_type_rotation_start_index == 1
     reopened.close()
 
 
@@ -344,7 +435,7 @@ def test_storage_runs_the_v3_to_v8_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 8
+    assert migrated.schema_version == SCHEMA_VERSION == 9
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()
@@ -418,7 +509,7 @@ def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 8
+    assert storage.schema_version == SCHEMA_VERSION == 9
     assert [
         tuple(row)
         for row in storage.connection.execute(

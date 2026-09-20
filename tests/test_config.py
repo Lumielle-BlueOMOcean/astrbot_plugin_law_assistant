@@ -17,6 +17,9 @@ def test_config_defaults_are_safe() -> None:
     assert config.daily_case_selection_mode == "random"
     assert config.daily_question_origin == "random"
     assert config.daily_question_type is None
+    assert config.daily_question_type_selection_mode == "random"
+    assert config.daily_question_fixed_type is None
+    assert config.daily_question_rotation_types == ()
     assert config.case_source_court_enabled is True
     assert config.case_source_spp_enabled is True
 
@@ -101,3 +104,22 @@ def test_config_keeps_missing_rotation_anchor_unset_for_persistence_layer() -> N
     )
 
     assert config.daily_question_rotation_start_date is None
+
+
+def test_config_normalizes_independent_question_type_rotation() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "daily_question_type_selection_mode": "rotation",
+            "daily_question_rotation_types": ["单选", "多选", "unknown"],
+            "daily_question_type_rotation_start_date": "2026-09-21",
+            "daily_question_type_rotation_start_index": 2,
+        }
+    )
+
+    assert config.daily_question_type_selection_mode == "rotation"
+    assert config.daily_question_rotation_types == (
+        "single_choice",
+        "multiple_choice",
+    )
+    assert config.daily_question_type_rotation_start_date == "2026-09-21"
+    assert config.daily_question_type_rotation_start_index == 2

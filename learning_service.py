@@ -11,28 +11,18 @@ if __package__ and "." in __package__:
     from .content import (
         QUESTION_TYPE_LABELS,
         SUBJECT_LABELS,
-        QuestionRequest,
         RealQuestion,
-        normalize_subject,
-        parse_subject,
-        subject_matches,
-        validate_generated_question,
     )
-    from .learning_card import ContentTooLongError, format_case_card
+    from .learning_inventory import LearningContentProvider
     from .models import CaseItem
     from .storage import SQLiteStorage
 else:
     from content import (
         QUESTION_TYPE_LABELS,
         SUBJECT_LABELS,
-        QuestionRequest,
         RealQuestion,
-        normalize_subject,
-        parse_subject,
-        subject_matches,
-        validate_generated_question,
     )
-    from learning_card import ContentTooLongError, format_case_card
+    from learning_inventory import LearningContentProvider
     from models import CaseItem
     from storage import SQLiteStorage
 
@@ -58,6 +48,19 @@ class LearningService:
         self.rng = rng or random.Random()
         self.library_service = library_service
         self.daily_case_card_max_chars = daily_case_card_max_chars
+        self.content_provider = LearningContentProvider(
+            storage,
+            library_service=library_service,
+            llm_service=llm_service,
+            rng=self.rng,
+            daily_case_card_max_chars=daily_case_card_max_chars,
+        )
+
+    def _provider(self) -> LearningContentProvider:
+        self.content_provider.library_service = self.library_service
+        self.content_provider.llm_service = self.llm_service
+        self.content_provider.daily_case_card_max_chars = self.daily_case_card_max_chars
+        return self.content_provider
 
     async def daily_case(
         self,
@@ -66,153 +69,14 @@ class LearningService:
         subject: str | None = None,
         session_origin: str | None = None,
     ) -> dict[str, Any]:
-        requested_subject = parse_subject(subject)
-        if self.library_service is not None:
-            bundles = self.library_service.official_case_bundles(
-                subject=requested_subject or "", limit=500
-            )
-            if not bundles:
-                return {
-                    "available": False,
-                    "reason": (
-                        "暂无匹配方向的独立官方案例"
-                        if requested_subject
-                        else "暂无已存储的独立官方案例"
-                    ),
-                }
-            selected = _select_for_day(
-                bundles,
-                date or datetime.now(ZoneInfo(self.timezone_name)).date().isoformat(),
-            )
-            if self.llm_service is None:
-                return {"available": False, "reason": "LLM provider unavailable"}
-            evidence = _official_case_evidence(selected)
-            prompt = _official_case_prompt(selected, evidence)
-            result = await self.llm_service.generate_json(
-                prompt,
-                session_origin=session_origin,
-            )
-            if not isinstance(result, dict):
-                return {"available": False, "reason": "LLM provider unavailable"}
-            source = selected.sources[0] if selected.sources else None
-            subjects = tuple(selected.item.subjects)
-            selected_subject = requested_subject or next(
-                (
-                    normalize_subject(value)
-                    for value in subjects
-                    if normalize_subject(value)
-                ),
-                None,
-            )
-            response = {
-                "available": True,
-                "case_id": selected.item.id,
-                "title": selected.item.title,
-                "source_url": source.source_url if source else "",
-                "authority": selected.case.authority if selected.case else "",
-                "subject": selected_subject,
-                "content": result,
-                "evidence_text": evidence,
-                "source_locator": (
-                    selected.source_links[0].locator if selected.source_links else ""
-                ),
-            }
-            try:
-                response["card_body"] = format_case_card(
-                    response, max_chars=self.daily_case_card_max_chars
-                )
-            except ContentTooLongError:
-                compact = await self.llm_service.generate_json(
-                    prompt
-                    + f"\n请在 {self.daily_case_card_max_chars} 字符内重新整理，不得省略来源证据支持的关键结论。",
-                    session_origin=session_origin,
-                )
-                if not isinstance(compact, dict):
-                    return {
-                        "available": False,
-                        "error": "content_too_long",
-                        "reason": "案例学习卡片超过长度预算且无法压缩",
-                    }
-                response["content"] = compact
-                try:
-                    response["card_body"] = format_case_card(
-                        response, max_chars=self.daily_case_card_max_chars
-                    )
-                except ContentTooLongError:
-                    return {
-                        "available": False,
-                        "error": "content_too_long",
-                        "reason": "案例学习卡片超过长度预算且无法压缩",
-                    }
-            return response
-        items = self.storage.list_case_items(limit=500)
-        if requested_subject:
-            items = [
-                item
-                for item in items
-                if subject_matches(
-                    tuple(item.subjects)
-                    or tuple(item.metadata.get("subjects", ()))
-                    or (
-                        (item.metadata.get("subject"),)
-                        if item.metadata.get("subject")
-                        else ()
-                    ),
-                    requested_subject,
-                )
-            ]
-            if not items:
-                return {"available": False, "reason": "暂无匹配方向的官方案例"}
-        if not items:
-            return {"available": False, "reason": "暂无已存储的官方案例"}
-        unpublished = [
-            item
-            for item in items
-            if item.id is not None and item.id not in self.storage.published_case_ids()
-        ]
-        items = unpublished or items
-        selected = _select_for_day(
-            items,
-            date or datetime.now(ZoneInfo(self.timezone_name)).date().isoformat(),
+        requested_date = (
+            date or datetime.now(ZoneInfo(self.timezone_name)).date().isoformat()
         )
-        if self.llm_service is None:
-            return {"available": False, "reason": "LLM provider unavailable"}
-        result = await self.llm_service.generate_json(
-            _case_prompt(selected), session_origin=session_origin
+        return await self._provider().select_case(
+            subject=subject,
+            date=requested_date,
+            session_origin=session_origin,
         )
-        if not isinstance(result, dict):
-            return {"available": False, "reason": "LLM provider unavailable"}
-        response = {
-            "available": True,
-            "case_id": selected.id,
-            "title": selected.title,
-            "source_url": selected.source_url,
-            "authority": selected.authority,
-            "subject": requested_subject
-            or next(
-                (
-                    normalize_subject(value)
-                    for value in (
-                        tuple(selected.subjects)
-                        or tuple(selected.metadata.get("subjects", ()))
-                    )
-                    if normalize_subject(value)
-                ),
-                None,
-            ),
-            "content": result,
-        }
-        try:
-            response["card_body"] = format_case_card(
-                response, max_chars=self.daily_case_card_max_chars
-            )
-        except ContentTooLongError:
-            return {
-                "available": False,
-                "error": "content_too_long",
-                "reason": "案例学习卡片超过长度预算且无法压缩",
-            }
-        return response
 
     async def generate_question(
         self,
@@ -224,84 +88,14 @@ class LearningService:
         exam_year: str | None = None,
         session_origin: str | None = None,
     ) -> dict[str, Any]:
-        request = QuestionRequest.from_values(
+        return await self._provider().select_question(
             origin=origin,
             subject=subject,
             question_type=question_type,
             source_name=source_name,
             exam_year=exam_year,
-        )
-        candidates = self.storage.list_real_questions(
-            subject=request.subject,
-            question_type=request.question_type,
-            source_name=request.source_name,
-            exam_year=request.exam_year,
-            exclude_ids=self.storage.published_question_ids(),
-        )
-        if not candidates:
-            candidates = self.storage.list_real_questions(
-                subject=request.subject,
-                question_type=request.question_type,
-                source_name=request.source_name,
-                exam_year=request.exam_year,
-            )
-        selected_origin = request.origin
-        if request.origin == "real":
-            if not candidates:
-                return {"available": False, "reason": "暂无匹配的已核验真题"}
-            return _real_question_result(self.rng.choice(candidates))
-        if request.origin == "random":
-            if candidates and self.rng.choice((True, False)):
-                return _real_question_result(self.rng.choice(candidates))
-            selected_origin = "mock"
-
-        selected_subject = request.subject or self.rng.choice(
-            (
-                "criminal_law",
-                "civil_commercial",
-                "intellectual_property",
-                "economic_law",
-            )
-        )
-        selected_type = request.question_type or self.rng.choice(
-            tuple(QUESTION_TYPE_LABELS)
-        )
-        if self.llm_service is None:
-            return {"available": False, "reason": "LLM provider unavailable"}
-        evidence = ""
-        cases = self.storage.list_case_items(limit=1)
-        if cases:
-            evidence = cases[0].raw_text[:8000]
-        else:
-            updates = self.storage.list_law_updates(limit=1)
-            if updates:
-                evidence = updates[0].raw_text[:8000]
-        result = await self.llm_service.generate_json(
-            _question_prompt(selected_subject, selected_type, evidence),
             session_origin=session_origin,
         )
-        if not validate_generated_question(result, selected_type):
-            return {
-                "available": False,
-                "reason": "LLM response does not match requested question type",
-            }
-        result = dict(result)
-        result["is_original_practice"] = True
-        result["disclaimer"] = "原创练习题，仅供学习，不构成法律意见"
-        response = {
-            "available": True,
-            "origin": selected_origin,
-            "subject": selected_subject,
-            "question_type": selected_type,
-            "content": result,
-            "label": "模拟题",
-            "source_note": "AI 生成的原创练习题，非官方考试真题",
-        }
-        if request.origin == "random" and not candidates:
-            response["selection_note"] = (
-                "当前真题库没有可用记录，本次随机选择仅使用模拟题"
-            )
-        return response
 
     def import_real_questions(
         self, records: list[RealQuestion | dict[str, Any]]

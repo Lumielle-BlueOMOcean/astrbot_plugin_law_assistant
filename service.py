@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 if __package__ and "." in __package__:
+    from .activity_radar import (
+        canonical_event_key,
+        derive_radar_status,
+        radar_policy_for,
+    )
     from .content import (
         format_question_content,
         normalize_subject,
@@ -19,6 +24,7 @@ if __package__ and "." in __package__:
         parse_subject,
     )
     from .daily_plans import DailyPlan
+    from .daily_resolver import resolve_daily_constraints
     from .document_extractors import DocumentSegment, ParsedDocument
     from .learning_segmentation import (
         CASE_SEGMENTATION_VERSION,
@@ -32,6 +38,11 @@ if __package__ and "." in __package__:
     from .sources.base import Extractor, SourceAdapter, Validator
     from .storage import SQLiteStorage
 else:
+    from activity_radar import (
+        canonical_event_key,
+        derive_radar_status,
+        radar_policy_for,
+    )
     from content import (
         format_question_content,
         normalize_subject,
@@ -40,6 +51,7 @@ else:
         parse_subject,
     )
     from daily_plans import DailyPlan
+    from daily_resolver import resolve_daily_constraints
     from document_extractors import DocumentSegment, ParsedDocument
     from learning_segmentation import CASE_SEGMENTATION_VERSION, segment_official_cases
     from learning_service import LearningService
@@ -233,7 +245,29 @@ class LawAssistantService:
                                 accepted_event = replace(
                                     accepted_event, last_seen_at=seen_at
                                 )
+                            canonical_key = canonical_event_key(accepted_event)
+                            prior_canonical_events = []
+                            if canonical_key:
+                                prior_canonical_events = [
+                                    prior_event
+                                    for prior_event in self.storage.list_events(
+                                        limit=10000
+                                    )
+                                    if prior_event.source_key
+                                    != accepted_event.source_key
+                                    and prior_event.source_item_key
+                                    != accepted_event.source_item_key
+                                    and canonical_event_key(prior_event)
+                                    == canonical_key
+                                ]
                             result = self.storage.upsert_event_detailed(accepted_event)
+                            if canonical_key:
+                                for prior_event in prior_canonical_events:
+                                    self.storage.record_event_relation(
+                                        result.event_id,
+                                        int(prior_event.id),
+                                        canonical_key,
+                                    )
                             if result.is_new:
                                 new_event_ids.append(result.event_id)
                                 self.logger.info(
@@ -460,11 +494,72 @@ class LawAssistantService:
     def _store_law_update(self, item: LawUpdate) -> None:
         self.storage.upsert_law_update(item)
 
-    async def list_events(self, limit: int = 20) -> list[LegalEvent]:
-        return self.storage.list_events(limit=max(1, min(limit, 100)))
+    async def list_events(
+        self,
+        limit: int = 20,
+        *,
+        radar_status: str = "current",
+        event_type: str | None = None,
+        keyword: str | None = None,
+    ) -> list[LegalEvent]:
+        if radar_status not in {"current", "needs_review", "historical", "all"}:
+            raise ValueError(
+                "radar_status 必须是 current、needs_review、historical 或 all"
+            )
+        candidates = self.storage.list_events(limit=1000)
+        result: list[LegalEvent] = []
+        for event in candidates:
+            derived_status = self._radar_status(event)
+            if radar_status != "all" and derived_status != radar_status:
+                continue
+            if event_type and event.event_type.casefold() != str(event_type).casefold():
+                continue
+            if keyword:
+                haystack = (
+                    f"{event.title} {event.organizer} {event.summary} {event.eligibility}"
+                ).casefold()
+                if str(keyword).casefold() not in haystack:
+                    continue
+            result.append(
+                replace(
+                    event,
+                    metadata={**event.metadata, "radar_status": derived_status},
+                )
+            )
+        result.sort(key=self._event_sort_key)
+        return result[: max(1, min(limit, 100))]
 
     async def get_event(self, event_id: int) -> LegalEvent | None:
-        return self.storage.get_event(event_id)
+        event = self.storage.get_event(event_id)
+        if event is None:
+            return None
+        return replace(
+            event,
+            metadata={**event.metadata, "radar_status": self._radar_status(event)},
+        )
+
+    def _radar_status(self, event: LegalEvent) -> str:
+        return derive_radar_status(
+            event,
+            self._now_utc(),
+            getattr(self.config, "timezone", "Asia/Shanghai"),
+            tuple(getattr(self.config, "radar_historical_keywords", ()) or ()),
+        )
+
+    def _event_sort_key(self, event: LegalEvent) -> tuple[datetime, float, int]:
+        deadlines = [
+            item.datetime
+            for item in event.dates
+            if item.confirmed
+            and item.datetime is not None
+            and item.kind.endswith("deadline")
+            and item.datetime >= self._now_utc()
+        ]
+        deadline = (
+            min(deadlines) if deadlines else datetime.max.replace(tzinfo=timezone.utc)
+        )
+        published = event.source_published_at or event.updated_at
+        return (deadline, -published.timestamp(), -(event.id or 0))
 
     async def list_deadlines(self, limit: int = 50) -> list[dict[str, Any]]:
         return self.storage.list_deadlines(now=self._now_utc(), limit=limit)
@@ -580,12 +675,37 @@ class LawAssistantService:
                     getattr(self.config, "daily_question_origin", "random")
                 ),
                 "question_type": getattr(self.config, "daily_question_type", None),
+                "question_type_selection_mode": getattr(
+                    self.config, "daily_question_type_selection_mode", "random"
+                ),
+                "fixed_question_type": getattr(
+                    self.config,
+                    "daily_question_fixed_type",
+                    getattr(self.config, "daily_question_type", None),
+                ),
+                "rotation_question_types": tuple(
+                    getattr(self.config, "daily_question_rotation_types", ())
+                ),
+                "question_type_rotation_start_date": getattr(
+                    self.config, "daily_question_type_rotation_start_date", None
+                ),
+                "question_type_rotation_start_index": int(
+                    getattr(self.config, "daily_question_type_rotation_start_index", 0)
+                ),
             }
         if str(
             values.get("selection_mode", "random")
         ).strip().lower() == "rotation" and not values.get("rotation_start_date"):
             values["rotation_start_date"] = self.storage.get_rotation_anchor(
                 content_type
+            )
+        if str(
+            values.get("question_type_selection_mode", "random")
+        ).strip().lower() == "rotation" and not values.get(
+            "question_type_rotation_start_date"
+        ):
+            values["question_type_rotation_start_date"] = (
+                self.storage.get_rotation_anchor("daily_question_type")
             )
         return DailyPlan.from_mapping(
             content_type, values, allow_unanchored_rotation=True
@@ -611,6 +731,14 @@ class LawAssistantService:
                 and plan.rotation_start_date is None
             ):
                 self.storage.set_rotation_anchor(content_type, local_today)
+            if (
+                content_type == "daily_question"
+                and plan.enabled
+                and plan.question_type_selection_mode == "rotation"
+                and plan.rotation_question_types
+                and plan.question_type_rotation_start_date is None
+            ):
+                self.storage.set_rotation_anchor("daily_question_type", local_today)
 
     def effective_daily_plan(
         self, target_id: int | None, content_type: str
@@ -637,7 +765,7 @@ class LawAssistantService:
                 content_type: {
                     "plan": self.effective_daily_plan(None, content_type).to_mapping(),
                     "preview": self.effective_daily_plan(None, content_type).preview(
-                        local_today, days
+                        local_today, days, target_id=None
                     ),
                 }
                 for content_type in ("daily_case", "daily_question")
@@ -655,7 +783,7 @@ class LawAssistantService:
                             ).to_mapping(),
                             "preview": self.effective_daily_plan(
                                 target["id"], content_type
-                            ).preview(local_today, days),
+                            ).preview(local_today, days, target_id=target["id"]),
                             "override": self.storage.get_daily_plan(
                                 target["id"], content_type
                             )
@@ -711,6 +839,15 @@ class LawAssistantService:
                 merged.get("selection_mode", "random")
             ).strip().lower() == "rotation" and not merged.get("rotation_start_date"):
                 merged["rotation_start_date"] = local_today.isoformat()
+            if (
+                item == "daily_question"
+                and str(merged.get("question_type_selection_mode", "random"))
+                .strip()
+                .lower()
+                == "rotation"
+                and not merged.get("question_type_rotation_start_date")
+            ):
+                merged["question_type_rotation_start_date"] = local_today.isoformat()
             plans.append(DailyPlan.from_mapping(item, merged))
         token = secrets.token_urlsafe(12)
         created = self._now_utc()
@@ -729,7 +866,10 @@ class LawAssistantService:
             "targets": target_info,
             "content_types": list(content_types),
             "plans": [
-                {"plan": plan.to_mapping(), "preview": plan.preview(local_today, 7)}
+                {
+                    "plan": plan.to_mapping(),
+                    "preview": plan.preview(local_today, 7, target_id=target_id),
+                }
                 for plan in plans
             ],
             "notice": "计划修改只会在明确确认后持久化。案例与题目计划独立执行。",
@@ -1079,20 +1219,31 @@ class LawAssistantService:
         event = self.storage.get_event(event_id)
         if event is None or self.publisher is None:
             return 0
-        if kind == "automatic" and (
-            event.status.upper() in {"CLOSED", "UNKNOWN"}
-            or not any(
+        if kind == "automatic":
+            policy = radar_policy_for(event.source_key, self.config)
+            if (
+                not policy.auto_publish_enabled
+                or self._radar_status(event) != "current"
+            ):
+                return 0
+            if not any(
                 date.confirmed
                 and date.datetime is not None
                 and date.kind in {"registration_deadline", "submission_deadline"}
                 for date in event.dates
-            )
-        ):
-            return 0
+            ):
+                return 0
         count = 0
         allowed = set(target_ids) if target_ids is not None else None
         for target in self.storage.list_targets(enabled_only=True):
             if allowed is not None and target["id"] not in allowed:
+                continue
+            canonical_key = canonical_event_key(event)
+            if (
+                kind == "automatic"
+                and canonical_key
+                and self.storage.has_canonical_publication(canonical_key, target["id"])
+            ):
                 continue
             publication_id = self.storage.claim_publication(
                 event.id, event.revision, target["id"], kind
@@ -1105,6 +1256,10 @@ class LawAssistantService:
             self.storage.finish_publication(publication_id, success=success)
             if success:
                 count += 1
+                if kind == "automatic" and canonical_key:
+                    self.storage.record_canonical_publication(
+                        canonical_key, target["id"]
+                    )
                 self.logger.info(
                     "Law Assistant published event %s to %s",
                     event_id,
@@ -1411,14 +1566,27 @@ class LawAssistantService:
             plan = self.effective_daily_plan(target["id"], content_type)
             if not plan.enabled or not _time_is_due(now, plan.time, self.config):
                 continue
-            selected_subject = plan.subject_for(local_now.date())
-            if plan.selection_mode == "rotation" and selected_subject is None:
+            resolved = resolve_daily_constraints(
+                plan,
+                local_now.date(),
+                target_id=target["id"],
+                content_type=content_type,
+            )
+            selected_subject = resolved["subject"]
+            selected_question_type = resolved["question_type"]
+            if (plan.selection_mode == "rotation" and selected_subject is None) or (
+                content_type == "daily_question"
+                and resolved["question_type_mode"] == "rotation"
+                and selected_question_type is None
+            ):
                 self._record_daily_skip(
                     local_now.date().isoformat(),
                     target["id"],
                     content_type,
-                    "轮换计划尚未开始或缺少有效方向",
-                    None,
+                    "轮换计划尚未开始或缺少有效方向/题型",
+                    selected_subject,
+                    question_type=selected_question_type,
+                    origin=resolved["origin"],
                 )
                 continue
             content_date = local_now.date().isoformat()
@@ -1433,19 +1601,20 @@ class LawAssistantService:
             else:
                 content = await self.generate_question(
                     selected_subject or "",
-                    origin=plan.question_origin,
-                    question_type=plan.question_type,
+                    origin=resolved["origin"] or "random",
+                    question_type=selected_question_type,
                 )
             if not content.get("available"):
                 reason = str(content.get("reason", "没有匹配内容"))
-                if "匹配" in reason or "暂无" in reason:
-                    self._record_daily_skip(
-                        content_date,
-                        target["id"],
-                        content_type,
-                        reason,
-                        selected_subject,
-                    )
+                self._record_daily_skip(
+                    content_date,
+                    target["id"],
+                    content_type,
+                    reason,
+                    selected_subject,
+                    question_type=selected_question_type,
+                    origin=resolved["origin"],
+                )
                 continue
             raw_body = content.get("content", content)
             body = raw_body if isinstance(raw_body, dict) else {"body": raw_body}
@@ -1455,6 +1624,12 @@ class LawAssistantService:
                 content_type=content_type,
                 body=body,
                 source_item_id=content.get("case_id") or content.get("question_id"),
+                source_kind=content.get("source_kind"),
+                source_item_key=content.get("source_item_key"),
+                resolved_subject=content.get("subject") or selected_subject,
+                resolved_question_type=content.get("question_type")
+                or selected_question_type,
+                resolved_origin=content.get("origin") or resolved["origin"],
             )
             if claim_id is None:
                 continue
@@ -1484,6 +1659,9 @@ class LawAssistantService:
         content_type: str,
         reason: str,
         subject: str | None,
+        *,
+        question_type: str | None = None,
+        origin: str | None = None,
     ) -> None:
         claim_id = self.storage.record_daily_skip(
             content_date=content_date,
@@ -1491,6 +1669,8 @@ class LawAssistantService:
             content_type=content_type,
             reason=reason,
             subject=subject,
+            resolved_question_type=question_type,
+            resolved_origin=origin,
         )
         if claim_id is not None:
             self.storage.mark_daily_skipped(claim_id, reason)

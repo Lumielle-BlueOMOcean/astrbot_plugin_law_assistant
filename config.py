@@ -39,6 +39,11 @@ class PluginConfig:
     scan_interval_minutes: int
     llm_provider_id: str
     extra_event_source_urls: tuple[str, ...]
+    radar_keywords: tuple[str, ...]
+    radar_action_keywords: tuple[str, ...]
+    radar_historical_keywords: tuple[str, ...]
+    radar_auto_publish_sources: tuple[str, ...]
+    radar_source_policies: tuple[dict[str, Any], ...]
     auto_publish_events: bool
     deadline_reminder_days: tuple[int, ...]
     deadline_same_day_enabled: bool
@@ -56,6 +61,11 @@ class PluginConfig:
     daily_question_origin: str
     daily_question_subject: str | None
     daily_question_type: str | None
+    daily_question_type_selection_mode: str
+    daily_question_fixed_type: str | None
+    daily_question_rotation_types: tuple[str, ...]
+    daily_question_type_rotation_start_date: str | None
+    daily_question_type_rotation_start_index: int
     daily_question_rotation_subjects: tuple[str, ...]
     daily_question_rotation_start_date: str | None
     daily_question_rotation_start_index: int
@@ -90,6 +100,20 @@ class PluginConfig:
         question_rotation_start_date = _normalize_date(
             values.get("daily_question_rotation_start_date")
         )
+        question_type_selection_mode = normalize_selection_mode(
+            values.get("daily_question_type_selection_mode", "random")
+        )
+        question_type_rotation_types = _normalize_question_types(
+            values.get("daily_question_rotation_types", [])
+        )
+        if (
+            question_type_selection_mode == "rotation"
+            and not question_type_rotation_types
+        ):
+            question_type_selection_mode = "random"
+        question_type_rotation_start_date = _normalize_date(
+            values.get("daily_question_type_rotation_start_date")
+        )
         return cls(
             operator_ids=_normalize_operator_ids(values.get("operator_ids", [])),
             timezone=timezone_name,
@@ -100,6 +124,19 @@ class PluginConfig:
             llm_provider_id=str(values.get("llm_provider_id", "") or "").strip(),
             extra_event_source_urls=_normalize_urls(
                 values.get("extra_event_source_urls", [])
+            ),
+            radar_keywords=_normalize_keywords(values.get("radar_keywords", [])),
+            radar_action_keywords=_normalize_keywords(
+                values.get("radar_action_keywords", [])
+            ),
+            radar_historical_keywords=_normalize_keywords(
+                values.get("radar_historical_keywords", [])
+            ),
+            radar_auto_publish_sources=_normalize_strings(
+                values.get("radar_auto_publish_sources", [])
+            ),
+            radar_source_policies=_normalize_source_policies(
+                values.get("radar_source_policies", [])
             ),
             auto_publish_events=_to_bool(values.get("auto_publish_events", False)),
             deadline_reminder_days=_normalize_days(
@@ -139,6 +176,18 @@ class PluginConfig:
             ),
             daily_question_type=normalize_question_type(
                 values.get("daily_question_type")
+            ),
+            daily_question_type_selection_mode=question_type_selection_mode,
+            daily_question_fixed_type=normalize_question_type(
+                values.get(
+                    "daily_question_fixed_type",
+                    values.get("daily_question_type"),
+                )
+            ),
+            daily_question_rotation_types=question_type_rotation_types,
+            daily_question_type_rotation_start_date=question_type_rotation_start_date,
+            daily_question_type_rotation_start_index=_normalize_index(
+                values.get("daily_question_type_rotation_start_index", 0)
             ),
             daily_question_rotation_subjects=question_rotation_subjects,
             daily_question_rotation_start_date=question_rotation_start_date,
@@ -184,6 +233,43 @@ def _normalize_urls(value: Any) -> tuple[str, ...]:
         if url and url.startswith(("http://", "https://")) and url not in seen:
             result.append(url)
             seen.add(url)
+    return tuple(result)
+
+
+def _normalize_strings(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        return ()
+    result: list[str] = []
+    for item in value:
+        normalized = str(item or "").strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
+def _normalize_keywords(value: Any) -> tuple[str, ...]:
+    return _normalize_strings(value)
+
+
+def _normalize_source_policies(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, (list, tuple)) or isinstance(value, str):
+        return ()
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            key = str(item.get("key") or item.get("source_key") or "").strip()
+            if not key:
+                continue
+            result.append(
+                {
+                    "key": key,
+                    "display_name": str(item.get("display_name") or key).strip(),
+                    "discover_enabled": _to_bool(item.get("discover_enabled", True)),
+                    "auto_publish_enabled": _to_bool(
+                        item.get("auto_publish_enabled", False)
+                    ),
+                }
+            )
     return tuple(result)
 
 
@@ -245,6 +331,17 @@ def _normalize_subjects(value: Any) -> tuple[str, ...]:
         subject = normalize_subject(item)
         if subject and subject not in result:
             result.append(subject)
+    return tuple(result)
+
+
+def _normalize_question_types(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+        return ()
+    result: list[str] = []
+    for item in value:
+        question_type = normalize_question_type(item)
+        if question_type and question_type not in result:
+            result.append(question_type)
     return tuple(result)
 
 
