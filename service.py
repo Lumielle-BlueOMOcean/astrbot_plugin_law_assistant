@@ -19,6 +19,7 @@ if __package__ and "." in __package__:
     )
     from .daily_plans import DailyPlan
     from .learning_service import LearningService
+    from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from .publisher import format_deadline_reminder, format_event
     from .sources.base import Extractor, SourceAdapter, Validator
@@ -33,6 +34,7 @@ else:
     )
     from daily_plans import DailyPlan
     from learning_service import LearningService
+    from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from publisher import format_deadline_reminder, format_event
     from sources.base import Extractor, SourceAdapter, Validator
@@ -101,6 +103,7 @@ class LawAssistantService:
         law_sources: list[tuple[Any, Any]] | None = None,
         publisher: Any | None = None,
         learning_service: LearningService | None = None,
+        library_service: LibraryService | None = None,
         config: Any | None = None,
         clock: Any | None = None,
     ) -> None:
@@ -113,6 +116,7 @@ class LawAssistantService:
         self.publisher = publisher
         self.config = config
         self.learning_service = learning_service
+        self.library_service = library_service
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._scan_lock = asyncio.Lock()
         self._publish_confirmations: dict[str, PendingPublication] = {}
@@ -1096,6 +1100,44 @@ class LawAssistantService:
             actor_id=actor_id,
             session_origin=session_origin,
         )
+
+    async def archive_learning_material(self, **kwargs: Any) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.archive_learning_material(**kwargs)
+
+    async def search_learning_library(self, **kwargs: Any) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.search_learning_library(**kwargs)
+
+    async def get_learning_item(self, item_id: int) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.get_learning_item(item_id)
+
+    async def update_learning_item(
+        self, item_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.update_learning_item(item_id, changes)
 
     async def generate_question(
         self,

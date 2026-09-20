@@ -17,6 +17,8 @@ if __package__:
     from .extraction import EventExtractor
     from .http_client import AsyncHttpClient
     from .learning_service import LearningService
+    from .library_repository import LibraryRepository
+    from .library_service import LibraryService
     from .llm_service import LLMService
     from .publisher import AstrBotPublisher
     from .scheduler import LawAssistantScheduler
@@ -31,6 +33,8 @@ else:
     from extraction import EventExtractor
     from http_client import AsyncHttpClient
     from learning_service import LearningService
+    from library_repository import LibraryRepository
+    from library_service import LibraryService
     from llm_service import LLMService
     from publisher import AstrBotPublisher
     from scheduler import LawAssistantScheduler
@@ -130,6 +134,9 @@ class LawAssistant(Star):
             timezone_name=self.plugin_config.timezone,
             logger=logger,
         )
+        self.library_service = LibraryService(
+            LibraryRepository(self.storage.connection)
+        )
         self.service = LawAssistantService(
             self.storage,
             sources=event_sources,
@@ -137,6 +144,7 @@ class LawAssistant(Star):
             law_sources=law_sources,
             publisher=self.publisher,
             learning_service=self.learning_service,
+            library_service=self.library_service,
             config=self.plugin_config,
             logger=logger,
         )
@@ -418,6 +426,122 @@ class LawAssistant(Star):
         if not self._authorized(event):
             return self._denial(event)
         return _json_text(await self.service.question_inventory())
+
+    @filter.llm_tool(name="law_archive_learning_material")
+    async def law_archive_learning_material(
+        self,
+        event: AstrMessageEvent,
+        raw_text: str,
+        material_type: str,
+        title: str = "",
+        subjects: str = "",
+        source_url: str = "",
+        structured_json: str = "{}",
+        note: str = "",
+    ) -> str:
+        """仅在用户明确要求收藏、保存、归档或加入题库时保存学习资料。
+
+        Args:
+            raw_text(string): 用户交给机器人的原始资料正文，必须原样保留。
+            material_type(string): case、real_question_candidate、mock_question 或 note。
+            title(string): 可选标题。
+            subjects(string): 可选法律方向，多个方向用逗号或顿号分隔。
+            source_url(string): 可选来源 URL。
+            structured_json(string): Agent 整理出的 JSON；不能授予 official/verified 身份。
+            note(string): 可选人工备注。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.archive_learning_material(
+                raw_text=raw_text,
+                material_type=material_type,
+                title=title,
+                subjects=subjects,
+                source_url=source_url,
+                structured_json=structured_json,
+                note=note,
+                created_by=str(event.get_sender_id()),
+                session_origin=_session_origin(event),
+            )
+        )
+
+    @filter.llm_tool(name="law_search_learning_library")
+    async def law_search_learning_library(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        material_type: str = "",
+        subject: str = "",
+        limit: int = 10,
+    ) -> str:
+        """搜索已收藏的学习资料，不会自动创建或修改资料。
+
+        Args:
+            query(string): 可选关键词，搜索标题、原文、摘要、题干和要点。
+            material_type(string): 可选 case、question、note、real_question_candidate 或 mock_question。
+            subject(string): 可选法律方向。
+            limit(number): 返回数量，默认 10。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.search_learning_library(
+                query=query,
+                material_type=material_type,
+                subject=subject,
+                limit=limit,
+            )
+        )
+
+    @filter.llm_tool(name="law_get_learning_item")
+    async def law_get_learning_item(
+        self, event: AstrMessageEvent, item_id: int
+    ) -> str:
+        """读取一条完整学习资料，包括原始来源和结构化内容。
+
+        Args:
+            item_id(number): 搜索结果中的学习条目 ID。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(await self.service.get_learning_item(item_id))
+
+    @filter.llm_tool(name="law_update_learning_item")
+    async def law_update_learning_item(
+        self,
+        event: AstrMessageEvent,
+        item_id: int,
+        title: str = "",
+        subjects: str = "",
+        note: str = "",
+        practice_notes: str = "",
+        explanation: str = "",
+    ) -> str:
+        """修改学习条目的标题、方向、备注或学习解析；不能升级官方/核验身份。
+
+        Args:
+            item_id(number): 要修改的学习条目 ID。
+            title(string): 可选新标题。
+            subjects(string): 可选新方向，多个方向用逗号或顿号分隔。
+            note(string): 可选人工备注。
+            practice_notes(string): 可选案例学习要点。
+            explanation(string): 可选题目学习解析。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        changes = {
+            key: value
+            for key, value in {
+                "title": title,
+                "subjects": subjects,
+                "note": note,
+                "practice_notes": practice_notes,
+                "explanation": explanation,
+            }.items()
+            if str(value or "").strip()
+        }
+        return _json_text(await self.service.update_learning_item(item_id, changes))
 
     @filter.llm_tool(name="law_list_targets")
     async def law_list_targets(self, event: AstrMessageEvent) -> str:
