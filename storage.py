@@ -18,7 +18,7 @@ else:
     from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -391,12 +391,91 @@ def _migrate_4_to_5(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
+    """Create the evidence-preserving user learning library."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS library_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            session_origin TEXT NOT NULL,
+            original_filename TEXT,
+            mime_type TEXT,
+            storage_path TEXT,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(created_by, content_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_sources_hash
+            ON library_sources(content_hash);
+        CREATE TABLE IF NOT EXISTS learning_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            item_hash TEXT NOT NULL,
+            title TEXT NOT NULL,
+            subjects_json TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            source_summary TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(created_by, item_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_learning_items_type
+            ON learning_items(item_type);
+        CREATE INDEX IF NOT EXISTS idx_learning_items_subjects
+            ON learning_items(subjects_json);
+        CREATE INDEX IF NOT EXISTS idx_learning_items_created_by
+            ON learning_items(created_by);
+        CREATE TABLE IF NOT EXISTS learning_item_sources (
+            item_id INTEGER NOT NULL REFERENCES learning_items(id) ON DELETE CASCADE,
+            source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+            locator TEXT NOT NULL,
+            relationship TEXT NOT NULL,
+            PRIMARY KEY(item_id, source_id, relationship)
+        );
+        CREATE TABLE IF NOT EXISTS learning_cases (
+            item_id INTEGER PRIMARY KEY REFERENCES learning_items(id) ON DELETE CASCADE,
+            case_number TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            case_summary TEXT NOT NULL,
+            issues_json TEXT NOT NULL,
+            reasoning TEXT NOT NULL,
+            result_text TEXT NOT NULL,
+            practice_notes_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS learning_questions (
+            item_id INTEGER PRIMARY KEY REFERENCES learning_items(id) ON DELETE CASCADE,
+            question_identity TEXT NOT NULL,
+            question_type TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            answer_json TEXT,
+            explanation TEXT NOT NULL,
+            exam_name TEXT NOT NULL,
+            exam_year TEXT NOT NULL,
+            paper TEXT NOT NULL,
+            question_number TEXT NOT NULL,
+            answer_source TEXT NOT NULL
+        );
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
     4: _migrate_4_to_5,
+    5: _migrate_5_to_6,
 }
 
 
@@ -423,6 +502,13 @@ class SQLiteStorage:
             "SELECT value FROM schema_meta WHERE key = 'version'",
         ).fetchone()
         return int(row["value"]) if row else 0
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose the owned connection to bounded repositories only."""
+        if self._connection is None:
+            raise RuntimeError("storage is closed")
+        return self._connection
 
     def get_rotation_anchor(self, content_type: str) -> str | None:
         if content_type not in {"daily_case", "daily_question"}:
