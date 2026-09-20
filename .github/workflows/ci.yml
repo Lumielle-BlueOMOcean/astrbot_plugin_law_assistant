@@ -62,3 +62,55 @@ jobs:
           python -m pip install pytest pytest-asyncio ruff
       - name: Run real loader compatibility smoke
         run: python tests/compatibility_smoke.py "$ASTRBOT_SOURCE" --commit "${{ matrix.commit }}"
+
+  release-package:
+    name: Release package smoke (${{ matrix.version }})
+    needs: [quality, astrbot-compatibility]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 4.22.0
+            commit: 81c7b0f7150485beb6124a7ec524a8d8534e7f6e
+          - version: 4.25.0
+            commit: 02291a3217c92faa0c577bf9d89076949c40954c
+    steps:
+      - name: Check out plugin repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download exact AstrBot source commit
+        env:
+          ASTRBOT_COMMIT: ${{ matrix.commit }}
+        run: |
+          archive="$RUNNER_TEMP/astrbot-$ASTRBOT_COMMIT.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" "https://codeload.github.com/AstrBotDevs/AstrBot/tar.gz/$ASTRBOT_COMMIT"
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "ASTRBOT_SOURCE=$RUNNER_TEMP/AstrBot-$ASTRBOT_COMMIT" >> "$GITHUB_ENV"
+      - name: Install exact AstrBot and plugin dependencies
+        run: |
+          python -m pip install "$ASTRBOT_SOURCE"
+          python -m pip install -r requirements.txt
+      - name: Build clean release ZIP
+        run: python scripts/build_release.py --output "$RUNNER_TEMP/release"
+      - name: Extract release ZIP
+        run: |
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          unzip -q "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-0.3.0.zip" -d "$RUNNER_TEMP/unpacked"
+      - name: Compile extracted plugin
+        run: python -m compileall "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+      - name: Run extracted package loader smoke
+        run: python tests/compatibility_smoke.py "$ASTRBOT_SOURCE" --commit "${{ matrix.commit }}" --plugin-root "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+      - name: Run real AstrBot Plugin Page discovery smoke
+        if: matrix.version == '4.25.0'
+        run: python tests/page_discovery_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+      - name: Upload release ZIP artifact
+        if: matrix.version == '4.25.0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot_plugin_law_assistant-0.3.0
+          path: ${{ runner.temp }}/release/astrbot_plugin_law_assistant-0.3.0.zip
+          if-no-files-found: error

@@ -1501,19 +1501,25 @@ class SQLiteStorage:
         )
         self._connection.commit()
 
+    def delete_daily_plan(self, target_id: int | None, content_type: str) -> bool:
+        if target_id is None:
+            cursor = self._connection.execute(
+                "DELETE FROM daily_plans WHERE target_id IS NULL AND content_type = ?",
+                (content_type,),
+            )
+        else:
+            cursor = self._connection.execute(
+                "DELETE FROM daily_plans WHERE target_id = ? AND content_type = ?",
+                (target_id, content_type),
+            )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
     def list_daily_plans(self) -> list[dict[str, Any]]:
         rows = self._connection.execute(
             "SELECT * FROM daily_plans ORDER BY target_id, content_type"
         ).fetchall()
         return [_daily_plan_record(row) for row in rows]
-
-    def delete_daily_plan(self, target_id: int, content_type: str) -> bool:
-        cursor = self._connection.execute(
-            "DELETE FROM daily_plans WHERE target_id = ? AND content_type = ?",
-            (target_id, content_type),
-        )
-        self._connection.commit()
-        return cursor.rowcount > 0
 
     def claim_publication(
         self, event_id: int, revision: int, target_id: int, kind: str

@@ -29,6 +29,7 @@ if __package__:
     from .sources.generic import GenericEventSourceAdapter
     from .sources.law_updates import LawUpdateExtractor
     from .storage import SQLiteStorage
+    from .web_api import LawAssistantWebApi
 else:
     from config import PluginConfig
     from document_ingestion import DocumentIngestionService
@@ -46,6 +47,7 @@ else:
     from sources.generic import GenericEventSourceAdapter
     from sources.law_updates import LawUpdateExtractor
     from storage import SQLiteStorage
+    from web_api import LawAssistantWebApi
 
 PLUGIN_NAME = "astrbot_plugin_law_assistant"
 
@@ -181,6 +183,9 @@ class LawAssistant(Star):
             logger=logger,
         )
         self.service.set_scheduler_wakeup(self._wake_scheduler)
+        self.web_api = LawAssistantWebApi(self.service, logger=logger)
+        if context is not None and hasattr(context, "register_web_api"):
+            self.web_api.register(context)
 
     async def initialize(self) -> None:
         await self.scheduler.start()

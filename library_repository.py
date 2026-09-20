@@ -574,6 +574,37 @@ class LibraryRepository:
         ).fetchall()
         return [_item_from_row(row) for row in rows]
 
+    def count_items(
+        self, *, item_type: str = "", identity: str = "", active_only: bool = True
+    ) -> int:
+        clauses = ["1 = 1"]
+        params: list[Any] = []
+        if active_only:
+            clauses.append("active = 1")
+        if item_type:
+            clauses.append("item_type = ?")
+            params.append(item_type)
+        if identity:
+            clauses.append("identity = ?")
+            params.append(identity)
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM learning_items WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        return int(row["count"])
+
+    def count_review_items(self, *, status: str | None = None) -> int:
+        if status:
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM learning_review_items WHERE status = ?",
+                (status,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM learning_review_items"
+            ).fetchone()
+        return int(row["count"])
+
     def update(self, item_id: int, changes: dict[str, Any]) -> LibraryItemBundle | None:
         allowed = {"title", "subjects", "note", "practice_notes", "explanation"}
         unknown = set(changes) - allowed

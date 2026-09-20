@@ -662,6 +662,20 @@ class LibraryService:
             "items": [self._item_summary(item) for item in items],
         }
 
+    def dashboard_summary(self) -> dict[str, int]:
+        """Return bounded inventory counters for the dashboard overview."""
+        return {
+            "official_case": self.repository.count_items(identity="official_case"),
+            "persistent_mock": self.repository.count_items(identity="mock_question"),
+            "verified_real": self.repository.count_items(
+                identity="verified_real_question"
+            ),
+            "real_question_candidate": self.repository.count_items(
+                identity="real_question_candidate"
+            ),
+            "pending_review": self.repository.count_review_items(status="pending"),
+        }
+
     async def get_learning_item(self, item_id: int) -> dict[str, Any]:
         try:
             normalized_id = int(item_id)

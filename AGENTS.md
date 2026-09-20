@@ -50,3 +50,8 @@ The intended division is ChatGPT Sol for analysis, architecture, debugging reaso
 - Scheduler-only learning selection may exclude successful `(source_kind, source_item_key)` identities scoped to the target and content type. Manual selection must not inherit another target's history, and failed/skipped attempts are not used-history.
 - In `DailyPlan.from_mapping`, an explicitly supplied question-type mode has priority over legacy `question_type`: only legacy-only input implies fixed mode; explicit `random` stays random and explicit `rotation` requires its own valid rotation list.
 - Keep schema migrations sequential and transactional; schema version 9 fields for daily content identity and cross-source publication state must remain backward-compatible with older daily plans.
+- Plugin Pages are another LawAssistantService entrypoint; Web API handlers must not create a second business-logic path or expose arbitrary SQL/exec/file APIs.
+- Treat all Plugin Page user and source text as untrusted; render it as text, validate URLs, and never inject it as HTML.
+- Web uploads may only be staged below the plugin data directory `imports/`; prepare/confirm writes must verify the staged hash and use one-time short-lived tokens.
+- AstrBot 4.25+ may expose the embedded Plugin Page, while AstrBot 4.22 compatibility must continue loading the plugin and Web API registration without requiring the page bridge.
+- Release ZIPs are built from tracked plugin files and must not include runtime data, tests, development scripts, caches, secrets, or SQLite files.

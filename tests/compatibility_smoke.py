@@ -11,12 +11,16 @@ from pathlib import Path
 MODULE_NAME = "data.plugins.astrbot_plugin_law_assistant.main"
 
 
-def run_smoke(core_source: Path, expected_commit: str | None = None) -> None:
+def run_smoke(
+    core_source: Path,
+    expected_commit: str | None = None,
+    plugin_root: Path | None = None,
+) -> None:
     core_source = core_source.resolve()
     if not (core_source / "astrbot").is_dir():
         raise SystemExit(f"AstrBot source directory is missing astrbot/: {core_source}")
 
-    repository = Path(__file__).parents[1].resolve()
+    repository = (plugin_root or Path(__file__).parents[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="law-assistant-compat-") as temp:
         runtime_root = Path(temp)
         os.environ["ASTRBOT_ROOT"] = str(runtime_root)
@@ -25,10 +29,13 @@ def run_smoke(core_source: Path, expected_commit: str | None = None) -> None:
         plugins_package.mkdir(parents=True)
         (data_package / "__init__.py").write_text("", encoding="utf-8")
         (plugins_package / "__init__.py").write_text("", encoding="utf-8")
-        (plugins_package / "astrbot_plugin_law_assistant").symlink_to(
-            repository,
-            target_is_directory=True,
-        )
+        plugin_destination = plugins_package / "astrbot_plugin_law_assistant"
+        if plugin_root is None:
+            plugin_destination.symlink_to(repository, target_is_directory=True)
+        else:
+            import shutil
+
+            shutil.copytree(repository, plugin_destination)
 
         sys.path.insert(0, str(runtime_root))
         sys.path.insert(0, str(core_source))
@@ -113,8 +120,9 @@ def main() -> None:
     )
     parser.add_argument("core_source", type=Path)
     parser.add_argument("--commit", default=None)
+    parser.add_argument("--plugin-root", type=Path, default=None)
     args = parser.parse_args()
-    run_smoke(args.core_source, args.commit)
+    run_smoke(args.core_source, args.commit, args.plugin_root)
 
 
 if __name__ == "__main__":

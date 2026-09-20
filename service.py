@@ -25,7 +25,7 @@ if __package__ and "." in __package__:
     )
     from .daily_plans import DailyPlan
     from .daily_resolver import resolve_daily_constraints
-    from .document_extractors import DocumentSegment, ParsedDocument
+    from .document_extractors import DocumentParseError, DocumentSegment, ParsedDocument
     from .learning_segmentation import (
         CASE_SEGMENTATION_VERSION,
         segment_official_cases,
@@ -52,7 +52,7 @@ else:
     )
     from daily_plans import DailyPlan
     from daily_resolver import resolve_daily_constraints
-    from document_extractors import DocumentSegment, ParsedDocument
+    from document_extractors import DocumentParseError, DocumentSegment, ParsedDocument
     from learning_segmentation import CASE_SEGMENTATION_VERSION, segment_official_cases
     from learning_service import LearningService
     from library_models import LibrarySource
@@ -97,6 +97,26 @@ class PendingPlanUpdate:
     target_id: int | None
     content_types: tuple[str, ...]
     plans: tuple[DailyPlan, ...]
+    created_at: datetime
+    expires_at: datetime
+    owner_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPlanReset:
+    target_id: int | None
+    content_types: tuple[str, ...]
+    created_at: datetime
+    expires_at: datetime
+    owner_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingImport:
+    token: str
+    prepared: Any
+    staged_path: str
+    file_hash: str
     created_at: datetime
     expires_at: datetime
     owner_id: str | None = None
@@ -154,6 +174,11 @@ class LawAssistantService:
         self._scan_lock = asyncio.Lock()
         self._publish_confirmations: dict[str, PendingPublication] = {}
         self._plan_confirmations: dict[str, PendingPlanUpdate] = {}
+        self._plan_reset_confirmations: dict[str, PendingPlanReset] = {}
+        self._import_confirmations: dict[str, PendingImport] = {}
+        self._unbind_confirmations: dict[
+            str, tuple[int, datetime, datetime, str | None]
+        ] = {}
         self._content_references: dict[str, ContentReference] = {}
         self._scheduler_wakeup: Any | None = None
 
@@ -176,6 +201,86 @@ class LawAssistantService:
             "last_source_run": self.storage.latest_source_run(),
             "sources": await self.list_sources(),
         }
+
+    async def dashboard_overview(self) -> dict[str, Any]:
+        """Build the bounded read model used by the embedded management page."""
+        events = await self.list_events(limit=1000, radar_status="all")
+        radar_counts = {key: 0 for key in ("current", "needs_review", "historical")}
+        for event in events:
+            radar_counts[self._radar_status(event)] += 1
+        learning = (
+            self.library_service.dashboard_summary()
+            if self.library_service is not None
+            else {}
+        )
+        plans = self.storage.list_daily_plans()
+        status = await self.status()
+        return {
+            "schema_version": self.storage.schema_version,
+            "plugin": {
+                "version": "0.3.0",
+                "schema_version": self.storage.schema_version,
+                "scheduler_enabled": bool(
+                    any(
+                        bool(getattr(self.config, name, False))
+                        for name in (
+                            "auto_scan_enabled",
+                            "daily_case_enabled",
+                            "daily_question_enabled",
+                            "law_update_enabled",
+                        )
+                    )
+                    or any(bool(item.get("enabled")) for item in plans)
+                ),
+                "scan_in_progress": self._scan_lock.locked(),
+            },
+            "radar": {
+                **radar_counts,
+                "last_scan": status.get("last_source_run"),
+                "sources": await self.list_sources(),
+            },
+            "learning": learning,
+            "targets": {
+                "count": len(self.storage.list_targets(enabled_only=True)),
+                "enabled_plans": sum(1 for item in plans if item.get("enabled")),
+            },
+            "recent": {
+                "daily": self.storage.list_daily_contents(limit=10),
+                "source_runs": self.storage.list_source_runs(limit=10),
+            },
+        }
+
+    async def dashboard_radar_events(
+        self,
+        *,
+        limit: int = 50,
+        radar_status: str = "current",
+        event_type: str | None = None,
+        keyword: str | None = None,
+    ) -> list[dict[str, Any]]:
+        events = await self.list_events(
+            limit=limit,
+            radar_status=radar_status,
+            event_type=event_type,
+            keyword=keyword,
+        )
+        return [_event_dashboard_dict(event) for event in events]
+
+    async def dashboard_history(
+        self, kind: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        if kind == "daily":
+            return self.storage.list_daily_contents(limit=safe_limit)
+        if kind == "publications":
+            return self.storage.list_publications(limit=safe_limit)
+        if kind == "reminders":
+            return self.storage.list_reminders(limit=safe_limit)
+        if kind == "sources":
+            return self.storage.list_source_runs(limit=safe_limit)
+        raise ValueError(
+            "history kind 必须是 daily、publications、reminders 或 sources"
+        )
 
     async def scan_events(
         self,
@@ -639,6 +744,54 @@ class LawAssistantService:
     async def unbind_target(self, unified_msg_origin: str) -> bool:
         return self.storage.unbind_target(unified_msg_origin)
 
+    async def prepare_unbind_target(
+        self, selector: str, *, actor_id: str | None = None
+    ) -> dict[str, Any]:
+        needle = str(selector or "").strip()
+        matches = [
+            target
+            for target in self.storage.list_targets(enabled_only=False)
+            if needle == str(target["id"])
+            or needle == target["unified_msg_origin"]
+            or needle.casefold() == str(target["label"]).casefold()
+        ]
+        if len(matches) > 1:
+            return {"ready": False, "reason": f"群名称有歧义：{needle}"}
+        if not matches:
+            return {"ready": False, "reason": f"未找到发布目标：{needle}"}
+        token = secrets.token_urlsafe(12)
+        now = self._now_utc()
+        self._unbind_confirmations[token] = (
+            int(matches[0]["id"]),
+            now,
+            now + timedelta(minutes=10),
+            actor_id,
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "target": matches[0],
+            "notice": "解绑会停止该群的后续自动任务，必须明确确认。",
+        }
+
+    async def confirm_unbind_target(
+        self, token: str, *, actor_id: str | None = None
+    ) -> dict[str, Any]:
+        pending = self._unbind_confirmations.pop(str(token).strip(), None)
+        if pending is None:
+            return {"success": False, "reason": "确认 token 无效或已使用"}
+        target_id, _, expires_at, owner_id = pending
+        if owner_id and owner_id != str(actor_id or ""):
+            self._unbind_confirmations[str(token).strip()] = pending
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        if self._now_utc() > expires_at:
+            return {"success": False, "reason": "确认 token 已过期"}
+        target = self.storage.get_target(target_id)
+        if target is None:
+            return {"success": False, "reason": "目标群不存在"}
+        success = await self.unbind_target(target["unified_msg_origin"])
+        return {"success": success, "target_id": target_id}
+
     async def list_targets(self) -> list[dict[str, Any]]:
         return self.storage.list_targets()
 
@@ -904,6 +1057,58 @@ class LawAssistantService:
             self.storage.upsert_daily_plan(plan, pending.target_id)
         if any(plan.enabled for plan in pending.plans) or self._has_enabled_plan():
             await self._wake_scheduler()
+        return {"success": True, "content_types": list(pending.content_types)}
+
+    async def prepare_daily_plan_override_removal(
+        self,
+        *,
+        target_selectors: list[str] | None,
+        content_type: str = "both",
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        targets = self._resolve_targets(target_selectors)
+        if len(targets) != 1:
+            return {"ready": False, "reason": "一次只能恢复一个群的全局计划"}
+        content_types = (
+            ("daily_case", "daily_question")
+            if content_type == "both"
+            else (content_type,)
+        )
+        if any(item not in {"daily_case", "daily_question"} for item in content_types):
+            return {"ready": False, "reason": "content_type 参数无效"}
+        token = secrets.token_urlsafe(12)
+        now = self._now_utc()
+        self._plan_reset_confirmations[token] = PendingPlanReset(
+            target_id=int(targets[0]["id"]),
+            content_types=content_types,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+            owner_id=actor_id,
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "target": targets[0],
+            "content_types": list(content_types),
+            "notice": "恢复全局计划只会在明确确认后执行。",
+        }
+
+    async def confirm_daily_plan_override_removal(
+        self, token: str, *, actor_id: str | None = None
+    ) -> dict[str, Any]:
+        pending = self._plan_reset_confirmations.pop(str(token).strip(), None)
+        if pending is None:
+            return {"success": False, "reason": "确认 token 无效或已使用"}
+        if pending.owner_id and pending.owner_id != str(actor_id or ""):
+            self._plan_reset_confirmations[str(token).strip()] = pending
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        if self._now_utc() > pending.expires_at:
+            return {"success": False, "reason": "确认 token 已过期"}
+        target = self.storage.get_target(pending.target_id)
+        if target is None:
+            return {"success": False, "reason": "目标群不存在"}
+        for content_type in pending.content_types:
+            self.storage.delete_daily_plan(pending.target_id, content_type)
         return {"success": True, "content_types": list(pending.content_types)}
 
     def _has_enabled_plan(self) -> bool:
@@ -1418,6 +1623,135 @@ class LawAssistantService:
             content_kind=content_kind,
         )
 
+    async def stage_learning_upload(self, filename: str, data: bytes) -> dict[str, Any]:
+        if self.document_ingestion is None:
+            return {"success": False, "error": "document_ingestion_unavailable"}
+        try:
+            staged = await self.document_ingestion.stage_upload(filename, data)
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": _document_error_code(str(exc)),
+                "message": str(exc),
+            }
+        return {"success": True, **staged}
+
+    async def prepare_learning_import(
+        self,
+        staged_path: str,
+        *,
+        content_kind: str,
+        created_by: str,
+        session_origin: str,
+        owner_id: str | None = None,
+        original_filename: str | None = None,
+    ) -> dict[str, Any]:
+        if self.document_ingestion is None:
+            return {"success": False, "error": "document_ingestion_unavailable"}
+        try:
+            prepared = await self.document_ingestion.prepare_import(
+                staged_path,
+                created_by=created_by,
+                session_origin=session_origin,
+                content_kind=content_kind,
+                original_filename=original_filename,
+            )
+        except (DocumentParseError, OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": getattr(exc, "code", "invalid_import"),
+                "message": str(exc),
+            }
+        token = secrets.token_urlsafe(12)
+        now = self._now_utc()
+        self._import_confirmations[token] = PendingImport(
+            token=token,
+            prepared=prepared,
+            staged_path=str(staged_path),
+            file_hash=prepared.parsed.file_hash,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+            owner_id=owner_id,
+        )
+        candidates = list(prepared.candidates)
+        counts = {
+            "total_candidates": len(candidates),
+            "archivable": sum(
+                1
+                for item in candidates
+                if str(item.get("status") or "").lower()
+                not in {"needs_review", "review"}
+            ),
+            "needs_review": sum(
+                1
+                for item in candidates
+                if str(item.get("status") or "").lower() in {"needs_review", "review"}
+            ),
+        }
+        preview_items = [
+            {
+                "index": index,
+                "status": item.get("status", "ready"),
+                "material_type": item.get("material_type", content_kind),
+                "title": item.get("title", ""),
+                "locator": item.get("locator", ""),
+                "review_reason": item.get("review_reason", ""),
+            }
+            for index, item in enumerate(candidates[:10])
+        ]
+        return {
+            "success": True,
+            "token": token,
+            "file_hash": prepared.parsed.file_hash,
+            "original_filename": prepared.original_filename,
+            "content_kind": content_kind,
+            "preview": {**counts, "items": preview_items},
+            "warnings": list(prepared.warnings),
+        }
+
+    async def confirm_learning_import(
+        self, token: str, *, owner_id: str | None = None
+    ) -> dict[str, Any]:
+        key = str(token or "").strip()
+        pending = self._import_confirmations.pop(key, None)
+        if pending is None:
+            return {
+                "success": False,
+                "error": "invalid_token",
+                "message": "导入 token 无效或已使用",
+            }
+        if pending.owner_id and pending.owner_id != owner_id:
+            self._import_confirmations[key] = pending
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "导入 token 不属于当前会话",
+            }
+        if self._now_utc() > pending.expires_at:
+            return {
+                "success": False,
+                "error": "expired_token",
+                "message": "导入 token 已过期",
+            }
+        try:
+            current_hash = await self.document_ingestion.staged_file_hash(
+                pending.staged_path
+            )
+            if current_hash != pending.file_hash:
+                return {
+                    "success": False,
+                    "error": "staged_file_changed",
+                    "message": "staged 文件内容已变化，请重新 prepare",
+                }
+            result = await self.document_ingestion.archive_prepared(pending.prepared)
+        except (DocumentParseError, OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": getattr(exc, "code", "invalid_import"),
+                "message": str(exc),
+            }
+        return {"success": True, **result}
+
     async def search_learning_library(self, **kwargs: Any) -> dict[str, Any]:
         if self.library_service is None:
             return {
@@ -1785,6 +2119,51 @@ def _format_daily_content(content_type: str, content: dict[str, Any]) -> str:
     if content.get("source_url"):
         lines.append(f"官方来源：{content['source_url']}")
     return "\n".join(lines)
+
+
+def _event_dashboard_dict(event: LegalEvent) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "source_key": event.source_key,
+        "source_item_key": event.source_item_key,
+        "title": event.title,
+        "source_url": event.source_url,
+        "organizer": event.organizer,
+        "event_type": event.event_type,
+        "eligibility": event.eligibility,
+        "status": event.status,
+        "summary": event.summary,
+        "radar_status": event.metadata.get("radar_status"),
+        "revision": event.revision,
+        "source_published_at": (
+            event.source_published_at.isoformat()
+            if event.source_published_at is not None
+            else None
+        ),
+        "updated_at": event.updated_at.isoformat(),
+        "dates": [
+            {
+                "kind": item.kind,
+                "datetime": item.datetime.isoformat() if item.datetime else None,
+                "timezone": item.timezone,
+                "label": item.label,
+                "evidence_text": item.evidence_text,
+                "confirmed": item.confirmed,
+            }
+            for item in event.dates
+        ],
+    }
+
+
+def _document_error_code(message: str) -> str:
+    lowered = str(message).lower()
+    if "格式" in message:
+        return "unsupported_format"
+    if "20 mb" in lowered:
+        return "file_too_large"
+    if "为空" in message:
+        return "empty_file"
+    return "invalid_upload"
 
 
 __all__ = ["LawAssistantService", "ScanFailure", "ScanResult"]

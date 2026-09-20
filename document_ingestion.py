@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 if __package__ and "." in __package__:
     from .document_extractors import (
+        MAX_FILE_BYTES,
         DocumentParseError,
         ParsedDocument,
         extract_document,
@@ -17,7 +19,12 @@ if __package__ and "." in __package__:
     from .library_models import LibrarySource
     from .library_service import LibraryService
 else:
-    from document_extractors import DocumentParseError, ParsedDocument, extract_document
+    from document_extractors import (
+        MAX_FILE_BYTES,
+        DocumentParseError,
+        ParsedDocument,
+        extract_document,
+    )
     from learning_segmentation import MAX_CANDIDATES, segment_document
     from library_models import LibrarySource
     from library_service import LibraryService
@@ -38,6 +45,17 @@ class DocumentIngestionService:
         self.asset_dir = self.data_dir / "assets"
         self.library_service = library_service
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @dataclass(frozen=True, slots=True)
+    class PreparedImport:
+        path: Path
+        parsed: ParsedDocument
+        candidates: tuple[dict[str, Any], ...]
+        warnings: tuple[str, ...]
+        content_kind: str
+        created_by: str
+        session_origin: str
+        original_filename: str
 
     async def import_document(
         self,
@@ -94,6 +112,113 @@ class DocumentIngestionService:
             }
         )
         return result
+
+    async def stage_upload(self, filename: str, data: bytes) -> dict[str, Any]:
+        """Store an uploaded asset under the plugin-owned imports directory.
+
+        The caller never supplies a filesystem path.  The staged filename is a
+        content hash, so path traversal, collisions and platform-specific
+        separators cannot escape the controlled directory.
+        """
+        original = str(filename or "").strip()
+        safe_name = Path(original.replace("\\", "/")).name
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in {".txt", ".md", ".docx", ".pdf"}:
+            raise ValueError(f"不支持的文件格式：{suffix or '无扩展名'}")
+        if not data:
+            raise ValueError("文件为空")
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError("文件超过 20 MB 限制")
+        digest = hashlib.sha256(data).hexdigest()
+        self.import_dir.mkdir(parents=True, exist_ok=True)
+        path = self.import_dir / f"{digest}{suffix}"
+        if path.exists() and path.is_symlink():
+            raise ValueError("staged 文件路径无效")
+        if not path.exists():
+            await asyncio.to_thread(path.write_bytes, data)
+        return {
+            "staged_path": path.relative_to(self.import_dir).as_posix(),
+            "original_filename": safe_name,
+            "file_hash": digest,
+            "size": len(data),
+            "extension": suffix,
+        }
+
+    async def prepare_import(
+        self,
+        relative_path: str,
+        *,
+        created_by: str,
+        session_origin: str,
+        content_kind: str = "auto",
+        original_filename: str | None = None,
+    ) -> PreparedImport:
+        path = self._resolve_import_path(relative_path)
+        parsed = await asyncio.to_thread(extract_document, path)
+        segments = segment_document(
+            parsed, content_kind=content_kind, max_candidates=MAX_CANDIDATES
+        )
+        display_name = Path(str(original_filename or path.name).replace("\\", "/")).name
+        return self.PreparedImport(
+            path=path,
+            parsed=parsed,
+            candidates=tuple(segments.candidates),
+            warnings=tuple(parsed.warnings) + tuple(segments.warnings),
+            content_kind=str(content_kind or "auto"),
+            created_by=str(created_by),
+            session_origin=str(session_origin),
+            original_filename=display_name,
+        )
+
+    async def archive_prepared(self, prepared: PreparedImport) -> dict[str, Any]:
+        """Archive the exact candidates produced by ``prepare_import``."""
+        current_hash = hashlib.sha256(
+            await asyncio.to_thread(prepared.path.read_bytes)
+        ).hexdigest()
+        if current_hash != prepared.parsed.file_hash:
+            raise ValueError("staged 文件内容已变化，请重新上传并 prepare")
+        parsed = ParsedDocument(
+            path=prepared.parsed.path,
+            original_filename=prepared.original_filename,
+            mime_type=prepared.parsed.mime_type,
+            file_hash=prepared.parsed.file_hash,
+            extracted_text_hash=prepared.parsed.extracted_text_hash,
+            text=prepared.parsed.text,
+            segments=prepared.parsed.segments,
+            warnings=prepared.parsed.warnings,
+            parse_status=prepared.parsed.parse_status,
+        )
+        asset_path = await asyncio.to_thread(self._preserve_original, parsed)
+        source = self._source_from_parsed(
+            parsed,
+            asset_path=asset_path,
+            created_by=prepared.created_by,
+            session_origin=prepared.session_origin,
+            content_kind=prepared.content_kind,
+            warnings=prepared.warnings,
+        )
+        result = await self.library_service.archive_material_batch(
+            source=source,
+            candidates=list(prepared.candidates),
+        )
+        result.update(
+            {
+                "original_filename": parsed.original_filename,
+                "file_hash": parsed.file_hash,
+                "extracted_text_hash": parsed.extracted_text_hash,
+                "parse_status": parsed.parse_status,
+                "warnings": list(prepared.warnings),
+                "storage_path": str(asset_path.relative_to(self.data_dir)),
+            }
+        )
+        return result
+
+    async def staged_file_hash(self, relative_path: str) -> str:
+        path = self._resolve_import_path(relative_path)
+        if path.is_symlink():
+            raise ValueError("staged 文件路径无效")
+        data = await asyncio.to_thread(path.read_bytes)
+        return hashlib.sha256(data).hexdigest()
 
     def _resolve_import_path(self, relative_path: str) -> Path:
         value = str(relative_path or "").strip()
