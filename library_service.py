@@ -61,7 +61,7 @@ def _as_text_list(value: Any) -> tuple[str, ...]:
     elif isinstance(value, (list, tuple)):
         values = value
     else:
-        raise ValueError("字段必须是字符串或列表")
+        raise TypeError("字段必须是字符串或列表")
     return tuple(str(item).strip() for item in values if str(item).strip())
 
 
@@ -82,11 +82,13 @@ def _title(raw_text: str, explicit: Any) -> str:
     value = _as_text(explicit)
     if value:
         return value[:200]
-    first_line = next((line.strip() for line in raw_text.splitlines() if line.strip()), "")
+    first_line = next(
+        (line.strip() for line in raw_text.splitlines() if line.strip()), ""
+    )
     return (first_line or "学习资料")[:200]
 
 
-def _structured_json(value: Any) -> dict[str, Any] | dict[str, Any]:
+def _structured_json(value: Any) -> dict[str, Any]:
     if value is None or value == "":
         return {}
     if isinstance(value, dict):
@@ -96,14 +98,16 @@ def _structured_json(value: Any) -> dict[str, Any] | dict[str, Any]:
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("structured_json 必须是合法 JSON 对象") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("structured_json 必须是 JSON 对象")
+        raise TypeError("structured_json 必须是 JSON 对象")
     return parsed
 
 
 class LibraryService:
     """Validate and orchestrate evidence-preserving learning-library operations."""
 
-    def __init__(self, repository: LibraryRepository, *, clock: Any | None = None) -> None:
+    def __init__(
+        self, repository: LibraryRepository, *, clock: Any | None = None
+    ) -> None:
         self.repository = repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -126,7 +130,9 @@ class LibraryService:
         normalized_type = str(material_type or "").strip().lower()
         mapped = _MATERIAL_TYPES.get(normalized_type)
         if mapped is None:
-            return _error("invalid_material_type", f"不支持的资料类型：{normalized_type}")
+            return _error(
+                "invalid_material_type", f"不支持的资料类型：{normalized_type}"
+            )
         try:
             structured = _structured_json(structured_json)
             normalized_subjects = _subjects(subjects)
@@ -234,9 +240,13 @@ class LibraryService:
     ) -> dict[str, Any]:
         normalized_type = str(material_type or "").strip().lower()
         if normalized_type and normalized_type not in _SEARCH_TYPES:
-            return _error("invalid_material_type", f"不支持的资料类型：{normalized_type}")
+            return _error(
+                "invalid_material_type", f"不支持的资料类型：{normalized_type}"
+            )
         try:
-            normalized_subject = parse_subject(subject) if str(subject).strip() else None
+            normalized_subject = (
+                parse_subject(subject) if str(subject).strip() else None
+            )
         except ValueError as exc:
             return _error("invalid_subject", str(exc))
         try:
@@ -289,9 +299,7 @@ class LibraryService:
         allowed = {"title", "subjects", "note", "practice_notes", "explanation"}
         unknown = set(changes) - allowed
         if unknown:
-            return _error(
-                "invalid_update_field", f"不允许修改字段：{sorted(unknown)}"
-            )
+            return _error("invalid_update_field", f"不允许修改字段：{sorted(unknown)}")
         normalized: dict[str, Any] = {}
         try:
             if "title" in changes:

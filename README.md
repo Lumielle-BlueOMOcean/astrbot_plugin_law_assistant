@@ -12,6 +12,8 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 最高人民法院/最高人民检察院案例列表接口与案例学习内容接口（需要可用 LLM provider 才生成解读）。
 - 真题 JSON 导入、核验状态、考试定位、答案来源和方向/题型检索；仓库不内置未经授权的商业题库。
 - 真题、模拟题和官方案例使用独立身份标注；模拟题不会被标为官方真题，缺少答案证据时不会由 LLM 冒充官方答案。
+- 学习资料库基础：私聊中明确要求收藏的文本资料会保存原文、确定性 hash、归属人和结构化学习条目；支持 `user_case`、`real_question_candidate`、持久化 `mock_question` 和 `note`。
+- 学习资料库支持 Agent Tool 搜索、读取和有限人工更新；同一原文可以复用 Source，但不同整理结果、方向和备注不会互相覆盖。
 - 题目来源/方向/题型的统一选择规则，支持 `real`、`mock`、`random` 和单选、多选、判断、简答、案例分析。
 - 案例和题目各自独立的每日任务计划：随机、固定或按日期轮换；支持全局默认、群级覆盖、学校四方向预设和未来安排预览。
 - 已绑定多个群的名称/别名解析、明确目标的赛事/题目/案例发布预览和一次性确认 token。
@@ -26,6 +28,8 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 更广泛的法律硕士赛事来源和跨来源实体解析。
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG 和 dashboard。
 - 更广泛的题库内容和需要用户授权的真实题目数据；本仓库当前不声称拥有完整真题库。
+- Word/PDF/OCR/QQ 文件附件导入、官方合集自动拆分，以及 `real_question_candidate` 到 `verified_real_question` 的人工审核流。
+- 新资料库尚未接管每日案例/每日一题；当前每日任务仍使用现有官方案例和 verified real question 体系。
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG、dashboard、特殊 OneBot 消息和 Nexus runtime integration。
 
 ## Architecture
@@ -37,7 +41,7 @@ Scheduler ────────┘                 └──────> Pub
 Future Nexus integration (optional) ────────┘
 ```
 
-四入口共享同一个 `LawAssistantService`。服务与 `AstrMessageEvent` 解耦；Nexus 是可选集成，Law Assistant 独立运行，不读取 Nexus SQLite，也不依赖 Nexus 内部实现。
+四入口共享同一个 `LawAssistantService`；学习资料库通过该 facade 进入独立的 `LibraryService`/`LibraryRepository`。服务与 `AstrMessageEvent` 解耦；Nexus 是可选集成，Law Assistant 独立运行，不读取 Nexus SQLite，也不依赖 Nexus 内部实现。
 
 LLM interprets evidence; deterministic code owns truth：来源 URL、原文 hash、日期 evidence、题目来源与核验状态、权限、是否已发布和去重均由代码/持久化状态决定。
 
@@ -92,6 +96,8 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
+当前 schema version 为 `6`。v5→v6 只建立学习资料库表，不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容；安装开发版前可按部署说明备份并重新初始化。
+
 该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
 
 ## Commands and LLM Tools
@@ -127,7 +133,15 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
+可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_archive_learning_material`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
+
+### 学习资料库
+
+只有用户明确说“收藏”“保存”“归档”“加入题库”或“记下来”时，Agent 才应调用 `law_archive_learning_material`。用户提供的原文会原样保存到同一个 SQLite 数据库，并与 Agent 整理出的摘要、争议焦点、题干、选项或学习要点分开保存。
+
+资料身份由后端确定：普通案例为 `user_case`，未核验题目为 `real_question_candidate`，原创练习题为 `mock_question`。Tool 不能创建 `official_case` 或 `verified_real_question`，也不会因为 structured JSON 中出现 `official` 或 `verified` 就提升身份。现有 verified 真题 JSON 导入路径继续独立运行。
+
+`law_search_learning_library` 支持标题、原文、摘要、题干、学习要点和方向的普通文本查询；`law_get_learning_item` 返回完整原文与结构化条目；`law_update_learning_item` 只允许修改标题、方向、备注、案例学习要点或题目解析，不能修改创建者、来源 hash 或核验身份。四个 Tool 都要求私聊及 AstrBot Admin/operator 权限。
 
 ### 真题导入格式
 

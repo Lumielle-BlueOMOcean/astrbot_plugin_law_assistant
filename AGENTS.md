@@ -37,3 +37,6 @@ The intended division is ChatGPT Sol for analysis, architecture, debugging reaso
 - A missing subject-matched case or question is a strict skip and must not silently fall back to another subject, type, origin or task. Case failure or disablement must not advance or block the question plan, and vice versa.
 - Long-lived plan changes require a preview and explicit confirmation. Content publication also locks the selected body and exact target IDs at preview time; confirmation must not regenerate content or expand targets.
 - README must distinguish implemented behavior from planned capabilities and must not claim deferred sources, advanced radar, full QQ management, or Nexus runtime integration are complete.
+- User-provided unverified learning material may enter the library only with its original evidence preserved; `real_question_candidate` is not a verified real question and `user_case` is not an official case.
+- LLM/Agent may summarize, structure, and classify learning material, but deterministic code owns identity, content hashes, verification state, validation, deduplication, and protected update fields.
+- Learning-library writes, reads, searches, and updates must go through `LawAssistantService` and `LibraryService`; never expose arbitrary SQL, database writes, or filesystem writes as an Agent Tool.

@@ -5,8 +5,8 @@ import sys
 
 import pytest
 
-from tests.test_plugin import install_fake_astrbot
 from tests.fakes import FakeEvent
+from tests.test_plugin import install_fake_astrbot
 
 
 @pytest.fixture

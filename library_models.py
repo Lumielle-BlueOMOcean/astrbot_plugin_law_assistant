@@ -77,4 +77,3 @@ class LibraryItemBundle:
     sources: tuple[LibrarySource, ...]
     case: CaseDetail | None = None
     question: QuestionDetail | None = None
-

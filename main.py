@@ -495,9 +495,7 @@ class LawAssistant(Star):
         )
 
     @filter.llm_tool(name="law_get_learning_item")
-    async def law_get_learning_item(
-        self, event: AstrMessageEvent, item_id: int
-    ) -> str:
+    async def law_get_learning_item(self, event: AstrMessageEvent, item_id: int) -> str:
         """读取一条完整学习资料，包括原始来源和结构化内容。
 
         Args:

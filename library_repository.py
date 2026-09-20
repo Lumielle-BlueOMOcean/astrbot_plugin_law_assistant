@@ -207,7 +207,9 @@ class LibraryRepository:
                         question.answer_source,
                     ),
                 )
-        return LibraryArchiveResult(source_id=source_id, item_id=item_id, duplicate=False)
+        return LibraryArchiveResult(
+            source_id=source_id, item_id=item_id, duplicate=False
+        )
 
     def get(self, item_id: int) -> LibraryItemBundle | None:
         row = self.connection.execute(
@@ -296,7 +298,7 @@ class LibraryRepository:
             LEFT JOIN library_sources AS s ON s.id = link.source_id
             LEFT JOIN learning_cases AS c ON c.item_id = i.id
             LEFT JOIN learning_questions AS q ON q.item_id = i.id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY i.updated_at DESC, i.id DESC
             LIMIT ?
             """,
@@ -347,4 +349,3 @@ class LibraryRepository:
                     (str(changes["explanation"]), item_id),
                 )
         return self.get(item_id)
-
