@@ -72,6 +72,7 @@ def run_smoke(core_source: Path, expected_commit: str | None = None) -> None:
             "law_generate_question",
             "law_question_inventory",
             "law_archive_learning_material",
+            "law_import_learning_document",
             "law_search_learning_library",
             "law_get_learning_item",
             "law_update_learning_item",

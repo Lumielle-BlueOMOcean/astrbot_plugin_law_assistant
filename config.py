@@ -28,6 +28,7 @@ MAX_SCAN_INTERVAL_MINUTES = 24 * 60
 DEFAULT_DEADLINE_REMINDER_DAYS = (7, 3, 1)
 DEFAULT_DAILY_TIME = "08:00"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
+DEFAULT_DAILY_CASE_CARD_MAX_CHARS = 1800
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,7 @@ class PluginConfig:
     daily_case_rotation_subjects: tuple[str, ...]
     daily_case_rotation_start_date: str | None
     daily_case_rotation_start_index: int
+    daily_case_card_max_chars: int
     daily_question_enabled: bool
     daily_question_time: str
     daily_question_selection_mode: str
@@ -116,6 +118,11 @@ class PluginConfig:
             daily_case_rotation_start_date=case_rotation_start_date,
             daily_case_rotation_start_index=_normalize_index(
                 values.get("daily_case_rotation_start_index", 0)
+            ),
+            daily_case_card_max_chars=_normalize_card_max_chars(
+                values.get(
+                    "daily_case_card_max_chars", DEFAULT_DAILY_CASE_CARD_MAX_CHARS
+                )
             ),
             daily_question_enabled=_to_bool(
                 values.get("daily_question_enabled", False)
@@ -258,6 +265,14 @@ def _normalize_index(value: Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_card_max_chars(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_CASE_CARD_MAX_CHARS
+    return max(600, min(5000, limit))
 
 
 def _to_bool(value: Any) -> bool:

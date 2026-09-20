@@ -88,6 +88,13 @@
     "minimum": 0,
     "description": "每日案例轮换的起始位置。"
   },
+  "daily_case_card_max_chars": {
+    "type": "int",
+    "default": 1800,
+    "minimum": 600,
+    "maximum": 5000,
+    "description": "每日案例学习卡片的字符预算；超出时不发送，避免整篇合集或过长正文进入 QQ。"
+  },
   "daily_question_enabled": {
     "type": "bool",
     "default": false,

@@ -12,6 +12,7 @@ if __package__ and "." in __package__:
         LibraryArchiveResult,
         LibraryItemBundle,
         LibrarySource,
+        LibrarySourceLink,
         QuestionDetail,
     )
 else:
@@ -21,6 +22,7 @@ else:
         LibraryArchiveResult,
         LibraryItemBundle,
         LibrarySource,
+        LibrarySourceLink,
         QuestionDetail,
     )
 
@@ -74,6 +76,44 @@ class LibraryRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
+    def ensure_source(self, source: LibrarySource) -> int:
+        """Insert or find one source row without creating a learning item."""
+        if source.id is not None:
+            raise ValueError("ensure_source expects an unsaved source model")
+        source_row = self.connection.execute(
+            """
+            SELECT id FROM library_sources
+            WHERE created_by = ? AND content_hash = ? AND source_url = ?
+            """,
+            (source.created_by, source.content_hash, source.source_url),
+        ).fetchone()
+        if source_row is not None:
+            return int(source_row["id"])
+        cursor = self.connection.execute(
+            """
+            INSERT INTO library_sources(
+                source_kind, title, raw_text, source_url, content_hash,
+                created_at, created_by, session_origin, original_filename,
+                mime_type, storage_path, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source.source_kind,
+                source.title,
+                source.raw_text,
+                source.source_url,
+                source.content_hash,
+                source.created_at.isoformat(),
+                source.created_by,
+                source.session_origin,
+                source.original_filename,
+                source.mime_type,
+                source.storage_path,
+                _json(source.metadata),
+            ),
+        )
+        return int(cursor.lastrowid)
+
     def archive(
         self,
         source: LibrarySource,
@@ -81,44 +121,13 @@ class LibraryRepository:
         *,
         case: CaseDetail | None = None,
         question: QuestionDetail | None = None,
+        locator: str = "",
+        relationship: str = "primary_evidence",
     ) -> LibraryArchiveResult:
         if source.id is not None or item.id is not None:
             raise ValueError("archive expects unsaved source and item models")
         with self.connection:
-            source_row = self.connection.execute(
-                """
-                SELECT * FROM library_sources
-                WHERE created_by = ? AND content_hash = ? AND source_url = ?
-                """,
-                (source.created_by, source.content_hash, source.source_url),
-            ).fetchone()
-            if source_row is None:
-                cursor = self.connection.execute(
-                    """
-                    INSERT INTO library_sources(
-                        source_kind, title, raw_text, source_url, content_hash,
-                        created_at, created_by, session_origin, original_filename,
-                        mime_type, storage_path, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        source.source_kind,
-                        source.title,
-                        source.raw_text,
-                        source.source_url,
-                        source.content_hash,
-                        source.created_at.isoformat(),
-                        source.created_by,
-                        source.session_origin,
-                        source.original_filename,
-                        source.mime_type,
-                        source.storage_path,
-                        _json(source.metadata),
-                    ),
-                )
-                source_id = int(cursor.lastrowid)
-            else:
-                source_id = int(source_row["id"])
+            source_id = self.ensure_source(source)
 
             existing = self.connection.execute(
                 """
@@ -134,7 +143,12 @@ class LibraryRepository:
                         item_id, source_id, locator, relationship
                     ) VALUES (?, ?, ?, ?)
                     """,
-                    (int(existing["id"]), source_id, "", "primary_evidence"),
+                    (
+                        int(existing["id"]),
+                        source_id,
+                        locator,
+                        relationship,
+                    ),
                 )
                 return LibraryArchiveResult(
                     source_id=source_id,
@@ -170,7 +184,7 @@ class LibraryRepository:
                 INSERT INTO learning_item_sources(item_id, source_id, locator, relationship)
                 VALUES (?, ?, ?, ?)
                 """,
-                (item_id, source_id, "", "primary_evidence"),
+                (item_id, source_id, locator, relationship),
             )
             if case is not None:
                 self.connection.execute(
@@ -234,6 +248,16 @@ class LibraryRepository:
             """,
             (item_id,),
         ).fetchall()
+        link_rows = self.connection.execute(
+            """
+            SELECT s.*, link.locator, link.relationship
+            FROM library_sources AS s
+            JOIN learning_item_sources AS link ON link.source_id = s.id
+            WHERE link.item_id = ?
+            ORDER BY s.id
+            """,
+            (item_id,),
+        ).fetchall()
         case_row = self.connection.execute(
             "SELECT * FROM learning_cases WHERE item_id = ?", (item_id,)
         ).fetchone()
@@ -269,9 +293,29 @@ class LibraryRepository:
         return LibraryItemBundle(
             item=item,
             sources=tuple(_source_from_row(source) for source in source_rows),
+            source_links=tuple(
+                LibrarySourceLink(
+                    source=_source_from_row(source),
+                    locator=str(source["locator"]),
+                    relationship=str(source["relationship"]),
+                )
+                for source in link_rows
+            ),
             case=case,
             question=question,
         )
+
+    def list_by_source(self, source_id: int) -> list[LearningItem]:
+        rows = self.connection.execute(
+            """
+            SELECT i.* FROM learning_items AS i
+            JOIN learning_item_sources AS link ON link.item_id = i.id
+            WHERE link.source_id = ?
+            ORDER BY i.id
+            """,
+            (source_id,),
+        ).fetchall()
+        return [_item_from_row(row) for row in rows]
 
     def search(
         self,

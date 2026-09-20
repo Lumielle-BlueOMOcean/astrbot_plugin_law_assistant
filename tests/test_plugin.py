@@ -239,6 +239,57 @@ async def test_question_import_command_accepts_quoted_path_and_reports_inventory
 
 
 @pytest.mark.asyncio
+async def test_controlled_document_import_command_archives_multiple_items(
+    plugin_module, tmp_path
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    import_dir = tmp_path / "plugin-data" / "imports"
+    import_dir.mkdir(parents=True, exist_ok=True)
+    (import_dir / "练习资料.txt").write_text(
+        "第1题 单项选择题\n题干一\nA. 一\nB. 二\n答案\n1 A\n"
+        "第2题 判断题\n题干二\n答案\n2 对\n",
+        encoding="utf-8",
+    )
+    response = [
+        item
+        async for item in plugin.law(
+            FakeEvent(
+                private=True,
+                sender_id="42",
+                message="/law import 练习资料.txt real_question_candidate",
+            )
+        )
+    ]
+
+    assert '"success": true' in response[0]
+    assert '"archived": 2' in response[0]
+    assert '"source_id":' in response[0]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_learning_tools_archive_and_search_through_service(plugin_module):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    event = FakeEvent(private=True, sender_id="42")
+
+    archived = await plugin.law_archive_learning_material(
+        event,
+        raw_text="可复用的案例资料",
+        material_type="case",
+        title="可复用案例",
+        subjects="知识产权",
+        structured_json='{"case_summary":"原始事实"}',
+    )
+    searched = await plugin.law_search_learning_library(
+        event, query="可复用案例", material_type="case"
+    )
+
+    assert '"success": true' in archived
+    assert '"count": 1' in searched
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("arguments", "reason_fragment"),
     [

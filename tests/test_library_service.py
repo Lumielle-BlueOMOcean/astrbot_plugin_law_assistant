@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
+from library_models import LibrarySource
 from library_repository import LibraryRepository
 from library_service import LibraryService
 from storage import SQLiteStorage
@@ -350,4 +352,98 @@ async def test_update_rejects_detail_fields_for_wrong_item_type(tmp_path):
         archived["item_id"], {"practice_notes": "不应静默丢弃"}
     )
     assert result["error"] == "invalid_update"
+    storage.close()
+
+
+def _batch_source() -> LibrarySource:
+    return LibrarySource(
+        source_kind="file",
+        title="测试试卷.docx",
+        raw_text="第1题\n题干一\n第2题\n题干二",
+        source_url="",
+        content_hash="document-text-hash",
+        created_at=datetime(2026, 9, 21, tzinfo=timezone.utc),
+        created_by="42",
+        session_origin="private:42",
+        original_filename="测试试卷.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        storage_path="assets/document-hash.docx",
+        metadata={
+            "file_hash": "document-file-hash",
+            "extracted_text_hash": "document-text-hash",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_archive_preserves_locators_and_is_idempotent(tmp_path):
+    storage, service = _service(tmp_path)
+    source = _batch_source()
+    candidates = [
+        {
+            "material_type": "real_question_candidate",
+            "title": "第一题",
+            "subjects": "刑法",
+            "locator": "第1页/第1题",
+            "structured": {
+                "question_type": "单选",
+                "stem": "题干一",
+                "options": ["A", "B"],
+            },
+        },
+        {
+            "material_type": "real_question_candidate",
+            "title": "无法归档题目",
+            "locator": "第1页/第2题",
+            "structured": {"question_type": "不支持的题型", "stem": "题干二"},
+        },
+    ]
+
+    first = await service.archive_material_batch(source=source, candidates=candidates)
+    second = await service.archive_material_batch(
+        source=source, candidates=candidates[:1]
+    )
+
+    assert first["success"] is True
+    assert first["archived"] == 1
+    assert first["failed"] == 1
+    assert first["items"][0]["locator"] == "第1页/第1题"
+    assert second["duplicate"] == 1
+    assert second["archived"] == 0
+    detail = await service.get_learning_item(first["items"][0]["item_id"])
+    assert detail["source_links"][0]["locator"] == "第1页/第1题"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_only_trusted_official_archive_can_create_official_case(tmp_path):
+    storage, service = _service(tmp_path)
+    source = _batch_source()
+    candidate = {
+        "title": "官方独立案例",
+        "subjects": ["知识产权"],
+        "locator": "文章/案例一",
+        "structured": {
+            "case_summary": "官方原文支持的案件事实",
+            "issues": ["是否侵权"],
+            "evidence_text": "案例一：官方原文支持的案件事实",
+        },
+    }
+
+    ordinary = await service.archive_learning_material(
+        raw_text="不应直接创建官方案例",
+        material_type="official_case",
+        created_by="42",
+        session_origin="private:42",
+    )
+    trusted = await service.archive_official_cases(
+        source=source, candidates=[candidate], adapter_key="court_cases"
+    )
+
+    assert ordinary["error"] == "invalid_material_type"
+    assert trusted["archived"] == 1
+    detail = await service.get_learning_item(trusted["items"][0]["item_id"])
+    assert detail["item"]["identity"] == "official_case"
+    assert detail["item"]["verification_status"] == "verified_official"
+    assert detail["source_links"][0]["locator"] == "文章/案例一"
     storage.close()

@@ -14,6 +14,7 @@ from astrbot.api.star import Context, Star, StarTools
 
 if __package__:
     from .config import PluginConfig
+    from .document_ingestion import DocumentIngestionService
     from .extraction import EventExtractor
     from .http_client import AsyncHttpClient
     from .learning_service import LearningService
@@ -30,6 +31,7 @@ if __package__:
     from .storage import SQLiteStorage
 else:
     from config import PluginConfig
+    from document_ingestion import DocumentIngestionService
     from extraction import EventExtractor
     from http_client import AsyncHttpClient
     from learning_service import LearningService
@@ -133,10 +135,17 @@ class LawAssistant(Star):
             llm_service,
             timezone_name=self.plugin_config.timezone,
             logger=logger,
+            library_service=None,
+            daily_case_card_max_chars=self.plugin_config.daily_case_card_max_chars,
         )
         self.library_service = LibraryService(
             LibraryRepository(self.storage.connection)
         )
+        self.document_ingestion = DocumentIngestionService(
+            data_dir,
+            self.library_service,
+        )
+        self.learning_service.library_service = self.library_service
         self.service = LawAssistantService(
             self.storage,
             sources=event_sources,
@@ -145,6 +154,7 @@ class LawAssistant(Star):
             publisher=self.publisher,
             learning_service=self.learning_service,
             library_service=self.library_service,
+            document_ingestion=self.document_ingestion,
             config=self.plugin_config,
             logger=logger,
         )
@@ -299,6 +309,16 @@ class LawAssistant(Star):
                     question_type=question_type,
                     session_origin=_session_origin(event),
                     actor_id=str(event.get_sender_id()),
+                )
+            )
+        elif subcommand == "import" and len(parts) > 2:
+            relative_path, content_kind = _parse_document_import_args(parts[2:])
+            text = _json_text(
+                await self.service.import_learning_document(
+                    relative_path,
+                    created_by=str(event.get_sender_id()),
+                    session_origin=_session_origin(event),
+                    content_kind=content_kind,
                 )
             )
         elif subcommand in {"plans", "plan"}:
@@ -463,6 +483,30 @@ class LawAssistant(Star):
                 note=note,
                 created_by=str(event.get_sender_id()),
                 session_origin=_session_origin(event),
+            )
+        )
+
+    @filter.llm_tool(name="law_import_learning_document")
+    async def law_import_learning_document(
+        self,
+        event: AstrMessageEvent,
+        relative_path: str,
+        content_kind: str = "auto",
+    ) -> str:
+        """从插件受控 imports 目录导入 TXT、DOCX 或文本型 PDF。
+
+        Args:
+            relative_path(string): imports 目录内的相对路径，不能是绝对路径。
+            content_kind(string): auto、case、mock_question 或 real_question_candidate。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.import_learning_document(
+                relative_path,
+                created_by=str(event.get_sender_id()),
+                session_origin=_session_origin(event),
+                content_kind=content_kind,
             )
         )
 
@@ -807,6 +851,7 @@ class LawAssistant(Star):
         return (
             "用法：/law status、/law scan、/law events、/law deadlines、"
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
+            "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
             "/law bind [当前群别名]、/law bind-umo <UMO> [群别名]、"
             "/law rename <目标> <新别名>、/law publish <id> [群名]、"
@@ -894,6 +939,19 @@ def _parse_question_args(parts: list[str]) -> tuple[str, str, str | None]:
         else:
             question_type = part
     return origin, subject, question_type
+
+
+def _parse_document_import_args(parts: list[str]) -> tuple[str, str]:
+    values = list(parts)
+    content_kind = "auto"
+    if values and values[-1] in {
+        "auto",
+        "case",
+        "mock_question",
+        "real_question_candidate",
+    }:
+        content_kind = values.pop()
+    return " ".join(values), content_kind
 
 
 def _extract_question_import_path(message_text: str) -> str | None:

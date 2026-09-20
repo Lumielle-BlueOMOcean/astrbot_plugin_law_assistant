@@ -17,7 +17,12 @@ if __package__ and "." in __package__:
     from .library_repository import LibraryRepository
 else:
     from content import parse_question_type, parse_subject
-    from library_models import CaseDetail, LearningItem, LibrarySource, QuestionDetail
+    from library_models import (
+        CaseDetail,
+        LearningItem,
+        LibrarySource,
+        QuestionDetail,
+    )
     from library_repository import LibraryRepository
 
 
@@ -29,12 +34,14 @@ _MATERIAL_TYPES = {
 }
 _SEARCH_TYPES = {
     "case": "case",
+    "official_case": "case",
     "question": "question",
     "real_question_candidate": "question",
     "mock_question": "question",
     "note": "note",
 }
 _SEARCH_IDENTITIES = {
+    "official_case": "official_case",
     "real_question_candidate": "real_question_candidate",
     "mock_question": "mock_question",
 }
@@ -115,6 +122,11 @@ class LibraryService:
         self.repository = repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
+    def record_source(self, source: LibrarySource) -> int:
+        """Persist an original source even when extraction cannot proceed."""
+        with self.repository.connection:
+            return self.repository.ensure_source(source)
+
     async def archive_learning_material(
         self,
         *,
@@ -139,81 +151,11 @@ class LibraryService:
             )
         try:
             structured = _structured_json(structured_json)
-            normalized_subjects = _subjects(subjects)
-            title_value = _title(raw_text, title)
             now = self.clock()
             source_hash = _hash(raw_text)
-            item_type, identity, verification_status = mapped
-            case_detail: CaseDetail | None = None
-            question_detail: QuestionDetail | None = None
-            if normalized_type == "case":
-                case_summary = _as_text(structured.get("case_summary"))
-                issues = _as_text_list(structured.get("issues"))
-                practice_notes = _as_text_list(structured.get("practice_notes"))
-                case_detail = CaseDetail(
-                    case_number=_as_text(structured.get("case_number")),
-                    authority=_as_text(structured.get("authority")),
-                    case_summary=case_summary,
-                    issues=issues,
-                    reasoning=_as_text(structured.get("reasoning")),
-                    result_text=_as_text(structured.get("result")),
-                    practice_notes=practice_notes,
-                )
-                source_summary = case_summary or raw_text.strip()[:300]
-            elif normalized_type in {"real_question_candidate", "mock_question"}:
-                stem = _as_text(structured.get("stem") or structured.get("question"))
-                question_type = parse_question_type(structured.get("question_type"))
-                if not stem or not question_type:
-                    raise ValueError("题目必须包含题干和受支持的题型")
-                options = _as_text_list(structured.get("options"))
-                answer = structured.get("answer")
-                question_detail = QuestionDetail(
-                    question_identity=identity,
-                    question_type=question_type,
-                    stem=stem,
-                    options=options,
-                    answer=answer,
-                    explanation=_as_text(structured.get("explanation")),
-                    exam_name=_as_text(structured.get("exam_name")),
-                    exam_year=_as_text(structured.get("exam_year")),
-                    paper=_as_text(structured.get("paper")),
-                    question_number=_as_text(structured.get("question_number")),
-                    answer_source=_as_text(structured.get("answer_source")),
-                )
-                source_summary = question_detail.explanation or stem[:300]
-            else:
-                body = _as_text(structured.get("body")) or raw_text.strip()
-                source_summary = body[:300]
-
-            metadata: dict[str, Any] = {}
-            if normalized_type == "note":
-                metadata["body"] = body
-            if _as_text(note):
-                metadata["note"] = _as_text(note)
-            item_payload = {
-                "source_hash": source_hash,
-                "material_type": normalized_type,
-                "title": title_value,
-                "subjects": normalized_subjects,
-                "structured": structured,
-                "note": _as_text(note),
-            }
-            item = LearningItem(
-                item_type=item_type,
-                identity=identity,
-                item_hash=_hash(_canonical(item_payload)),
-                title=title_value,
-                subjects=normalized_subjects,
-                verification_status=verification_status,
-                source_summary=source_summary,
-                created_at=now,
-                updated_at=now,
-                created_by=str(created_by),
-                metadata=metadata,
-            )
             source = LibrarySource(
                 source_kind="user_text",
-                title=title_value,
+                title=_title(raw_text, title),
                 raw_text=raw_text,
                 source_url=_as_text(source_url),
                 content_hash=source_hash,
@@ -221,6 +163,16 @@ class LibraryService:
                 created_by=str(created_by),
                 session_origin=str(session_origin),
                 metadata={},
+            )
+            item, case_detail, question_detail = self._build_candidate(
+                raw_text=raw_text,
+                material_type=normalized_type,
+                title=title,
+                subjects=subjects,
+                structured=structured,
+                created_by=str(created_by),
+                now=now,
+                note=note,
             )
             archived = self.repository.archive(
                 source, item, case=case_detail, question=question_detail
@@ -232,11 +184,323 @@ class LibraryService:
             "item_id": archived.item_id,
             "source_id": archived.source_id,
             "duplicate": archived.duplicate,
-            "item_type": item_type,
-            "identity": identity,
-            "verification_status": verification_status,
+            "item_type": item.item_type,
+            "identity": item.identity,
+            "verification_status": item.verification_status,
             "message": "资料已收藏" if not archived.duplicate else "已找到相同收藏资料",
         }
+
+    def _build_candidate(
+        self,
+        *,
+        raw_text: str,
+        material_type: str,
+        title: Any,
+        subjects: Any,
+        structured: dict[str, Any],
+        created_by: str,
+        now: datetime,
+        note: Any = "",
+        identity_override: str | None = None,
+        verification_override: str | None = None,
+        item_hash_seed: Any | None = None,
+    ) -> tuple[LearningItem, CaseDetail | None, QuestionDetail | None]:
+        normalized_type = str(material_type or "").strip().lower()
+        mapped = _MATERIAL_TYPES.get(normalized_type)
+        if mapped is None and identity_override != "official_case":
+            raise ValueError(f"不支持的资料类型：{normalized_type}")
+        normalized_subjects = _subjects(subjects)
+        title_value = _title(raw_text, title)
+        if identity_override == "official_case":
+            item_type, identity, verification_status = (
+                "case",
+                "official_case",
+                verification_override or "verified_official",
+            )
+        else:
+            assert mapped is not None
+            item_type, identity, verification_status = mapped
+        case_detail: CaseDetail | None = None
+        question_detail: QuestionDetail | None = None
+        if normalized_type == "case" or identity == "official_case":
+            case_summary = _as_text(structured.get("case_summary"))
+            issues = _as_text_list(structured.get("issues"))
+            practice_notes = _as_text_list(structured.get("practice_notes"))
+            case_detail = CaseDetail(
+                case_number=_as_text(structured.get("case_number")),
+                authority=_as_text(structured.get("authority")),
+                case_summary=case_summary,
+                issues=issues,
+                reasoning=_as_text(structured.get("reasoning")),
+                result_text=_as_text(structured.get("result")),
+                practice_notes=practice_notes,
+            )
+            source_summary = case_summary or raw_text.strip()[:300]
+        elif normalized_type in {"real_question_candidate", "mock_question"}:
+            stem = _as_text(structured.get("stem") or structured.get("question"))
+            question_type = parse_question_type(structured.get("question_type"))
+            if not stem or not question_type:
+                raise ValueError("题目必须包含题干和受支持的题型")
+            options = _as_text_list(structured.get("options"))
+            question_detail = QuestionDetail(
+                question_identity=identity,
+                question_type=question_type,
+                stem=stem,
+                options=options,
+                answer=structured.get("answer"),
+                explanation=_as_text(structured.get("explanation")),
+                exam_name=_as_text(structured.get("exam_name")),
+                exam_year=_as_text(structured.get("exam_year")),
+                paper=_as_text(structured.get("paper")),
+                question_number=_as_text(structured.get("question_number")),
+                answer_source=_as_text(structured.get("answer_source")),
+            )
+            source_summary = question_detail.explanation or stem[:300]
+        else:
+            body = _as_text(structured.get("body")) or raw_text.strip()
+            source_summary = body[:300]
+
+        metadata: dict[str, Any] = {}
+        if normalized_type == "note":
+            metadata["body"] = body
+        if _as_text(note):
+            metadata["note"] = _as_text(note)
+        for key in ("evidence_text", "adapter_key", "original_title"):
+            if _as_text(structured.get(key)):
+                metadata[key] = _as_text(structured[key])
+        item_payload = (
+            item_hash_seed
+            if item_hash_seed is not None
+            else {
+                "source_hash": _hash(raw_text),
+                "material_type": normalized_type,
+                "title": title_value,
+                "subjects": normalized_subjects,
+                "structured": structured,
+                "note": _as_text(note),
+            }
+        )
+        item = LearningItem(
+            item_type=item_type,
+            identity=identity,
+            item_hash=_hash(_canonical(item_payload)),
+            title=title_value,
+            subjects=normalized_subjects,
+            verification_status=verification_status,
+            source_summary=source_summary,
+            created_at=now,
+            updated_at=now,
+            created_by=created_by,
+            metadata=metadata,
+        )
+        return item, case_detail, question_detail
+
+    async def archive_material_batch(
+        self,
+        *,
+        source: LibrarySource,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not source.raw_text.strip():
+            return _error("invalid_raw_text", "原始资料不能为空")
+        items: list[dict[str, Any]] = []
+        failed = 0
+        duplicate = 0
+        archived = 0
+        needs_review = 0
+        with self.repository.connection:
+            source_id = self.repository.ensure_source(source)
+            for index, candidate in enumerate(candidates):
+                if not isinstance(candidate, dict):
+                    failed += 1
+                    items.append(
+                        {
+                            "index": index,
+                            "status": "failed",
+                            "reason": "候选条目必须是对象",
+                        }
+                    )
+                    continue
+                if str(candidate.get("status") or "").strip().lower() in {
+                    "needs_review",
+                    "review",
+                }:
+                    needs_review += 1
+                    items.append(
+                        {
+                            "index": index,
+                            "status": "needs_review",
+                            "reason": _as_text(candidate.get("review_reason"))
+                            or "边界需要人工确认",
+                        }
+                    )
+                    continue
+                material_type = (
+                    str(candidate.get("material_type") or "").strip().lower()
+                )
+                locator = _as_text(candidate.get("locator"))
+                raw_text = _as_text(candidate.get("raw_text")) or source.raw_text
+                try:
+                    structured = _structured_json(candidate.get("structured", {}))
+                    item, case_detail, question_detail = self._build_candidate(
+                        raw_text=raw_text,
+                        material_type=material_type,
+                        title=candidate.get("title", ""),
+                        subjects=candidate.get("subjects", ""),
+                        structured=structured,
+                        created_by=source.created_by,
+                        now=self.clock(),
+                        note=candidate.get("note", ""),
+                        identity_override=(
+                            "official_case"
+                            if candidate.get("trusted_official") is True
+                            else None
+                        ),
+                        verification_override=(
+                            "verified_official"
+                            if candidate.get("trusted_official") is True
+                            else None
+                        ),
+                        item_hash_seed={
+                            "source_hash": source.content_hash,
+                            "source_url": source.source_url,
+                            "locator": locator or _hash(_canonical(candidate)),
+                            "material_type": material_type,
+                            "identity": (
+                                "official_case"
+                                if candidate.get("trusted_official") is True
+                                else material_type
+                            ),
+                        },
+                    )
+                    result = self.repository.archive(
+                        source,
+                        item,
+                        case=case_detail,
+                        question=question_detail,
+                        locator=locator,
+                        relationship=_as_text(candidate.get("relationship"))
+                        or "primary_evidence",
+                    )
+                except (TypeError, ValueError, KeyError) as exc:
+                    failed += 1
+                    items.append(
+                        {"index": index, "status": "failed", "reason": str(exc)}
+                    )
+                    continue
+                status = "duplicate" if result.duplicate else "archived"
+                if result.duplicate:
+                    duplicate += 1
+                else:
+                    archived += 1
+                items.append(
+                    {
+                        "index": index,
+                        "status": status,
+                        "item_id": result.item_id,
+                        "source_id": source_id,
+                        "item_type": item.item_type,
+                        "identity": item.identity,
+                        "locator": locator,
+                    }
+                )
+        return {
+            "success": True,
+            "source_id": source_id,
+            "total_candidates": len(candidates),
+            "archived": archived,
+            "duplicate": duplicate,
+            "failed": failed,
+            "needs_review": needs_review,
+            "items": items,
+        }
+
+    async def archive_official_cases(
+        self,
+        *,
+        source: LibrarySource,
+        candidates: list[dict[str, Any]],
+        adapter_key: str,
+    ) -> dict[str, Any]:
+        if adapter_key not in {"court_cases", "spp_cases"}:
+            return _error(
+                "untrusted_source", "只有最高法或最高检受信来源可以创建官方案例"
+            )
+        normalized = []
+        for candidate in candidates:
+            item = dict(candidate)
+            item["material_type"] = "case"
+            item["trusted_official"] = True
+            structured = _structured_json(item.get("structured", {}))
+            structured["adapter_key"] = adapter_key
+            item["structured"] = structured
+            normalized.append(item)
+        return await self.archive_material_batch(source=source, candidates=normalized)
+
+    async def list_official_cases(
+        self, *, subject: str = "", limit: int = 100
+    ) -> dict[str, Any]:
+        try:
+            normalized_subject = parse_subject(subject) if str(subject).strip() else ""
+        except ValueError as exc:
+            return _error("invalid_subject", str(exc))
+        items = self.repository.search(
+            item_type="case",
+            identity="official_case",
+            subject=normalized_subject or "",
+            limit=limit,
+        )
+        return {
+            "success": True,
+            "count": len(items),
+            "items": [self._item_summary(item) for item in items],
+        }
+
+    def official_case_bundles(
+        self, *, subject: str = "", limit: int = 100
+    ) -> list[Any]:
+        normalized_subject = parse_subject(subject) if str(subject).strip() else ""
+        items = self.repository.search(
+            item_type="case",
+            identity="official_case",
+            subject=normalized_subject or "",
+            limit=limit,
+        )
+        bundles = []
+        for item in items:
+            if item.id is not None:
+                bundle = self.repository.get(item.id)
+                if bundle is not None:
+                    bundles.append(bundle)
+        return bundles
+
+    def set_official_case_subjects(
+        self,
+        *,
+        source_key: str,
+        source_item_key: str,
+        subjects: tuple[str, ...],
+    ) -> int:
+        """Propagate an operator classification to matching official segments."""
+        updated = 0
+        for item in self.repository.search(
+            item_type="case", identity="official_case", limit=50
+        ):
+            if item.id is None:
+                continue
+            bundle = self.repository.get(item.id)
+            if bundle is None:
+                continue
+            if (
+                any(
+                    source.metadata.get("adapter_key") == source_key
+                    and source.metadata.get("source_item_key") == source_item_key
+                    for source in bundle.sources
+                )
+                and self.repository.update(item.id, {"subjects": subjects}) is not None
+            ):
+                updated += 1
+        return updated
 
     async def search_learning_library(
         self,
@@ -390,6 +654,15 @@ class LibraryService:
             },
             "sources": sources,
             "source": sources[0] if sources else None,
+            "source_links": [
+                {
+                    "source_id": link.source.id,
+                    "source_url": link.source.source_url,
+                    "locator": link.locator,
+                    "relationship": link.relationship,
+                }
+                for link in getattr(bundle, "source_links", ())
+            ],
         }
         if bundle.case is not None:
             result["case"] = {

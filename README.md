@@ -14,6 +14,8 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 真题、模拟题和官方案例使用独立身份标注；模拟题不会被标为官方真题，缺少答案证据时不会由 LLM 冒充官方答案。
 - 学习资料库基础：私聊中明确要求收藏的文本资料会保存原文、确定性 hash、归属人和结构化学习条目；支持 `user_case`、`real_question_candidate`、持久化 `mock_question` 和 `note`。
 - 学习资料库支持 Agent Tool 搜索、读取和有限人工更新；同一原文可以复用 Source，但不同整理结果、方向和备注不会互相覆盖。
+- 受控目录资料导入：管理员可导入 UTF-8/常见中文编码 TXT、标准 DOCX 和文本型 PDF；原件保存在插件数据目录，提取文本保留页码/段落/行号定位，题目和案例按可确定边界拆成独立条目并返回待复核统计。
+- 最高法/最高检受信来源的合集文章会通过独立官方案例入口按原文案例标题拆分；每日一案优先使用独立 `official_case`，并通过统一学习卡片长度预算阻止过长内容发送。
 - 题目来源/方向/题型的统一选择规则，支持 `real`、`mock`、`random` 和单选、多选、判断、简答、案例分析。
 - 案例和题目各自独立的每日任务计划：随机、固定或按日期轮换；支持全局默认、群级覆盖、学校四方向预设和未来安排预览。
 - 已绑定多个群的名称/别名解析、明确目标的赛事/题目/案例发布预览和一次性确认 token。
@@ -28,7 +30,7 @@ AstrBot QQ 法律信息助手。`0.2.0` 支持活动、官方案例、法规更�
 - 更广泛的法律硕士赛事来源和跨来源实体解析。
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG 和 dashboard。
 - 更广泛的题库内容和需要用户授权的真实题目数据；本仓库当前不声称拥有完整真题库。
-- Word/PDF/OCR/QQ 文件附件导入、官方合集自动拆分，以及 `real_question_candidate` 到 `verified_real_question` 的人工审核流。
+- 直接接收 QQ 文件附件、旧版 DOC、扫描 PDF/OCR、完整 WebUI，以及 `real_question_candidate` 到 `verified_real_question` 的人工审核流。
 - 新资料库尚未接管每日案例/每日一题；当前每日任务仍使用现有官方案例和 verified real question 体系。
 - 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG、dashboard、特殊 OneBot 消息和 Nexus runtime integration。
 
@@ -120,6 +122,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law confirm <token>
 /law case [方向]
 /law question [real|mock|random] [方向] [题型]
+/law import <imports目录相对路径> [case|mock_question|real_question_candidate]
 /law plans [群名]
 /law question-import <JSON路径>
 /law case-tag <案例ID> <方向...>
@@ -133,7 +136,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_archive_learning_material`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
+可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
 
 ### 学习资料库
 
@@ -173,6 +176,27 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 插件会保存题目 hash、来源定位和答案身份；没有可靠答案时只显示“未提供”，不让模型猜成官方答案。当前仓库没有随代码提交真实题库，安装后真题数量取决于管理员导入的数据。
 
+### 受控文档导入与官方案例拆分
+
+先将文件复制到运行时目录：
+
+```text
+data/plugin_data/astrbot_plugin_law_assistant/imports/
+```
+
+然后在管理员私聊执行，例如：
+
+```text
+/law import "试卷 with spaces.txt" real_question_candidate
+/law import "官方案例合集.docx" case
+```
+
+`auto` 会根据题号或案例标题尝试确定类型；对无法可靠确定边界的片段会保留原件并标记 `needs_review`，不会凭空拆分或补写答案。导入支持 `.txt`、`.md`、标准 `.docx` 和文本型 `.pdf`，单文件默认上限 20 MB、PDF 200 页、提取文本 600000 字符、单次 100 个候选条目。旧版 `.doc`、扫描件/OCR 和 QQ 文件附件不在本轮实现范围。
+
+原件复制到插件专属 `assets/<sha256>.<ext>`，数据库来源记录保存文件 hash、提取文本 hash、解析状态、警告和每个条目的定位。重复导入同一文件不会重复复制原件或生成相同条目；部分条目失败不会回滚已经成功归档的条目。安装或升级前应备份运行时 SQLite；安装包不覆盖现有数据库。
+
+最高法/最高检适配器取得的真实官方文章才可进入 `official_case` 入口。文章导语不会作为案件，能识别的每个“案例一/案例二”等独立条目均保留官方文章 URL 和文章内定位；边界不清的片段跳过发布。每日案例与手动案例预览只针对一个独立案例，案例卡片默认 1800 字符，超过预算且无法在证据约束下压缩时返回 `content_too_long`，不发送整篇合集。
+
 ## Development
 
 ```bash
@@ -191,3 +215,5 @@ python scripts/live_smoke.py
 ```
 
 `.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；required failure 不用 `continue-on-error` 隐藏。
+
+本轮的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用本地 fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取和真实 LLM provider 仍需后续实机验收。

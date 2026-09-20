@@ -7,6 +7,7 @@ import logging
 import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 if __package__ and "." in __package__:
@@ -18,7 +19,10 @@ if __package__ and "." in __package__:
         parse_subject,
     )
     from .daily_plans import DailyPlan
+    from .document_extractors import DocumentSegment, ParsedDocument
+    from .learning_segmentation import segment_official_cases
     from .learning_service import LearningService
+    from .library_models import LibrarySource
     from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from .publisher import format_deadline_reminder, format_event
@@ -33,7 +37,10 @@ else:
         parse_subject,
     )
     from daily_plans import DailyPlan
+    from document_extractors import DocumentSegment, ParsedDocument
+    from learning_segmentation import segment_official_cases
     from learning_service import LearningService
+    from library_models import LibrarySource
     from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from publisher import format_deadline_reminder, format_event
@@ -104,6 +111,7 @@ class LawAssistantService:
         publisher: Any | None = None,
         learning_service: LearningService | None = None,
         library_service: LibraryService | None = None,
+        document_ingestion: Any | None = None,
         config: Any | None = None,
         clock: Any | None = None,
     ) -> None:
@@ -117,6 +125,7 @@ class LawAssistantService:
         self.config = config
         self.learning_service = learning_service
         self.library_service = library_service
+        self.document_ingestion = document_ingestion
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._scan_lock = asyncio.Lock()
         self._publish_confirmations: dict[str, PendingPublication] = {}
@@ -305,7 +314,11 @@ class LawAssistantService:
                             continue
                         item = await _maybe_await(extractor.extract(document))
                         if item is not None:
-                            handler(item)
+                            await _maybe_await(
+                                handler(item, document=document, source_key=key)
+                                if source_type == "case"
+                                else handler(item)
+                            )
                             count += 1
                         # Keep the last successfully processed document so a failed
                         # extraction can be retried on the next scan.
@@ -347,8 +360,54 @@ class LawAssistantService:
                 "skipped": False,
             }
 
-    def _store_case(self, item: CaseItem) -> None:
+    async def _store_case(
+        self,
+        item: CaseItem,
+        *,
+        document: SourceDocument | None = None,
+        source_key: str = "",
+    ) -> None:
         self.storage.upsert_case_item(item)
+        if self.library_service is None or document is None:
+            return
+        parsed = ParsedDocument(
+            path=Path(f"{document.source_item_key}.html"),
+            original_filename=document.title or f"{document.source_item_key}.html",
+            mime_type=document.content_type,
+            file_hash=document.content_hash,
+            extracted_text_hash=document.content_hash,
+            text=item.raw_text,
+            segments=(DocumentSegment(0, item.raw_text, "文章正文"),),
+        )
+        split = segment_official_cases(parsed)
+        candidates = []
+        for candidate in split.candidates:
+            current = dict(candidate)
+            structured = dict(current.get("structured") or {})
+            structured["authority"] = item.authority
+            current["structured"] = structured
+            current["subjects"] = list(item.subjects)
+            candidates.append(current)
+        source = LibrarySource(
+            source_kind="official_article",
+            title=item.title,
+            raw_text=item.raw_text,
+            source_url=item.source_url,
+            content_hash=item.content_hash,
+            created_at=self._now_utc(),
+            created_by=f"source:{source_key or item.source_key}",
+            session_origin=f"source:{source_key or item.source_key}",
+            metadata={
+                "adapter_key": source_key or item.source_key,
+                "source_item_key": item.source_item_key,
+                "authority": item.authority,
+            },
+        )
+        await self.library_service.archive_official_cases(
+            source=source,
+            candidates=candidates,
+            adapter_key=source_key or item.source_key,
+        )
 
     def _store_law_update(self, item: LawUpdate) -> None:
         self.storage.upsert_law_update(item)
@@ -929,10 +988,20 @@ class LawAssistantService:
         )
         if not normalized:
             return {"success": False, "reason": "至少需要一个有效方向"}
+        success = self.storage.set_case_subjects(case_id, normalized)
+        legacy = self.storage.get_case_item(case_id)
+        official_updated = 0
+        if success and legacy is not None and self.library_service is not None:
+            official_updated = self.library_service.set_official_case_subjects(
+                source_key=legacy.source_key,
+                source_item_key=legacy.source_item_key,
+                subjects=normalized,
+            )
         return {
-            "success": self.storage.set_case_subjects(case_id, normalized),
+            "success": success,
             "case_id": case_id,
             "subjects": list(normalized),
+            "official_case_items_updated": official_updated,
         }
 
     def import_real_questions_file(self, path: str) -> dict[str, Any]:
@@ -1109,6 +1178,27 @@ class LawAssistantService:
                 "message": "学习资料库服务不可用",
             }
         return await self.library_service.archive_learning_material(**kwargs)
+
+    async def import_learning_document(
+        self,
+        relative_path: str,
+        *,
+        created_by: str,
+        session_origin: str,
+        content_kind: str = "auto",
+    ) -> dict[str, Any]:
+        if self.document_ingestion is None:
+            return {
+                "success": False,
+                "error": "document_ingestion_unavailable",
+                "reason": "文档导入服务不可用",
+            }
+        return await self.document_ingestion.import_document(
+            relative_path,
+            created_by=created_by,
+            session_origin=session_origin,
+            content_kind=content_kind,
+        )
 
     async def search_learning_library(self, **kwargs: Any) -> dict[str, Any]:
         if self.library_service is None:
@@ -1370,6 +1460,8 @@ def _time_is_due(value: datetime | str, configured_time: str, config: Any) -> bo
 
 def _format_daily_content(content_type: str, content: dict[str, Any]) -> str:
     if content_type == "daily_case":
+        if isinstance(content.get("card_body"), str):
+            return content["card_body"]
         title = "【每日一案】"
         if content.get("subject"):
             title += f"｜{content['subject']}"

@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from learning_service import LearningService
+from library_models import LibrarySource
+from library_repository import LibraryRepository
+from library_service import LibraryService
 from models import CaseItem, EventDate, SourceDocument
 from scheduler import LawAssistantScheduler
 from service import LawAssistantService
@@ -171,6 +174,102 @@ async def test_case_manual_subject_survives_updated_official_source(tmp_path):
         subject="知识产权"
     )
     assert filtered["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_official_case_collection_is_split_into_independent_library_cases(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    library = LibraryService(LibraryRepository(storage.connection))
+    document = SourceDocument(
+        source_key="court_cases",
+        source_item_key="collection-1",
+        url="https://court.example/collection-1",
+        title="三个典型案例",
+        content=(
+            "导语：本期发布三个案例。\n"
+            "案例一：知识产权纠纷\n甲公司主张商标侵权，法院依法裁判。\n"
+            "案例二：合同纠纷\n乙公司与丙公司签订合同，法院认定违约。\n"
+            "案例三：司法实务\n检察机关依法审查起诉并提出建议。"
+        ),
+        fetched_at="2026-09-18T00:00:00+00:00",
+    )
+
+    class Extractor:
+        async def extract(self, document):
+            return CaseItem(
+                source_key=document.source_key,
+                source_item_key=document.source_item_key,
+                title=document.title,
+                source_url=document.url,
+                authority="最高人民法院",
+                raw_text=document.content,
+                content_hash=document.content_hash,
+            )
+
+    service = LawAssistantService(
+        storage,
+        case_sources=[(FakeAdapter("court_cases", [document]), Extractor())],
+        library_service=library,
+    )
+    result = await service.scan_cases()
+
+    assert result["failures"] == []
+    official = await library.list_official_cases()
+    assert official["count"] == 3
+    assert all(item["identity"] == "official_case" for item in official["items"])
+    assert all("导语" not in item["title"] for item in official["items"])
+    legacy_case = storage.list_case_items()[0]
+    tagged = await service.set_case_subjects(legacy_case.id, ["知识产权"])
+    assert tagged["official_case_items_updated"] == 3
+    filtered = await library.list_official_cases(subject="知识产权")
+    assert filtered["count"] == 3
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_case_uses_one_independent_library_case_and_card_budget(tmp_path):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    library = LibraryService(LibraryRepository(storage.connection))
+    await library.archive_official_cases(
+        source=LibrarySource(
+            source_kind="official_article",
+            title="官方合集",
+            raw_text="案例一正文\n案例二正文",
+            source_url="https://court.example/collection",
+            content_hash="collection-hash",
+            created_at=datetime(2026, 9, 18, tzinfo=ZoneInfo("Asia/Shanghai")),
+            created_by="source:court_cases",
+            session_origin="source:court_cases",
+        ),
+        candidates=[
+            {
+                "title": "案例一",
+                "locator": "案例一",
+                "subjects": ["知识产权"],
+                "structured": {
+                    "case_summary": "甲公司商标纠纷",
+                    "evidence_text": "案例一原文证据",
+                },
+            }
+        ],
+        adapter_key="court_cases",
+    )
+    learning = LearningService(
+        storage,
+        LearningLLM(),
+        library_service=library,
+        daily_case_card_max_chars=1800,
+    )
+
+    result = await learning.daily_case(subject="知识产权", date="2026-09-18")
+
+    assert result["available"] is True
+    assert result["title"] == "案例一"
+    assert "案例二" not in result["card_body"]
+    assert "官方来源" in result["card_body"]
+    storage.close()
 
 
 @pytest.mark.asyncio

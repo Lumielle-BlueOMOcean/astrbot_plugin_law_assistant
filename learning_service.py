@@ -18,6 +18,7 @@ if __package__ and "." in __package__:
         subject_matches,
         validate_generated_question,
     )
+    from .learning_card import ContentTooLongError, format_case_card
     from .models import CaseItem
     from .storage import SQLiteStorage
 else:
@@ -31,6 +32,7 @@ else:
         subject_matches,
         validate_generated_question,
     )
+    from learning_card import ContentTooLongError, format_case_card
     from models import CaseItem
     from storage import SQLiteStorage
 
@@ -46,12 +48,16 @@ class LearningService:
         timezone_name: str = "Asia/Shanghai",
         logger: Any | None = None,
         rng: random.Random | None = None,
+        library_service: Any | None = None,
+        daily_case_card_max_chars: int = 1800,
     ) -> None:
         self.storage = storage
         self.llm_service = llm_service
         self.timezone_name = timezone_name
         self.logger = logger or logging.getLogger(__name__)
         self.rng = rng or random.Random()
+        self.library_service = library_service
+        self.daily_case_card_max_chars = daily_case_card_max_chars
 
     async def daily_case(
         self,
@@ -61,6 +67,84 @@ class LearningService:
         session_origin: str | None = None,
     ) -> dict[str, Any]:
         requested_subject = parse_subject(subject)
+        if self.library_service is not None:
+            bundles = self.library_service.official_case_bundles(
+                subject=requested_subject or "", limit=500
+            )
+            if not bundles:
+                return {
+                    "available": False,
+                    "reason": (
+                        "暂无匹配方向的独立官方案例"
+                        if requested_subject
+                        else "暂无已存储的独立官方案例"
+                    ),
+                }
+            selected = _select_for_day(
+                bundles,
+                date or datetime.now(ZoneInfo(self.timezone_name)).date().isoformat(),
+            )
+            if self.llm_service is None:
+                return {"available": False, "reason": "LLM provider unavailable"}
+            evidence = _official_case_evidence(selected)
+            prompt = _official_case_prompt(selected, evidence)
+            result = await self.llm_service.generate_json(
+                prompt,
+                session_origin=session_origin,
+            )
+            if not isinstance(result, dict):
+                return {"available": False, "reason": "LLM provider unavailable"}
+            source = selected.sources[0] if selected.sources else None
+            subjects = tuple(selected.item.subjects)
+            selected_subject = requested_subject or next(
+                (
+                    normalize_subject(value)
+                    for value in subjects
+                    if normalize_subject(value)
+                ),
+                None,
+            )
+            response = {
+                "available": True,
+                "case_id": selected.item.id,
+                "title": selected.item.title,
+                "source_url": source.source_url if source else "",
+                "authority": selected.case.authority if selected.case else "",
+                "subject": selected_subject,
+                "content": result,
+                "evidence_text": evidence,
+                "source_locator": (
+                    selected.source_links[0].locator if selected.source_links else ""
+                ),
+            }
+            try:
+                response["card_body"] = format_case_card(
+                    response, max_chars=self.daily_case_card_max_chars
+                )
+            except ContentTooLongError:
+                compact = await self.llm_service.generate_json(
+                    prompt
+                    + f"\n请在 {self.daily_case_card_max_chars} 字符内重新整理，不得省略来源证据支持的关键结论。",
+                    session_origin=session_origin,
+                )
+                if not isinstance(compact, dict):
+                    return {
+                        "available": False,
+                        "error": "content_too_long",
+                        "reason": "案例学习卡片超过长度预算且无法压缩",
+                    }
+                response["content"] = compact
+                try:
+                    response["card_body"] = format_case_card(
+                        response, max_chars=self.daily_case_card_max_chars
+                    )
+                except ContentTooLongError:
+                    return {
+                        "available": False,
+                        "error": "content_too_long",
+                        "reason": "案例学习卡片超过长度预算且无法压缩",
+                    }
+            return response
         items = self.storage.list_case_items(limit=500)
         if requested_subject:
             items = [
@@ -98,7 +182,7 @@ class LearningService:
         )
         if not isinstance(result, dict):
             return {"available": False, "reason": "LLM provider unavailable"}
-        return {
+        response = {
             "available": True,
             "case_id": selected.id,
             "title": selected.title,
@@ -118,6 +202,17 @@ class LearningService:
             ),
             "content": result,
         }
+        try:
+            response["card_body"] = format_case_card(
+                response, max_chars=self.daily_case_card_max_chars
+            )
+        except ContentTooLongError:
+            return {
+                "available": False,
+                "error": "content_too_long",
+                "reason": "案例学习卡片超过长度预算且无法压缩",
+            }
+        return response
 
     async def generate_question(
         self,
@@ -225,7 +320,7 @@ class LearningService:
         return self.storage.real_question_inventory()
 
 
-def _select_for_day(items: list[CaseItem], date: str) -> CaseItem:
+def _select_for_day(items: list[Any], date: str) -> Any:
     digest = hashlib.sha256(date.encode()).digest()
     return items[int.from_bytes(digest[:4], "big") % len(items)]
 
@@ -235,6 +330,25 @@ def _case_prompt(item: CaseItem) -> str:
         "请根据下面最高司法机关官方案例原文生成 JSON，字段包括："
         "case_summary、issues、reasoning、practice_notes。不得加入原文无法支持的事实。\n"
         f"来源机关：{item.authority}\n标题：{item.title}\n原文：{item.raw_text[:16000]}"
+    )
+
+
+def _official_case_evidence(bundle: Any) -> str:
+    metadata = bundle.item.metadata if bundle is not None else {}
+    evidence = str(metadata.get("evidence_text") or "").strip()
+    if evidence:
+        return evidence[:16000]
+    if bundle.case is not None and bundle.case.case_summary:
+        return bundle.case.case_summary[:16000]
+    return bundle.item.source_summary[:16000]
+
+
+def _official_case_prompt(bundle: Any, evidence: str) -> str:
+    authority = bundle.case.authority if bundle.case else "官方来源"
+    return (
+        "请根据下面一条已经从官方合集独立拆分并定位的案例原文生成 JSON，字段包括："
+        "case_summary、issues、reasoning、practice_notes。不得加入原文无法支持的事实。\n"
+        f"来源机关：{authority}\n标题：{bundle.item.title}\n独立案例证据：{evidence}"
     )
 
 

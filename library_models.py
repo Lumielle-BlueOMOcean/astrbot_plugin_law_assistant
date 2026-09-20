@@ -72,8 +72,16 @@ class LibraryArchiveResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LibrarySourceLink:
+    source: LibrarySource
+    locator: str
+    relationship: str
+
+
+@dataclass(frozen=True, slots=True)
 class LibraryItemBundle:
     item: LearningItem
     sources: tuple[LibrarySource, ...]
+    source_links: tuple[LibrarySourceLink, ...] = ()
     case: CaseDetail | None = None
     question: QuestionDetail | None = None
