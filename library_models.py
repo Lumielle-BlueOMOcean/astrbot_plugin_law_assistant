@@ -36,6 +36,22 @@ class LearningItem:
     created_by: str
     metadata: dict[str, Any] = field(default_factory=dict)
     id: int | None = None
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class LearningReviewItem:
+    source_id: int
+    candidate_key: str
+    material_type: str
+    locator: str
+    raw_fragment: str
+    proposed_structure: dict[str, Any]
+    review_reason: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

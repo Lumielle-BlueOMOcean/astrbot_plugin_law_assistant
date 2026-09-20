@@ -290,6 +290,28 @@ async def test_learning_tools_archive_and_search_through_service(plugin_module):
 
 
 @pytest.mark.asyncio
+async def test_review_command_is_operator_only_and_reads_persisted_queue(plugin_module):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    denied = [
+        item
+        async for item in plugin.law(
+            FakeEvent(private=True, sender_id="7", message="/law review")
+        )
+    ]
+    allowed = [
+        item
+        async for item in plugin.law(
+            FakeEvent(private=True, sender_id="42", message="/law review")
+        )
+    ]
+
+    assert "没有" in denied[0]
+    assert '"success": true' in allowed[0]
+    assert '"count": 0' in allowed[0]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("arguments", "reason_fragment"),
     [

@@ -9,6 +9,7 @@ if __package__ and "." in __package__:
     from .library_models import (
         CaseDetail,
         LearningItem,
+        LearningReviewItem,
         LibraryArchiveResult,
         LibraryItemBundle,
         LibrarySource,
@@ -19,6 +20,7 @@ else:
     from library_models import (
         CaseDetail,
         LearningItem,
+        LearningReviewItem,
         LibraryArchiveResult,
         LibraryItemBundle,
         LibrarySource,
@@ -67,6 +69,23 @@ def _item_from_row(row: sqlite3.Row) -> LearningItem:
         updated_at=_parse_datetime(str(row["updated_at"])),
         created_by=str(row["created_by"]),
         metadata=json.loads(row["metadata_json"]),
+        active=bool(row["active"]),
+    )
+
+
+def _review_from_row(row: sqlite3.Row) -> LearningReviewItem:
+    return LearningReviewItem(
+        id=int(row["id"]),
+        source_id=int(row["source_id"]),
+        candidate_key=str(row["candidate_key"]),
+        material_type=str(row["material_type"]),
+        locator=str(row["locator"]),
+        raw_fragment=str(row["raw_fragment"]),
+        proposed_structure=json.loads(row["proposed_structure_json"]),
+        review_reason=str(row["review_reason"]),
+        status=str(row["status"]),
+        created_at=_parse_datetime(str(row["created_at"])),
+        updated_at=_parse_datetime(str(row["updated_at"])),
     )
 
 
@@ -82,12 +101,26 @@ class LibraryRepository:
             raise ValueError("ensure_source expects an unsaved source model")
         source_row = self.connection.execute(
             """
-            SELECT id FROM library_sources
+            SELECT * FROM library_sources
             WHERE created_by = ? AND content_hash = ? AND source_url = ?
             """,
             (source.created_by, source.content_hash, source.source_url),
         ).fetchone()
         if source_row is not None:
+            existing_metadata = json.loads(source_row["metadata_json"])
+            merged_metadata = {**existing_metadata, **source.metadata}
+            if (
+                merged_metadata != existing_metadata
+                or source.title != source_row["title"]
+            ):
+                self.connection.execute(
+                    """
+                    UPDATE library_sources
+                    SET title = ?, metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (source.title, _json(merged_metadata), int(source_row["id"])),
+                )
             return int(source_row["id"])
         cursor = self.connection.execute(
             """
@@ -150,6 +183,11 @@ class LibraryRepository:
                         relationship,
                     ),
                 )
+                if not bool(existing["active"]):
+                    self.connection.execute(
+                        "UPDATE learning_items SET active = 1 WHERE id = ?",
+                        (int(existing["id"]),),
+                    )
                 return LibraryArchiveResult(
                     source_id=source_id,
                     item_id=int(existing["id"]),
@@ -317,6 +355,177 @@ class LibraryRepository:
         ).fetchall()
         return [_item_from_row(row) for row in rows]
 
+    def source_ids_by_metadata(
+        self, *, created_by: str, key: str, value: str
+    ) -> list[int]:
+        """Find source rows sharing a stable upstream identity."""
+        rows = self.connection.execute(
+            "SELECT id, metadata_json FROM library_sources WHERE created_by = ?",
+            (created_by,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if str(metadata.get(key, "")) == value:
+                result.append(int(row["id"]))
+        return result
+
+    def deactivate_items_for_sources(
+        self, source_ids: list[int], *, identity: str = "official_case"
+    ) -> int:
+        if not source_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in source_ids)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE learning_items
+                SET active = 0
+                WHERE identity = ? AND active = 1 AND id IN (
+                    SELECT item_id FROM learning_item_sources
+                    WHERE source_id IN ({placeholders})
+                )
+                """,
+                [identity, *source_ids],
+            )
+        return cursor.rowcount
+
+    def manual_subjects_for_sources(self, source_ids: list[int]) -> tuple[str, ...]:
+        if not source_ids:
+            return ()
+        placeholders = ", ".join("?" for _ in source_ids)
+        rows = self.connection.execute(
+            f"""
+            SELECT i.subjects_json, i.metadata_json
+            FROM learning_items AS i
+            JOIN learning_item_sources AS link ON link.item_id = i.id
+            WHERE i.identity = 'official_case'
+              AND link.source_id IN ({placeholders})
+            """,
+            source_ids,
+        ).fetchall()
+        subjects: list[str] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if metadata.get("manual_subjects") is not True:
+                continue
+            for value in json.loads(row["subjects_json"]):
+                if value not in subjects:
+                    subjects.append(value)
+        return tuple(subjects)
+
+    def supersede_review_items(self, source_ids: list[int]) -> int:
+        if not source_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in source_ids)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE learning_review_items
+                SET status = 'superseded', updated_at = ?
+                WHERE status = 'pending' AND source_id IN ({placeholders})
+                """,
+                [datetime.now().astimezone().isoformat(), *source_ids],
+            )
+        return cursor.rowcount
+
+    def record_review_item(
+        self,
+        *,
+        source_id: int,
+        candidate_key: str,
+        material_type: str,
+        locator: str,
+        raw_fragment: str,
+        proposed_structure: dict[str, Any],
+        review_reason: str,
+        now: datetime,
+    ) -> int:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO learning_review_items(
+                    source_id, candidate_key, material_type, locator, raw_fragment,
+                    proposed_structure_json, review_reason, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(source_id, candidate_key) DO UPDATE SET
+                    material_type = excluded.material_type,
+                    locator = excluded.locator,
+                    raw_fragment = excluded.raw_fragment,
+                    proposed_structure_json = excluded.proposed_structure_json,
+                    review_reason = excluded.review_reason,
+                    status = CASE
+                        WHEN learning_review_items.status = 'resolved'
+                        THEN learning_review_items.status
+                        ELSE 'pending'
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_id,
+                    candidate_key,
+                    material_type,
+                    locator,
+                    raw_fragment,
+                    _json(proposed_structure),
+                    review_reason,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            row = self.connection.execute(
+                """
+                SELECT id FROM learning_review_items
+                WHERE source_id = ? AND candidate_key = ?
+                """,
+                (source_id, candidate_key),
+            ).fetchone()
+        return int(row["id"])
+
+    def list_review_items(
+        self,
+        *,
+        source_id: int | None = None,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> list[LearningReviewItem]:
+        clauses = ["status = ?"]
+        params: list[Any] = [status]
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        params.append(max(1, min(int(limit), 200)))
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM learning_review_items
+            WHERE {" AND ".join(clauses)}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [_review_from_row(row) for row in rows]
+
+    def get_review_item(self, review_id: int) -> LearningReviewItem | None:
+        row = self.connection.execute(
+            "SELECT * FROM learning_review_items WHERE id = ?", (review_id,)
+        ).fetchone()
+        return _review_from_row(row) if row is not None else None
+
+    def update_review_status(self, review_id: int, status: str) -> bool:
+        if status not in {"pending", "resolved", "superseded"}:
+            raise ValueError("不支持的待复核状态")
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE learning_review_items
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, datetime.now().astimezone().isoformat(), review_id),
+            )
+        return cursor.rowcount > 0
+
     def search(
         self,
         *,
@@ -325,9 +534,12 @@ class LibraryRepository:
         identity: str = "",
         subject: str = "",
         limit: int = 10,
+        include_inactive: bool = False,
     ) -> list[LearningItem]:
         clauses = ["1 = 1"]
         params: list[Any] = []
+        if not include_inactive:
+            clauses.append("i.active = 1")
         if item_type:
             clauses.append("i.item_type = ?")
             params.append(item_type)
@@ -381,6 +593,11 @@ class LibraryRepository:
             if "subjects" in changes:
                 item_updates.append("subjects_json = ?")
                 params.append(_json(list(changes["subjects"])))
+                if row["identity"] == "official_case":
+                    metadata = json.loads(row["metadata_json"])
+                    metadata["manual_subjects"] = True
+                    item_updates.append("metadata_json = ?")
+                    params.append(_json(metadata))
             if "note" in changes:
                 metadata = json.loads(row["metadata_json"])
                 metadata["note"] = str(changes["note"])

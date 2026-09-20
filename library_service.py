@@ -265,7 +265,14 @@ class LibraryService:
             metadata["body"] = body
         if _as_text(note):
             metadata["note"] = _as_text(note)
-        for key in ("evidence_text", "adapter_key", "original_title"):
+        for key in (
+            "evidence_text",
+            "adapter_key",
+            "original_title",
+            "answer_locator",
+            "case_segmentation_version",
+            "source_item_key",
+        ):
             if _as_text(structured.get(key)):
                 metadata[key] = _as_text(structured[key])
         item_payload = (
@@ -308,6 +315,7 @@ class LibraryService:
         duplicate = 0
         archived = 0
         needs_review = 0
+        review_items: list[dict[str, Any]] = []
         with self.repository.connection:
             source_id = self.repository.ensure_source(source)
             for index, candidate in enumerate(candidates):
@@ -326,12 +334,55 @@ class LibraryService:
                     "review",
                 }:
                     needs_review += 1
+                    review_reason = _as_text(candidate.get("review_reason")) or (
+                        "边界需要人工确认"
+                    )
+                    review_raw_text = (
+                        _as_text(candidate.get("raw_text")) or source.raw_text
+                    )
+                    review_material_type = (
+                        _as_text(candidate.get("material_type")) or "unknown"
+                    )
+                    locator = _as_text(candidate.get("locator"))
+                    candidate_key = _hash(
+                        _canonical(
+                            {
+                                "source_hash": source.content_hash,
+                                "source_url": source.source_url,
+                                "locator": locator,
+                                "material_type": review_material_type,
+                                "raw_text": review_raw_text,
+                            }
+                        )
+                    )
+                    review_id = self.repository.record_review_item(
+                        source_id=source_id,
+                        candidate_key=candidate_key,
+                        material_type=review_material_type,
+                        locator=locator,
+                        raw_fragment=review_raw_text,
+                        proposed_structure=_structured_json(
+                            candidate.get("structured", {})
+                        ),
+                        review_reason=review_reason,
+                        now=self.clock(),
+                    )
                     items.append(
                         {
                             "index": index,
                             "status": "needs_review",
-                            "reason": _as_text(candidate.get("review_reason"))
-                            or "边界需要人工确认",
+                            "reason": review_reason,
+                            "review_id": review_id,
+                            "source_id": source_id,
+                            "locator": locator,
+                        }
+                    )
+                    review_items.append(
+                        {
+                            "id": review_id,
+                            "source_id": source_id,
+                            "locator": locator,
+                            "reason": review_reason,
                         }
                     )
                     continue
@@ -370,6 +421,9 @@ class LibraryService:
                                 "official_case"
                                 if candidate.get("trusted_official") is True
                                 else material_type
+                            ),
+                            "segmentation_version": structured.get(
+                                "case_segmentation_version", ""
                             ),
                         },
                     )
@@ -412,6 +466,7 @@ class LibraryService:
             "duplicate": duplicate,
             "failed": failed,
             "needs_review": needs_review,
+            "review_items": review_items,
             "items": items,
         }
 
@@ -421,11 +476,28 @@ class LibraryService:
         source: LibrarySource,
         candidates: list[dict[str, Any]],
         adapter_key: str,
+        source_item_key: str = "",
+        segmentation_version: str = "",
     ) -> dict[str, Any]:
         if adapter_key not in {"court_cases", "spp_cases"}:
             return _error(
                 "untrusted_source", "只有最高法或最高检受信来源可以创建官方案例"
             )
+        preserved_subjects: tuple[str, ...] = ()
+        if source_item_key:
+            with self.repository.connection:
+                prior_source_ids = self.repository.source_ids_by_metadata(
+                    created_by=source.created_by,
+                    key="source_item_key",
+                    value=source_item_key,
+                )
+                preserved_subjects = self.repository.manual_subjects_for_sources(
+                    prior_source_ids
+                )
+                self.repository.deactivate_items_for_sources(
+                    prior_source_ids, identity="official_case"
+                )
+                self.repository.supersede_review_items(prior_source_ids)
         normalized = []
         for candidate in candidates:
             item = dict(candidate)
@@ -433,7 +505,15 @@ class LibraryService:
             item["trusted_official"] = True
             structured = _structured_json(item.get("structured", {}))
             structured["adapter_key"] = adapter_key
+            if segmentation_version:
+                structured["case_segmentation_version"] = segmentation_version
+            if source_item_key:
+                structured["source_item_key"] = source_item_key
             item["structured"] = structured
+            candidate_subjects = _as_text_list(item.get("subjects", ""))
+            item["subjects"] = list(
+                dict.fromkeys((*candidate_subjects, *preserved_subjects))
+            )
             normalized.append(item)
         return await self.archive_material_batch(source=source, candidates=normalized)
 
@@ -473,6 +553,45 @@ class LibraryService:
                 if bundle is not None:
                     bundles.append(bundle)
         return bundles
+
+    async def list_review_items(
+        self,
+        *,
+        source_id: int | None = None,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if status not in {"pending", "resolved", "superseded"}:
+            return _error("invalid_review_status", "不支持的待复核状态")
+        try:
+            items = self.repository.list_review_items(
+                source_id=source_id, status=status, limit=limit
+            )
+        except (TypeError, ValueError):
+            return _error("invalid_limit", "limit 必须是整数")
+        return {
+            "success": True,
+            "count": len(items),
+            "items": [self._review_dict(item) for item in items],
+        }
+
+    async def get_review_item(self, review_id: int) -> dict[str, Any]:
+        try:
+            item = self.repository.get_review_item(int(review_id))
+        except (TypeError, ValueError):
+            return _error("invalid_review_id", "review_id 必须是整数")
+        if item is None:
+            return _error("not_found", f"未找到待复核条目：{review_id}")
+        return {"success": True, "item": self._review_dict(item)}
+
+    async def update_review_status(self, review_id: int, status: str) -> dict[str, Any]:
+        try:
+            changed = self.repository.update_review_status(int(review_id), str(status))
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_review_status", str(exc))
+        if not changed:
+            return _error("not_found", f"未找到待复核条目：{review_id}")
+        return await self.get_review_item(int(review_id))
 
     def set_official_case_subjects(
         self,
@@ -617,6 +736,23 @@ class LibraryService:
             "verification_status": item.verification_status,
             "created_by": item.created_by,
             "updated_at": item.updated_at.isoformat(),
+            "active": item.active,
+        }
+
+    @staticmethod
+    def _review_dict(item: Any) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "source_id": item.source_id,
+            "candidate_key": item.candidate_key,
+            "material_type": item.material_type,
+            "locator": item.locator,
+            "raw_fragment": item.raw_fragment,
+            "proposed_structure": item.proposed_structure,
+            "review_reason": item.review_reason,
+            "status": item.status,
+            "created_at": item.created_at.isoformat(),
+            "updated_at": item.updated_at.isoformat(),
         }
 
     @classmethod
@@ -651,6 +787,7 @@ class LibraryService:
                 "updated_at": item.updated_at.isoformat(),
                 "created_by": item.created_by,
                 "metadata": item.metadata,
+                "active": item.active,
             },
             "sources": sources,
             "source": sources[0] if sources else None,

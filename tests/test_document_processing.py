@@ -113,6 +113,78 @@ def test_multiple_questions_split_with_answers_and_locator(tmp_path):
     assert result.candidates[0]["locator"] == "第1行-第4行"
 
 
+def test_question_split_keeps_independent_answer_table_out_of_last_question(tmp_path):
+    path = tmp_path / "题目格式.txt"
+    path.write_text(
+        "1、单项选择题\n第一道题干\nA. 选项一\nB. 选项二\n"
+        "（二）多项选择题\n第二道题干\nA. 选项一\nB. 选项二\n"
+        "参考答案及解析\n（一）A\n2. AB\n",
+        encoding="utf-8",
+    )
+
+    result = segment_document(
+        extract_document(path), content_kind="real_question_candidate"
+    )
+
+    assert len(result.candidates) == 2
+    assert result.candidates[0]["structured"]["answer"] == "A"
+    assert result.candidates[1]["structured"]["answer"] == "AB"
+    assert "参考答案及解析" not in result.candidates[1]["structured"]["stem"]
+    assert "（一）A" not in result.candidates[1]["structured"]["stem"]
+    assert result.candidates[1]["locator"] == "第5行-第8行"
+    assert result.candidates[1]["structured"]["answer_locator"] == "第11行"
+
+
+def test_question_split_supports_inline_answers_and_no_answer_material(tmp_path):
+    inline = tmp_path / "逐题答案.txt"
+    inline.write_text(
+        "第 1 题 单选题\n题干\nA. 一\nB. 二\n答案：A\n"
+        "第 2 题 判断题\n判断内容\n答案：对\n",
+        encoding="utf-8",
+    )
+    without = tmp_path / "无答案.txt"
+    without.write_text(
+        "1. 单选题\n题干\nA. 一\nB. 二\n2. 简答题\n请说明理由。\n",
+        encoding="utf-8",
+    )
+
+    inline_result = segment_document(
+        extract_document(inline), content_kind="real_question_candidate"
+    )
+    without_result = segment_document(
+        extract_document(without), content_kind="real_question_candidate"
+    )
+
+    assert [item["structured"]["answer"] for item in inline_result.candidates] == [
+        "A",
+        "对",
+    ]
+    assert all(
+        "答案：" not in item["structured"]["stem"] for item in inline_result.candidates
+    )
+    assert all(
+        item.get("status") != "needs_review" for item in without_result.candidates
+    )
+
+
+def test_question_split_marks_unmatched_independent_answer_as_review(tmp_path):
+    path = tmp_path / "答案不完整.txt"
+    path.write_text(
+        "第1题 单选题\n题干一\nA. 一\nB. 二\n"
+        "第2题 单选题\n题干二\nA. 一\nB. 二\n"
+        "答案\n1 A\n",
+        encoding="utf-8",
+    )
+
+    result = segment_document(
+        extract_document(path), content_kind="real_question_candidate"
+    )
+
+    assert result.candidates[0].get("status") != "needs_review"
+    assert result.candidates[1]["status"] == "needs_review"
+    assert result.candidates[1]["structured"]["answer"] is None
+
+
 def test_official_three_case_article_excludes_intro_and_keeps_independent_items(
     tmp_path,
 ):
@@ -130,6 +202,53 @@ def test_official_three_case_article_excludes_intro_and_keeps_independent_items(
     assert len(result.candidates) == 3
     assert all(item["trusted_official"] is True for item in result.candidates)
     assert all("本期发布" not in item["raw_text"] for item in result.candidates)
+
+
+def test_official_single_case_without_case_number_heading_is_accepted(tmp_path):
+    path = tmp_path / "单案文章.txt"
+    path.write_text(
+        "张三商标侵权案\n"
+        "基本案情：甲公司主张商标侵权，双方发生争议。\n"
+        "裁判要旨：法院结合证据作出裁判。",
+        encoding="utf-8",
+    )
+
+    result = segment_official_cases(extract_document(path))
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["trusted_official"] is True
+    assert result.candidates[0]["title"] == "张三商标侵权案"
+
+
+def test_official_named_case_headings_split_without_numbered_case_labels(tmp_path):
+    path = tmp_path / "命名合集.txt"
+    path.write_text(
+        "甲公司商标侵权案\n甲公司与乙公司发生商标争议，法院作出裁判。\n"
+        "丙公司合同纠纷案\n丙公司与丁公司签订合同，法院认定违约。\n",
+        encoding="utf-8",
+    )
+
+    result = segment_official_cases(extract_document(path))
+
+    assert len(result.candidates) == 2
+    assert [item["title"] for item in result.candidates] == [
+        "甲公司商标侵权案",
+        "丙公司合同纠纷案",
+    ]
+
+
+def test_official_news_or_ambiguous_article_is_persisted_as_review_candidate(tmp_path):
+    path = tmp_path / "官方导语.txt"
+    path.write_text(
+        "本期发布三个典型案例。\n相关工作情况和新闻导语，没有完整案件正文。\n",
+        encoding="utf-8",
+    )
+
+    result = segment_official_cases(extract_document(path))
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["status"] == "needs_review"
+    assert result.candidates[0]["trusted_official"] is True
 
 
 def test_ambiguous_question_boundary_is_not_claimed_as_archived(tmp_path):
@@ -175,7 +294,7 @@ async def test_controlled_import_preserves_original_and_reloads_items(tmp_path):
     bundle = LibraryRepository(reopened.connection).get(result["items"][0]["item_id"])
     assert bundle is not None
     assert bundle.sources[0].id == source_id
-    assert bundle.source_links[0].locator == "第1行-第6行"
+    assert bundle.source_links[0].locator == "第1行-第4行"
     reopened.close()
 
 

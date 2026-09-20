@@ -85,7 +85,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 7
+    assert storage.schema_version == SCHEMA_VERSION == 8
     assert storage.count_events() == 0
     storage.close()
 
@@ -104,7 +104,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 7",
+        match=r"schema version 99 is newer than supported version 8",
     ):
         SQLiteStorage(db_path)
 
@@ -189,7 +189,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 7
+    assert storage.schema_version == SCHEMA_VERSION == 8
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -234,7 +234,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 7
+    assert storage.schema_version == SCHEMA_VERSION == 8
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -329,11 +329,11 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 7
+    assert reopened.schema_version == 8
     reopened.close()
 
 
-def test_storage_runs_the_v3_to_v7_migration_path(tmp_path) -> None:
+def test_storage_runs_the_v3_to_v8_migration_path(tmp_path) -> None:
     db_path = tmp_path / "v3.sqlite3"
     storage = SQLiteStorage(db_path)
     storage.close()
@@ -344,7 +344,7 @@ def test_storage_runs_the_v3_to_v7_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 7
+    assert migrated.schema_version == SCHEMA_VERSION == 8
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()
@@ -418,7 +418,7 @@ def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 7
+    assert storage.schema_version == SCHEMA_VERSION == 8
     assert [
         tuple(row)
         for row in storage.connection.execute(
@@ -440,5 +440,17 @@ def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None
             "SELECT COUNT(*) FROM library_sources WHERE content_hash = 'same-hash'"
         ).fetchone()[0]
         == 2
+    )
+    assert (
+        storage.connection.execute(
+            "SELECT active FROM learning_items WHERE id = 9"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        storage.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learning_review_items'"
+        ).fetchone()[0]
+        == "learning_review_items"
     )
     storage.close()

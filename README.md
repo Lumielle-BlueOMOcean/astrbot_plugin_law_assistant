@@ -98,7 +98,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `7`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。安装开发版前可按部署说明备份运行时数据库。
+当前 schema version 为 `8`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
 
 该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
 
@@ -125,6 +125,9 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law import <imports目录相对路径> [case|mock_question|real_question_candidate]
 /law plans [群名]
 /law question-import <JSON路径>
+/law review [来源ID]
+/law review-get <待复核ID>
+/law review-status <待复核ID> <pending|resolved|superseded>
 /law case-tag <案例ID> <方向...>
 /law laws
 /law help
@@ -193,9 +196,11 @@ data/plugin_data/astrbot_plugin_law_assistant/imports/
 
 `auto` 会根据题号或案例标题尝试确定类型；对无法可靠确定边界的片段会保留原件并标记 `needs_review`，不会凭空拆分或补写答案。导入支持 `.txt`、`.md`、标准 `.docx` 和文本型 `.pdf`，单文件默认上限 20 MB、PDF 200 页、提取文本 600000 字符、单次 100 个候选条目。旧版 `.doc`、扫描件/OCR 和 QQ 文件附件不在本轮实现范围。
 
+试卷拆分支持 `第1题`、`第 1 题`、`1、`、`1.`、`（一）` 等明确题号，以及文末“答案/参考答案/答案与解析”表和逐题附答案。独立答案表不计入题干定位；答案无法与题号确定对应时会创建持久化待复核记录。管理员可用 `/law review [来源ID]` 查看待复核条目，用 `/law review-get <ID>` 查看原文片段和定位，用 `/law review-status <ID> resolved` 或 `superseded` 维护状态。待复核候选不会进入普通题库或每日案例选择。
+
 原件复制到插件专属 `assets/<sha256>.<ext>`，数据库来源记录保存文件 hash、提取文本 hash、解析状态、警告和每个条目的定位。重复导入同一文件不会重复复制原件或生成相同条目；部分条目失败不会回滚已经成功归档的条目。安装或升级前应备份运行时 SQLite；安装包不覆盖现有数据库。
 
-最高法/最高检适配器取得的真实官方文章才可进入 `official_case` 入口。文章导语不会作为案件，能识别的每个“案例一/案例二”等独立条目均保留官方文章 URL 和文章内定位；边界不清的片段跳过发布。每日案例与手动案例预览只针对一个独立案例，案例卡片默认 1800 字符，超过预算且无法在证据约束下压缩时返回 `content_too_long`，不发送整篇合集。
+最高法/最高检适配器取得的真实官方文章才可进入 `official_case` 入口。文章导语不会作为案件；有明确单案标题和案情/裁判结构的文章可以形成一个条目，能识别的每个“案例一/案例二”等独立条目均保留官方文章 URL 和文章内定位；边界不清的片段会持久化为待复核并跳过发布。拆分规则版本变化后，同一官方来源会重新处理，旧的拆分条目停用但历史发送记录不补发；管理员人工方向标签会保留。每日案例与手动案例预览只针对一个独立案例，案例卡片默认 1800 字符，超过预算且无法在证据约束下压缩时返回 `content_too_long`，不发送整篇合集。
 
 ## Development
 

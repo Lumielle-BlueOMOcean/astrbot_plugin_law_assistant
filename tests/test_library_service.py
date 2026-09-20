@@ -416,6 +416,64 @@ async def test_batch_archive_preserves_locators_and_is_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_review_candidates_persist_across_restart_and_are_idempotent(tmp_path):
+    database = tmp_path / "library.sqlite3"
+    source = _batch_source()
+    candidates = [
+        {
+            "material_type": "real_question_candidate",
+            "title": "可归档题目",
+            "locator": "第1页/第1题",
+            "structured": {
+                "question_type": "单选",
+                "stem": "题干一",
+                "options": ["A", "B"],
+            },
+        },
+        {
+            "status": "needs_review",
+            "review_reason": "答案题号无法确认",
+            "material_type": "real_question_candidate",
+            "locator": "第1页/答案区",
+            "raw_text": "答案区原文 1 A 2 ?",
+            "structured": {"question_type": "single_choice"},
+        },
+    ]
+
+    storage = SQLiteStorage(database)
+    service = LibraryService(LibraryRepository(storage.connection))
+    first = await service.archive_material_batch(source=source, candidates=candidates)
+    assert first["archived"] == 1
+    assert first["needs_review"] == 1
+    review_id = first["review_items"][0]["id"]
+    storage.close()
+
+    reopened = SQLiteStorage(database)
+    reopened_service = LibraryService(LibraryRepository(reopened.connection))
+    listed = await reopened_service.list_review_items(source_id=first["source_id"])
+    assert listed["count"] == 1
+    assert listed["items"][0]["id"] == review_id
+    assert listed["items"][0]["raw_fragment"] == "答案区原文 1 A 2 ?"
+    assert listed["items"][0]["locator"] == "第1页/答案区"
+    assert listed["items"][0]["review_reason"] == "答案题号无法确认"
+
+    second = await reopened_service.archive_material_batch(
+        source=source, candidates=candidates
+    )
+    assert second["review_items"][0]["id"] == review_id
+    assert (
+        reopened.connection.execute(
+            "SELECT COUNT(*) FROM learning_review_items"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (await reopened_service.update_review_status(review_id, "resolved"))[
+        "success"
+    ]
+    reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_only_trusted_official_archive_can_create_official_case(tmp_path):
     storage, service = _service(tmp_path)
     source = _batch_source()

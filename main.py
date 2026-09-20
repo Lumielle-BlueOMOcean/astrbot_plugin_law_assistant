@@ -341,6 +341,23 @@ class LawAssistant(Star):
             text = _json_text(
                 await self.service.set_case_subjects(_safe_int(parts[2]), parts[3:])
             )
+        elif subcommand == "review":
+            source_id = _safe_int(parts[2]) if len(parts) > 2 else None
+            text = _json_text(
+                await self.service.list_learning_review_items(
+                    source_id=source_id if source_id and source_id > 0 else None
+                )
+            )
+        elif subcommand == "review-get" and len(parts) > 2:
+            text = _json_text(
+                await self.service.get_learning_review_item(_safe_int(parts[2]))
+            )
+        elif subcommand == "review-status" and len(parts) > 3:
+            text = _json_text(
+                await self.service.update_learning_review_status(
+                    _safe_int(parts[2]), parts[3]
+                )
+            )
         elif subcommand == "laws":
             text = _json_text(await self.service.list_law_updates())
         else:
@@ -853,6 +870,7 @@ class LawAssistant(Star):
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
             "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
+            "/law review [来源ID]、/law review-get <ID>、/law review-status <ID> <状态>、"
             "/law bind [当前群别名]、/law bind-umo <UMO> [群别名]、"
             "/law rename <目标> <新别名>、/law publish <id> [群名]、"
             "/law confirm <token>、/law help"

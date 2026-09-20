@@ -18,7 +18,7 @@ else:
     from daily_plans import DailyPlan
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -553,6 +553,43 @@ def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_7_to_8(connection: sqlite3.Connection) -> None:
+    """Track active split results and persist candidates needing review."""
+    _add_column_if_missing(
+        connection, "learning_items", "active", "INTEGER NOT NULL DEFAULT 1"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS learning_review_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+            candidate_key TEXT NOT NULL,
+            material_type TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            raw_fragment TEXT NOT NULL,
+            proposed_structure_json TEXT NOT NULL,
+            review_reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source_id, candidate_key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_learning_review_items_source
+            ON learning_review_items(source_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_learning_review_items_status
+            ON learning_review_items(status)
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -561,6 +598,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: _migrate_4_to_5,
     5: _migrate_5_to_6,
     6: _migrate_6_to_7,
+    7: _migrate_7_to_8,
 }
 
 

@@ -20,7 +20,10 @@ if __package__ and "." in __package__:
     )
     from .daily_plans import DailyPlan
     from .document_extractors import DocumentSegment, ParsedDocument
-    from .learning_segmentation import segment_official_cases
+    from .learning_segmentation import (
+        CASE_SEGMENTATION_VERSION,
+        segment_official_cases,
+    )
     from .learning_service import LearningService
     from .library_models import LibrarySource
     from .library_service import LibraryService
@@ -38,7 +41,7 @@ else:
     )
     from daily_plans import DailyPlan
     from document_extractors import DocumentSegment, ParsedDocument
-    from learning_segmentation import segment_official_cases
+    from learning_segmentation import CASE_SEGMENTATION_VERSION, segment_official_cases
     from learning_service import LearningService
     from library_models import LibrarySource
     from library_service import LibraryService
@@ -94,6 +97,14 @@ class ContentReference:
     session_origin: str
     created_at: datetime
     expires_at: datetime
+
+
+def _case_needs_reprocessing(document: SourceDocument) -> bool:
+    metadata = document.metadata
+    return (
+        metadata.get("case_segmentation_version") != CASE_SEGMENTATION_VERSION
+        or metadata.get("case_processing_status") != "success"
+    )
 
 
 class LawAssistantService:
@@ -310,18 +321,39 @@ class LawAssistantService:
                         previous = self.storage.get_source_document(
                             document.source_key, document.source_item_key
                         )
-                        if previous and previous.content_hash == document.content_hash:
+                        if (
+                            previous
+                            and previous.content_hash == document.content_hash
+                            and (
+                                source_type != "case"
+                                or not _case_needs_reprocessing(previous)
+                            )
+                        ):
                             continue
                         item = await _maybe_await(extractor.extract(document))
+                        processing_status = "success"
                         if item is not None:
-                            await _maybe_await(
+                            outcome = await _maybe_await(
                                 handler(item, document=document, source_key=key)
                                 if source_type == "case"
                                 else handler(item)
                             )
+                            if source_type == "case" and isinstance(outcome, dict):
+                                processing_status = str(
+                                    outcome.get("processing_status") or "success"
+                                )
                             count += 1
                         # Keep the last successfully processed document so a failed
                         # extraction can be retried on the next scan.
+                        if source_type == "case":
+                            metadata = dict(document.metadata)
+                            metadata.update(
+                                {
+                                    "case_segmentation_version": CASE_SEGMENTATION_VERSION,
+                                    "case_processing_status": processing_status,
+                                }
+                            )
+                            document = replace(document, metadata=metadata)
                         self.storage.upsert_source_document(document)
                     total += count
                     self.storage.record_source_run(
@@ -366,10 +398,10 @@ class LawAssistantService:
         *,
         document: SourceDocument | None = None,
         source_key: str = "",
-    ) -> None:
+    ) -> dict[str, Any]:
         self.storage.upsert_case_item(item)
         if self.library_service is None or document is None:
-            return
+            return {"processing_status": "success"}
         parsed = ParsedDocument(
             path=Path(f"{document.source_item_key}.html"),
             original_filename=document.title or f"{document.source_item_key}.html",
@@ -401,13 +433,29 @@ class LawAssistantService:
                 "adapter_key": source_key or item.source_key,
                 "source_item_key": item.source_item_key,
                 "authority": item.authority,
+                "case_segmentation_version": CASE_SEGMENTATION_VERSION,
             },
         )
-        await self.library_service.archive_official_cases(
+        result = await self.library_service.archive_official_cases(
             source=source,
             candidates=candidates,
             adapter_key=source_key or item.source_key,
+            source_item_key=item.source_item_key,
+            segmentation_version=CASE_SEGMENTATION_VERSION,
         )
+        return {
+            "processing_status": (
+                "needs_review"
+                if split.warnings
+                or any(
+                    str(candidate.get("status") or "").lower()
+                    in {"needs_review", "review"}
+                    for candidate in split.candidates
+                )
+                else "success"
+            ),
+            "archive_result": result,
+        }
 
     def _store_law_update(self, item: LawUpdate) -> None:
         self.storage.upsert_law_update(item)
@@ -1228,6 +1276,43 @@ class LawAssistantService:
                 "message": "学习资料库服务不可用",
             }
         return await self.library_service.update_learning_item(item_id, changes)
+
+    async def list_learning_review_items(
+        self,
+        *,
+        source_id: int | None = None,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.list_review_items(
+            source_id=source_id, status=status, limit=limit
+        )
+
+    async def get_learning_review_item(self, review_id: int) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.get_review_item(review_id)
+
+    async def update_learning_review_status(
+        self, review_id: int, status: str
+    ) -> dict[str, Any]:
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.update_review_status(review_id, status)
 
     async def generate_question(
         self,

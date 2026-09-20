@@ -229,6 +229,147 @@ async def test_official_case_collection_is_split_into_independent_library_cases(
 
 
 @pytest.mark.asyncio
+async def test_official_case_reprocesses_when_segmentation_version_changes(tmp_path):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    library = LibraryService(LibraryRepository(storage.connection))
+    document = SourceDocument(
+        source_key="court_cases",
+        source_item_key="collection-reprocess",
+        url="https://court.example/collection-reprocess",
+        title="三个典型案例",
+        content=(
+            "导语\n"
+            "案例一：知识产权纠纷\n甲公司主张商标侵权，法院依法裁判。\n"
+            "案例二：合同纠纷\n乙公司与丙公司签订合同，法院认定违约。\n"
+            "案例三：司法实务\n检察机关依法审查起诉并提出建议。"
+        ),
+        fetched_at="2026-09-18T00:00:00+00:00",
+        metadata={
+            "case_segmentation_version": "1",
+            "case_processing_status": "success",
+        },
+    )
+    old_source = LibrarySource(
+        source_kind="official_article",
+        title=document.title,
+        raw_text=document.content,
+        source_url=document.url,
+        content_hash=document.content_hash,
+        created_at=datetime(2026, 9, 18, tzinfo=ZoneInfo("Asia/Shanghai")),
+        created_by="source:court_cases",
+        session_origin="source:court_cases",
+        metadata={
+            "adapter_key": "court_cases",
+            "source_item_key": document.source_item_key,
+            "case_segmentation_version": "1",
+        },
+    )
+    old = await library.archive_official_cases(
+        source=old_source,
+        candidates=[
+            {
+                "title": "旧规则合并条目",
+                "locator": "文章全文",
+                "raw_text": document.content,
+                "structured": {"case_summary": "旧规则错误合并"},
+            }
+        ],
+        adapter_key="court_cases",
+        source_item_key=document.source_item_key,
+        segmentation_version="1",
+    )
+    storage.upsert_source_document(document)
+
+    class Extractor:
+        calls = 0
+
+        async def extract(self, source_document):
+            self.calls += 1
+            return CaseItem(
+                source_key=source_document.source_key,
+                source_item_key=source_document.source_item_key,
+                title=source_document.title,
+                source_url=source_document.url,
+                authority="最高人民法院",
+                raw_text=source_document.content,
+                content_hash=source_document.content_hash,
+            )
+
+    extractor = Extractor()
+    service = LawAssistantService(
+        storage,
+        case_sources=[(FakeAdapter("court_cases", [document]), extractor)],
+        library_service=library,
+    )
+
+    first = await service.scan_cases()
+    assert first["failures"] == []
+    assert extractor.calls == 1
+    official = await library.list_official_cases()
+    assert official["count"] == 3
+    old_bundle = await library.get_learning_item(old["items"][0]["item_id"])
+    assert old_bundle["item"]["active"] is False
+
+    await service.scan_cases()
+    assert extractor.calls == 1
+    assert (await library.list_official_cases())["count"] == 3
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_official_case_manual_subject_survives_resegmentation(tmp_path):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    library = LibraryService(LibraryRepository(storage.connection))
+    first_document = SourceDocument(
+        source_key="court_cases",
+        source_item_key="single-reprocess",
+        url="https://court.example/single-reprocess",
+        title="张三商标侵权案",
+        content="张三商标侵权案\n基本案情：甲公司主张商标侵权。\n裁判要旨：法院依法裁判。",
+        fetched_at="2026-09-18T00:00:00+00:00",
+    )
+    second_document = SourceDocument(
+        source_key=first_document.source_key,
+        source_item_key=first_document.source_item_key,
+        url=first_document.url,
+        title=first_document.title,
+        content="张三商标侵权案\n基本案情：甲公司主张商标侵权，补充证据。\n裁判要旨：法院依法裁判。",
+        fetched_at="2026-09-19T00:00:00+00:00",
+    )
+
+    class Extractor:
+        async def extract(self, document):
+            return CaseItem(
+                source_key=document.source_key,
+                source_item_key=document.source_item_key,
+                title=document.title,
+                source_url=document.url,
+                authority="最高人民法院",
+                raw_text=document.content,
+                content_hash=document.content_hash,
+            )
+
+    adapter = FakeAdapter("court_cases", [first_document])
+    service = LawAssistantService(
+        storage,
+        case_sources=[(adapter, Extractor())],
+        library_service=library,
+    )
+    await service.scan_cases()
+    legacy = storage.list_case_items()[0]
+    tagged = await service.set_case_subjects(legacy.id, ["知识产权"])
+    assert tagged["official_case_items_updated"] == 1
+
+    adapter.documents = [second_document]
+    await service.scan_cases()
+
+    official = await library.list_official_cases(subject="知识产权")
+    assert official["count"] == 1
+    assert official["items"][0]["subjects"] == ["intellectual_property"]
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_daily_case_uses_one_independent_library_case_and_card_budget(tmp_path):
     storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
     library = LibraryService(LibraryRepository(storage.connection))
