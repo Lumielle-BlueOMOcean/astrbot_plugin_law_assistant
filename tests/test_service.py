@@ -686,3 +686,86 @@ async def test_daily_plan_fixed_to_random_survives_preview_confirmation_and_relo
     loaded = reloaded.get_daily_plan(target["id"], "daily_question")
     assert loaded is not None
     assert loaded.question_type_selection_mode == "random"
+
+
+@pytest.mark.asyncio
+async def test_daily_plan_reset_preview_uses_global_plan_and_rejects_stale_token(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: datetime(2026, 9, 21, 1, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    target = await service.bind_target("aiocqhttp:group:100", "法硕一群")
+    global_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "enabled": True,
+            "selection_mode": "rotation",
+            "rotation_subjects": ["intellectual_property", "civil_commercial"],
+            "rotation_start_date": "2026-09-21",
+        },
+    )
+    target_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {"enabled": True, "selection_mode": "fixed", "fixed_subject": "criminal_law"},
+    )
+    storage.upsert_daily_plan(global_plan)
+    storage.upsert_daily_plan(target_plan, target["id"])
+
+    prepared = await service.prepare_daily_plan_override_removal(
+        target_selectors=["法硕一群"],
+        content_type="daily_question",
+        actor_id="operator-1",
+    )
+
+    assert prepared["ready"] is True
+    assert prepared["target"]["id"] == target["id"]
+    assert prepared["target"]["label"] == "法硕一群"
+    assert prepared["content_types"] == ["daily_question"]
+    assert prepared["current_plans"][0]["plan"]["fixed_subject"] == "criminal_law"
+    assert prepared["restored_plans"][0]["plan"]["selection_mode"] == "rotation"
+    assert prepared["restored_plans"][0]["preview"][0]["subject"] == (
+        "intellectual_property"
+    )
+    assert len(prepared["restored_plans"][0]["preview"]) == 14
+    assert storage.get_daily_plan(target["id"], "daily_question") is not None
+
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "enabled": True,
+                "selection_mode": "rotation",
+                "rotation_subjects": ["economic_law", "civil_commercial"],
+                "rotation_start_date": "2026-09-21",
+            },
+        )
+    )
+    stale = await service.confirm_daily_plan_override_removal(
+        prepared["token"], actor_id="operator-1"
+    )
+    assert stale == {
+        "success": False,
+        "reason": "全局计划在准备后已变化，请重新预览",
+    }
+    assert storage.get_daily_plan(target["id"], "daily_question") is not None
+
+    refreshed = await service.prepare_daily_plan_override_removal(
+        target_selectors=["法硕一群"],
+        content_type="daily_question",
+        actor_id="operator-1",
+    )
+    confirmed = await service.confirm_daily_plan_override_removal(
+        refreshed["token"], actor_id="operator-1"
+    )
+    assert confirmed == {"success": True, "content_types": ["daily_question"]}
+    assert storage.get_daily_plan(target["id"], "daily_question") is None
+    restored = service.effective_daily_plan(target["id"], "daily_question")
+    assert restored.rotation_subjects == ("economic_law", "civil_commercial")
+    replay = await service.confirm_daily_plan_override_removal(
+        refreshed["token"], actor_id="operator-1"
+    )
+    assert replay["success"] is False

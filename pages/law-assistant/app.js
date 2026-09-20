@@ -35,9 +35,15 @@ const state = {
   libraryItemId: null,
   historyTab: "daily",
 };
+const PAGE_I18N_NAMESPACE = "pages.law-assistant.";
 
 function t(key, fallback) {
-  return bridge && typeof bridge.t === "function" ? bridge.t(key, fallback) : fallback;
+  if (!bridge || typeof bridge.t !== "function") return fallback;
+  const rawKey = String(key || "");
+  const pageKey = rawKey.startsWith(PAGE_I18N_NAMESPACE)
+    ? rawKey
+    : `${PAGE_I18N_NAMESPACE}${rawKey}`;
+  return bridge.t(pageKey, fallback);
 }
 
 function node(tag, text, className) {
@@ -441,6 +447,38 @@ function renderPlanConfirmation(container, prepared, onDone, confirmEndpoint = "
   panel.append(confirm, button(t("page.actions.cancel", "取消"), () => panel.remove())); container.prepend(panel);
 }
 
+function renderPlanResetConfirmation(container, prepared, onDone) {
+  const target = prepared.target || {};
+  const targetLabel = target.label || "未命名群";
+  const contentTypes = (prepared.content_types || []).join("、");
+  const panel = node("article", undefined, "confirm-panel");
+  panel.append(
+    node("h3", t("page.plans.restorePreview", "恢复全局计划预览")),
+    node("p", prepared.notice || t("page.plans.restoreNotice", "确认前不会写入配置。")),
+    keyValueRows({
+      [t("page.plans.target", "操作目标")]: `${targetLabel} #${target.id}（${target.unified_msg_origin || "UMO 未提供"}）`,
+      [t("page.plans.contentTypes", "内容类型")]: contentTypes,
+    }),
+  );
+  panel.append(node("h3", t("page.plans.current", "当前计划")));
+  (prepared.current_plans || []).forEach((entry) => {
+    panel.append(node("p", `${entry.content_type}：${planSummary(entry.plan)}`));
+    panel.append(table(entry.preview || [], [["date", "日期"], ["subject", "方向", (row) => node("span", subjectLabel(row.subject))], ["question_type", "题型"], ["origin", "来源"]]));
+  });
+  panel.append(node("h3", t("page.plans.restored", "操作后计划（全局计划）")));
+  (prepared.restored_plans || []).forEach((entry) => {
+    panel.append(node("p", `${entry.content_type}：${planSummary(entry.plan)}`));
+    panel.append(table(entry.preview || [], [["date", "日期"], ["subject", "方向", (row) => node("span", subjectLabel(row.subject))], ["question_type", "题型"], ["origin", "来源"]]));
+  });
+  const confirm = button(t("page.actions.confirm", "确认应用"), async () => {
+    confirm.disabled = true;
+    try { await apiPost("plans/reset-confirm", { token: prepared.token }); setFlash(t("page.plans.restoredSuccess", "已恢复全局计划")); await onDone(); }
+    catch (error) { setFlash(error.message, true); confirm.disabled = false; }
+  }, "primary");
+  panel.append(confirm, button(t("page.actions.cancel", "取消"), () => panel.remove()));
+  container.prepend(panel);
+}
+
 async function renderPlans() {
   const view = document.getElementById("view-plans"); view.replaceChildren(sectionTitle(t("page.nav.plans", "每日计划"), "全局默认与群级覆盖分别管理；页面不自行计算轮换。"));
   try {
@@ -448,7 +486,7 @@ async function renderPlans() {
     const renderPlan = (container, scope, target, contentType, entry, title) => {
       const card = node("article", undefined, "plan-card"); card.append(node("h3", title), node("p", entry.override ? "群级覆盖" : "继承全局"));
       card.append(planForm(contentType, entry.plan, async (changes) => { try { const prepared = await apiPost("plans/prepare", { scope, target, content_type: contentType, changes }); renderPlanConfirmation(card, prepared, renderPlans); } catch (error) { setFlash(error.message, true); } }));
-      if (scope === "target" && entry.override) card.append(button("恢复全局计划", async () => { try { const prepared = await apiPost("plans/reset-prepare", { target, content_type: contentType }); renderPlanConfirmation(card, { notice: prepared.notice, plans: [{ plan: entry.plan, preview: entry.preview }], token: prepared.token }, renderPlans, "plans/reset-confirm"); } catch (error) { setFlash(error.message, true); } }));
+      if (scope === "target" && entry.override) card.append(button(t("page.plans.restoreGlobal", "恢复全局计划"), async () => { try { const prepared = await apiPost("plans/reset-prepare", { target, content_type: contentType }); renderPlanResetConfirmation(card, prepared, renderPlans); } catch (error) { setFlash(error.message, true); } }));
       container.append(card);
     };
     const global = node("div"); global.append(sectionTitle("全局默认", "Daily Case 与 Daily Question 独立保存。"));
@@ -494,9 +532,17 @@ async function navigate(route) { state.route = labels[route] ? route : "overview
 async function init() {
   if (!bridge) { setFlash("AstrBot Plugin Page Bridge 不可用", true); return; }
   await bridge.ready(); state.context = bridge.getContext?.() || {};
-  const updateContext = (context) => { state.context = context || {}; document.documentElement.dataset.theme = state.context.isDark ? "dark" : "light"; document.getElementById("context-badge").textContent = state.context.locale || "Dashboard"; renderNavigation(); };
+  let pageInitialized = false;
+  const updateContext = (context) => {
+    state.context = context || {};
+    document.documentElement.dataset.theme = state.context.isDark ? "dark" : "light";
+    document.getElementById("context-badge").textContent = state.context.locale || "Dashboard";
+    renderNavigation();
+    if (pageInitialized) renderRoute().catch((error) => setFlash(error.message, true));
+  };
   updateContext(state.context); bridge.onContext?.(updateContext);
   const requested = window.location.hash.slice(1); state.route = labels[requested] ? requested : "overview"; await renderRoute();
+  pageInitialized = true;
 }
 
 window.addEventListener("hashchange", () => navigate(window.location.hash.slice(1)));

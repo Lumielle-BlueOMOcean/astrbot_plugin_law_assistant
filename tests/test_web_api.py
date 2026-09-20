@@ -8,6 +8,7 @@ import pytest
 from quart import Quart
 from werkzeug.datastructures import FileStorage
 
+from daily_plans import DailyPlan
 from document_ingestion import DocumentIngestionService
 from library_repository import LibraryRepository
 from library_service import LibraryService
@@ -179,6 +180,50 @@ async def test_web_plan_prepare_does_not_persist_before_confirm(tmp_path):
         assert (await confirmed.get_json())["success"] is True
         assert service.storage.get_daily_plan(1, "daily_question") is not None
 
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_plan_reset_preview_returns_current_and_global_plans(tmp_path):
+    service = _service(tmp_path)
+    target = await service.bind_target("aiocqhttp:group:100", "法硕一群")
+    service.storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "enabled": True,
+                "selection_mode": "rotation",
+                "rotation_subjects": ["intellectual_property", "civil_commercial"],
+                "rotation_start_date": "2026-09-21",
+            },
+        )
+    )
+    service.storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "enabled": True,
+                "selection_mode": "fixed",
+                "fixed_subject": "criminal_law",
+            },
+        ),
+        target["id"],
+    )
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        response = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/plans/reset-prepare",
+            json={"target": "1", "content_type": "daily_question"},
+        )
+        payload = await response.get_json()
+
+    assert payload["success"] is True
+    data = payload["data"]
+    assert data["target"]["id"] == target["id"]
+    assert data["current_plans"][0]["plan"]["fixed_subject"] == "criminal_law"
+    assert data["restored_plans"][0]["plan"]["selection_mode"] == "rotation"
+    assert len(data["restored_plans"][0]["preview"]) == 14
     service.storage.close()
 
 

@@ -106,6 +106,7 @@ class PendingPlanUpdate:
 class PendingPlanReset:
     target_id: int | None
     content_types: tuple[str, ...]
+    global_plans: tuple[DailyPlan, ...]
     created_at: datetime
     expires_at: datetime
     owner_id: str | None = None
@@ -1076,11 +1077,38 @@ class LawAssistantService:
         )
         if any(item not in {"daily_case", "daily_question"} for item in content_types):
             return {"ready": False, "reason": "content_type 参数无效"}
+        local_today = _local_datetime(
+            self._now_utc(), getattr(self.config, "timezone", "Asia/Shanghai")
+        ).date()
+        current_plans = []
+        restored_plans = []
+        global_plans: list[DailyPlan] = []
+        for item in content_types:
+            current_plan = self.effective_daily_plan(int(targets[0]["id"]), item)
+            global_plan = self.effective_daily_plan(None, item)
+            current_plans.append(
+                {
+                    "content_type": item,
+                    "plan": current_plan.to_mapping(),
+                    "preview": current_plan.preview(
+                        local_today, 14, target_id=int(targets[0]["id"])
+                    ),
+                }
+            )
+            restored_plans.append(
+                {
+                    "content_type": item,
+                    "plan": global_plan.to_mapping(),
+                    "preview": global_plan.preview(local_today, 14, target_id=None),
+                }
+            )
+            global_plans.append(global_plan)
         token = secrets.token_urlsafe(12)
         now = self._now_utc()
         self._plan_reset_confirmations[token] = PendingPlanReset(
             target_id=int(targets[0]["id"]),
             content_types=content_types,
+            global_plans=tuple(global_plans),
             created_at=now,
             expires_at=now + timedelta(minutes=10),
             owner_id=actor_id,
@@ -1090,6 +1118,8 @@ class LawAssistantService:
             "token": token,
             "target": targets[0],
             "content_types": list(content_types),
+            "current_plans": current_plans,
+            "restored_plans": restored_plans,
             "notice": "恢复全局计划只会在明确确认后执行。",
         }
 
@@ -1107,6 +1137,15 @@ class LawAssistantService:
         target = self.storage.get_target(pending.target_id)
         if target is None:
             return {"success": False, "reason": "目标群不存在"}
+        for content_type, expected_plan in zip(
+            pending.content_types, pending.global_plans, strict=True
+        ):
+            current_global = self.effective_daily_plan(None, content_type)
+            if current_global.to_mapping() != expected_plan.to_mapping():
+                return {
+                    "success": False,
+                    "reason": "全局计划在准备后已变化，请重新预览",
+                }
         for content_type in pending.content_types:
             self.storage.delete_daily_plan(pending.target_id, content_type)
         return {"success": True, "content_types": list(pending.content_types)}
