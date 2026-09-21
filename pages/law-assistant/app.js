@@ -130,14 +130,14 @@ function setFlash(message, error = false) {
 
 async function apiGet(endpoint, params = {}) {
   const result = await bridge.apiGet(endpoint, params);
-  if (!result || result.success === false) throw new Error(result?.message || t("page.error.request", "请求失败"));
-  return result.data;
+  if (result == null || result.success === false) throw new Error(result?.message || t("page.error.request", "请求失败"));
+  return result;
 }
 
 async function apiPost(endpoint, body = {}) {
   const result = await bridge.apiPost(endpoint, body);
-  if (!result || result.success === false) throw new Error(result?.message || t("page.error.request", "请求失败"));
-  return result.data;
+  if (result == null || result.success === false) throw new Error(result?.message || t("page.error.request", "请求失败"));
+  return result;
 }
 
 function renderNavigation() {
@@ -337,8 +337,8 @@ async function renderImports(view) {
     upload.disabled = true;
     try {
       const staged = await bridge.upload("files/stage", file.files[0]);
-      if (!staged?.success) throw new Error(staged?.message || "文件 staging 失败");
-      const prepared = await apiPost("imports/prepare", { staged_path: staged.data.staged_path, original_filename: staged.data.original_filename, content_kind: kind.value });
+      if (staged == null || staged.success === false) throw new Error(staged?.message || "文件 staging 失败");
+      const prepared = await apiPost("imports/prepare", { staged_path: staged.staged_path, original_filename: staged.original_filename, content_kind: kind.value });
       renderImportPreview(box, prepared);
     } catch (error) { setFlash(error.message, true); } finally { upload.disabled = false; }
   }, "primary");
