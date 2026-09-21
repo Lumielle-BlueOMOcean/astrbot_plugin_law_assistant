@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from daily_plans import DailyPlan
+from daily_resolver import resolve_daily_constraints
 from models import CaseItem, SourceDocument
 from service import LawAssistantService
 from storage import SQLiteStorage
@@ -769,3 +770,103 @@ async def test_daily_plan_reset_preview_uses_global_plan_and_rejects_stale_token
         refreshed["token"], actor_id="operator-1"
     )
     assert replay["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_daily_plan_reset_preview_uses_target_id_for_random_global_resolution(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: datetime(2026, 9, 21, 1, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    target = await service.bind_target("aiocqhttp:group:100", "法硕一群")
+    other_target = await service.bind_target("aiocqhttp:group:200", "法硕二群")
+    global_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "enabled": True,
+            "selection_mode": "random",
+            "question_origin": "random",
+            "question_type_selection_mode": "random",
+        },
+    )
+    target_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "enabled": True,
+            "selection_mode": "fixed",
+            "fixed_subject": "criminal_law",
+            "question_type_selection_mode": "fixed",
+            "fixed_question_type": "single_choice",
+        },
+    )
+    other_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "enabled": True,
+            "selection_mode": "fixed",
+            "fixed_subject": "economic_law",
+            "question_type_selection_mode": "fixed",
+            "fixed_question_type": "true_false",
+        },
+    )
+    storage.upsert_daily_plan(global_plan)
+    storage.upsert_daily_plan(target_plan, target["id"])
+    storage.upsert_daily_plan(other_plan, other_target["id"])
+    local_today = date(2026, 9, 21)
+
+    global_preview_before = global_plan.preview(local_today, 14, target_id=None)
+    other_preview_before = other_plan.preview(
+        local_today, 14, target_id=other_target["id"]
+    )
+    prepared = await service.prepare_daily_plan_override_removal(
+        target_selectors=["法硕一群"],
+        content_type="daily_question",
+        actor_id="operator-1",
+    )
+
+    restored_preview = prepared["restored_plans"][0]["preview"]
+    expected_preview = [
+        {
+            "date": (local_today + timedelta(days=offset)).isoformat(),
+            **resolve_daily_constraints(
+                global_plan,
+                local_today + timedelta(days=offset),
+                target_id=target["id"],
+                content_type="daily_question",
+            ),
+        }
+        for offset in range(14)
+    ]
+    assert restored_preview == expected_preview
+    assert restored_preview != global_preview_before
+    assert global_plan.preview(local_today, 14, target_id=None) == global_preview_before
+    assert other_plan.preview(local_today, 14, target_id=other_target["id"]) == (
+        other_preview_before
+    )
+
+    confirmed = await service.confirm_daily_plan_override_removal(
+        prepared["token"], actor_id="operator-1"
+    )
+    assert confirmed["success"] is True
+    effective = service.effective_daily_plan(target["id"], "daily_question")
+    assert effective.to_mapping() == global_plan.to_mapping()
+    assert [
+        {
+            "date": (local_today + timedelta(days=offset)).isoformat(),
+            **resolve_daily_constraints(
+                effective,
+                local_today + timedelta(days=offset),
+                target_id=target["id"],
+                content_type="daily_question",
+            ),
+        }
+        for offset in range(14)
+    ] == restored_preview
+    assert (
+        service.effective_daily_plan(other_target["id"], "daily_question").to_mapping()
+        == other_plan.to_mapping()
+    )

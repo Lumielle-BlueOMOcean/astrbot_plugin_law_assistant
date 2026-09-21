@@ -1099,7 +1099,9 @@ class LawAssistantService:
                 {
                     "content_type": item,
                     "plan": global_plan.to_mapping(),
-                    "preview": global_plan.preview(local_today, 14, target_id=None),
+                    "preview": global_plan.preview(
+                        local_today, 14, target_id=int(targets[0]["id"])
+                    ),
                 }
             )
             global_plans.append(global_plan)
