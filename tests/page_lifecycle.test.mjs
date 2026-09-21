@@ -134,7 +134,9 @@ test("stale Targets and Plans responses do not duplicate visible cards", async (
   await secondPlans;
   resolvePlans({ global: {}, targets: [] });
   await firstPlans;
-  assert.equal((textOf(elements.get("view-plans")).match(/全局默认/g) || []).length, 1);
+  // The heading and its description each contain this phrase; a stale render
+  // would append a second pair and therefore produce four occurrences.
+  assert.equal((textOf(elements.get("view-plans")).match(/全局默认/g) || []).length, 2);
 });
 
 test("navigate plus hashchange performs one effective route render", async () => {
