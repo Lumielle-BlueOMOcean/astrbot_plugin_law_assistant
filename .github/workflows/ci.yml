@@ -10,6 +10,10 @@ jobs:
     name: Quality / Unit
     runs-on: ubuntu-latest
     steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Set up Python 3.12
@@ -26,6 +30,8 @@ jobs:
         run: ruff check .
       - name: Unit tests
         run: pytest
+      - name: Frontend lifecycle tests
+        run: node --test tests/page_lifecycle.test.mjs
       - name: Diff check
         run: git show --check --format= HEAD
 

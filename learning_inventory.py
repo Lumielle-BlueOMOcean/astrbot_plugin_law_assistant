@@ -166,6 +166,7 @@ class LearningContentProvider:
             question_type=request.question_type,
             source_name=request.source_name,
             exam_year=request.exam_year,
+            limit=None,
         )
         real_candidates = [
             question
@@ -340,7 +341,7 @@ class LearningContentProvider:
             item_type="question",
             identity="mock_question",
             subject=subject or "",
-            limit=500,
+            limit=None,
         )
         result = []
         for item in normalized:

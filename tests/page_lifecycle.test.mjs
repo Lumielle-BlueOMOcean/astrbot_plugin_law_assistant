@@ -1,0 +1,156 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+import vm from "node:vm";
+
+class FakeElement {
+  constructor(tag = "div") {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.hidden = false;
+    this.value = "";
+    this.files = [];
+    this.listeners = {};
+    this.classList = { toggle() {} };
+  }
+
+  append(...children) { this.children.push(...children.flat().filter(Boolean)); }
+  prepend(...children) { this.children.unshift(...children.flat().filter(Boolean)); }
+  replaceChildren(...children) { this.children = children.flat().filter(Boolean); }
+  remove() { this.removed = true; }
+  addEventListener(name, handler) { this.listeners[name] = handler; }
+  setAttribute() {}
+}
+
+function textOf(value) {
+  if (!value) return "";
+  return `${value.textContent || ""}${(value.children || []).map(textOf).join("")}`;
+}
+
+async function loadPage() {
+  const elements = new Map();
+  for (const id of ["flash", "navigation", "context-badge", "view-overview", "view-library", "view-plans", "view-targets", "view-history"]) {
+    const element = new FakeElement();
+    element.id = id;
+    elements.set(id, element);
+  }
+  const bridge = {
+    async ready() { return new Promise(() => {}); },
+    async apiGet() { return { plugin: { version: "bridge" } }; },
+    async apiPost() { return { ok: true }; },
+    t(key, fallback) { return fallback || key; },
+  };
+  const handlers = {};
+  const window = {
+    AstrBotPluginPage: bridge,
+    location: { hash: "#overview" },
+    addEventListener(name, handler) { handlers[name] = handler; },
+  };
+  const document = {
+    documentElement: { dataset: {} },
+    createElement(tag) { return new FakeElement(tag); },
+    getElementById(id) { return elements.get(id) || new FakeElement(); },
+    querySelectorAll(selector) { return selector === ".view" ? [...elements.values()].filter((item) => item.id?.startsWith("view-")) : []; },
+  };
+  const context = { window, document, Node: FakeElement, URL, console, setTimeout, clearTimeout, globalThis: null, __LAW_ASSISTANT_TEST__: true };
+  context.globalThis = context;
+  vm.runInNewContext(
+    await readFile(new URL("../pages/law-assistant/app.js", import.meta.url), "utf8"),
+    context,
+    { filename: "pages/law-assistant/app.js" },
+  );
+  return { bridge, elements, handlers, window, page: context.__lawAssistantTest };
+}
+
+test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async () => {
+  const { bridge, page } = await loadPage();
+  bridge.apiGet = async () => ({ plugin: { version: "0.3.0" } });
+  bridge.apiPost = async () => ({ success: false, message: "业务失败" });
+  assert.deepEqual(await page.apiGet("overview"), { plugin: { version: "0.3.0" } });
+  await assert.rejects(() => page.apiPost("plans/prepare"), /业务失败/);
+});
+
+test("stale asynchronous overview render cannot overwrite the newest generation", async () => {
+  const { bridge, elements, page } = await loadPage();
+  let resolveFirst;
+  bridge.apiGet = async () => new Promise((resolve) => { resolveFirst = resolve; });
+  page.state.route = "overview";
+  page.state.renderGeneration = 1;
+  const first = page.renderOverview();
+  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 9 });
+  page.state.renderGeneration = 2;
+  const second = page.renderOverview();
+  await second;
+  resolveFirst({ plugin: { version: "stale" }, schema_version: 1 });
+  await first;
+  assert.match(textOf(elements.get("view-overview")), /new/);
+  assert.doesNotMatch(textOf(elements.get("view-overview")), /stale/);
+});
+
+test("stale Targets and Plans responses do not duplicate visible cards", async () => {
+  const { bridge, elements, page } = await loadPage();
+  let resolveTargets;
+  let targetsCalls = 0;
+  bridge.apiGet = async (endpoint) => {
+    if (endpoint === "targets") {
+      targetsCalls += 1;
+      if (targetsCalls === 1) return new Promise((resolve) => { resolveTargets = resolve; });
+      return [{ id: 1, label: "一群", unified_msg_origin: "aiocqhttp:group:1", enabled: true }];
+    }
+    return {
+      global: {
+        daily_case: { plan: { enabled: true, selection_mode: "random", time: "08:00" } },
+        daily_question: { plan: { enabled: true, selection_mode: "random", time: "09:00" } },
+      },
+      targets: [],
+    };
+  };
+  page.state.route = "targets";
+  page.state.renderGeneration = 3;
+  const firstTargets = page.renderTargets();
+  const secondTargets = page.renderTargets();
+  await secondTargets;
+  resolveTargets([{ id: 1, label: "旧一群", unified_msg_origin: "old", enabled: true }]);
+  await firstTargets;
+  assert.equal((textOf(elements.get("view-targets")).match(/一群/g) || []).length, 1);
+
+  let resolvePlans;
+  let plansCalls = 0;
+  bridge.apiGet = async (endpoint) => {
+    if (endpoint !== "plans") return [];
+    plansCalls += 1;
+    if (plansCalls === 1) return new Promise((resolve) => { resolvePlans = resolve; });
+    return {
+      global: {
+        daily_case: { plan: { enabled: true, selection_mode: "random", time: "08:00" } },
+        daily_question: { plan: { enabled: true, selection_mode: "random", time: "09:00" } },
+      },
+      targets: [],
+    };
+  };
+  page.state.route = "plans";
+  const firstPlans = page.renderPlans();
+  const secondPlans = page.renderPlans();
+  await secondPlans;
+  resolvePlans({ global: {}, targets: [] });
+  await firstPlans;
+  assert.equal((textOf(elements.get("view-plans")).match(/全局默认/g) || []).length, 1);
+});
+
+test("navigate plus hashchange performs one effective route render", async () => {
+  const { bridge, handlers, window, page } = await loadPage();
+  let librarySearchCalls = 0;
+  bridge.apiGet = async (endpoint) => {
+    if (endpoint === "library/search") {
+      librarySearchCalls += 1;
+      return { count: 0, items: [] };
+    }
+    return [];
+  };
+  page.state.route = "overview";
+  page.state.renderGeneration = 0;
+  await page.navigate("library");
+  window.location.hash = "#library";
+  await handlers.hashchange();
+  assert.equal(librarySearchCalls, 1);
+});

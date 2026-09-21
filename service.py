@@ -90,6 +90,8 @@ class PendingPublication:
     expires_at: datetime
     event_id: int | None = None
     owner_id: str | None = None
+    event_revision: int | None = None
+    event_content_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +133,16 @@ class ContentReference:
     session_origin: str
     created_at: datetime
     expires_at: datetime
+
+
+def _delivery_status(outcome: Any) -> tuple[str, str | None]:
+    """Normalize legacy bool publishers and explicit transport outcomes."""
+    if isinstance(outcome, bool):
+        return ("sent" if outcome else "failed"), None
+    status = str(getattr(outcome, "status", "failed"))
+    if status not in {"sent", "failed", "unknown"}:
+        status = "failed"
+    return status, getattr(outcome, "error", None)
 
 
 def _case_needs_reprocessing(document: SourceDocument) -> bool:
@@ -1231,6 +1243,8 @@ class LawAssistantService:
             expires_at=created + timedelta(minutes=10),
             event_id=event_id,
             owner_id=actor_id,
+            event_revision=event.revision,
+            event_content_hash=event.raw_content_hash,
         )
         return {
             "ready": True,
@@ -1253,6 +1267,17 @@ class LawAssistantService:
         if self._now_utc() > claimed.expires_at:
             return {"success": False, "reason": "确认 token 已过期"}
         if claimed.event_id is not None:
+            current_event = self.storage.get_event(claimed.event_id)
+            if current_event is None:
+                return {"success": False, "reason": "活动已不存在，发布预览失效"}
+            if (
+                current_event.revision != claimed.event_revision
+                or current_event.raw_content_hash != claimed.event_content_hash
+            ):
+                return {
+                    "success": False,
+                    "reason": "活动 revision 或内容已更新，原发布预览失效，请重新预览",
+                }
             count = await self._publish_event_to_targets(
                 claimed.event_id,
                 kind="manual",
@@ -1506,11 +1531,14 @@ class LawAssistantService:
             )
             if publication_id is None:
                 continue
-            success = await self.publisher.publish_text(
+            outcome = await self.publisher.publish_text(
                 target["unified_msg_origin"], fixed_body or format_event(event)
             )
-            self.storage.finish_publication(publication_id, success=success)
-            if success:
+            status, error = _delivery_status(outcome)
+            self.storage.finish_publication(
+                publication_id, status=status, error_summary=error
+            )
+            if status == "sent":
                 count += 1
                 if kind == "automatic" and canonical_key:
                     self.storage.record_canonical_publication(
@@ -1543,10 +1571,11 @@ class LawAssistantService:
             target = enabled_targets.get(target_id)
             if target is None:
                 continue
-            success = await self.publisher.publish_text(
+            outcome = await self.publisher.publish_text(
                 target["unified_msg_origin"], body
             )
-            if success:
+            status, _ = _delivery_status(outcome)
+            if status == "sent":
                 count += 1
             else:
                 self.logger.warning(
@@ -1583,13 +1612,16 @@ class LawAssistantService:
                 )
                 if reminder_id is None:
                     continue
-                success = await self.publisher.publish_text(
+                outcome = await self.publisher.publish_text(
                     target["unified_msg_origin"],
                     format_deadline_reminder(event, date, remaining),
                 )
-                self.storage.finish_reminder(reminder_id, success=success)
-                sent += int(success)
-                if success:
+                status, error = _delivery_status(outcome)
+                self.storage.finish_reminder(
+                    reminder_id, status=status, error_summary=error
+                )
+                sent += int(status == "sent")
+                if status == "sent":
                     self.logger.info(
                         "Law Assistant sent deadline reminder for event %s", event.id
                     )
@@ -2041,13 +2073,16 @@ class LawAssistantService:
                 if content_type == "daily_case"
                 else format_question_content(content)
             )
-            success = await self.publisher.publish_text(
+            outcome = await self.publisher.publish_text(
                 target["unified_msg_origin"],
                 formatted,
             )
-            self.storage.finish_daily_content(claim_id, success=success)
-            sent += int(success)
-            if success:
+            status, error = _delivery_status(outcome)
+            self.storage.finish_daily_content(
+                claim_id, status=status, error_summary=error
+            )
+            sent += int(status == "sent")
+            if status == "sent":
                 self.logger.info(
                     "Law Assistant sent %s to %s",
                     content_type,

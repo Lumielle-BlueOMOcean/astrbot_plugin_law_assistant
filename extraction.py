@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 if __package__ and "." in __package__:
     from .date_parser import (
+        date_is_on_or_after,
         extract_publication_datetime,
         extract_publication_year,
         parse_chinese_dates,
@@ -17,6 +18,7 @@ if __package__ and "." in __package__:
     from .sources.html import html_to_text
 else:
     from date_parser import (
+        date_is_on_or_after,
         extract_publication_datetime,
         extract_publication_year,
         parse_chinese_dates,
@@ -215,21 +217,73 @@ def _event_type(title: str, text: str) -> str:
 
 
 def _status_for_dates(dates: list[EventDate], now: datetime) -> str:
-    valid = [date.datetime for date in dates if date.confirmed and date.datetime]
+    valid = [date for date in dates if date.confirmed and date.datetime]
     if not valid:
         return "UNKNOWN"
     deadlines = [
-        date.datetime
+        date
         for date in dates
         if date.confirmed and date.datetime and date.kind.endswith("deadline")
     ]
-    if deadlines and all(value < now for value in deadlines):
+    if deadlines and all(
+        not date_is_on_or_after(
+            date.datetime,
+            precision=date.precision,
+            now=now,
+            timezone_name=date.timezone,
+        )
+        for date in deadlines
+    ):
         return "CLOSED"
-    if deadlines and min(deadlines) <= now:
-        return "DEADLINE_SOON"
-    if deadlines and (min(deadlines) - now).total_seconds() <= 7 * 86400:
-        return "DEADLINE_SOON"
+    for date in deadlines:
+        local_now = now.astimezone(ZoneInfo(date.timezone))
+        local_value = date.datetime.astimezone(ZoneInfo(date.timezone))
+        if date.precision == "date":
+            remaining_days = (local_value.date() - local_now.date()).days
+            if 0 <= remaining_days <= 7:
+                return "DEADLINE_SOON"
+        elif 0 <= (local_value - local_now).total_seconds() <= 7 * 86400:
+            return "DEADLINE_SOON"
     return "OPEN" if deadlines else "UPCOMING"
+
+
+def _value_precision(value: str) -> str:
+    return "minute" if re.search(r"(?:T|\s)\d{1,2}:\d{2}", value) else "date"
+
+
+def _llm_date_is_supported(
+    source_text: str,
+    evidence: str,
+    raw: dict[str, Any],
+    value: datetime,
+    kind: str,
+    zone: ZoneInfo,
+) -> bool:
+    """Accept an LLM date only when source text proves value and semantic kind."""
+    if not _evidence_matches(source_text, evidence):
+        return False
+    evidence_dates = parse_chinese_dates(
+        evidence, publication_year=value.year, timezone_name=zone.key
+    )
+    if not evidence_dates:
+        return False
+    precision = _value_precision(str(raw.get("value") or ""))
+    for evidence_date in evidence_dates:
+        if evidence_date.datetime is None:
+            continue
+        if evidence_date.datetime.date() != value.astimezone(zone).date():
+            continue
+        if evidence_date.kind != kind:
+            continue
+        if precision == "minute":
+            if evidence_date.precision != "minute":
+                continue
+            if evidence_date.datetime.astimezone(zone).replace(
+                tzinfo=None
+            ) != value.astimezone(zone).replace(tzinfo=None):
+                continue
+        return True
+    return False
 
 
 def _first_match(text: str, pattern: str) -> str:
@@ -295,7 +349,15 @@ def _merge_llm_fields(
                     timezone=str(raw.get("timezone") or zone.key),
                     label=str(raw.get("label") or raw.get("kind") or "活动时间"),
                     evidence_text=evidence,
-                    confirmed=_evidence_matches(source_text, evidence),
+                    confirmed=_llm_date_is_supported(
+                        source_text,
+                        evidence,
+                        raw,
+                        value,
+                        str(raw.get("kind") or "event"),
+                        zone,
+                    ),
+                    precision=_value_precision(str(raw.get("value") or "")),
                 )
             )
         if llm_dates:

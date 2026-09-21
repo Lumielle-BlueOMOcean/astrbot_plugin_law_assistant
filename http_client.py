@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from email.message import Message
 from typing import Any, Self
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -54,6 +55,12 @@ class AsyncHttpClient:
             self._session = None
 
     async def fetch_document(self, url: str, **kwargs: Any) -> FetchResult:
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise ValueError("only absolute http(s) URLs are allowed")
+        max_bytes = int(kwargs.pop("max_bytes", 8 * 1024 * 1024))
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
         if self._session is None:
             await self.__aenter__()
         last_error: Exception | None = None
@@ -66,7 +73,11 @@ class AsyncHttpClient:
                     headers={"User-Agent": self.user_agent},
                     **kwargs,
                 ) as response:
-                    body = await response.read()
+                    body = await response.content.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        raise RuntimeError(
+                            f"response exceeds {max_bytes} bytes for {url}"
+                        )
                     if response.status >= 400:
                         raise RuntimeError(f"HTTP {response.status} for {url}")
                     content_type = response.headers.get("Content-Type", "")

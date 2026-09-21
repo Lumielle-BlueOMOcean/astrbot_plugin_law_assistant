@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -331,10 +332,14 @@ def validate_generated_question(content: Any, question_type: str | None) -> bool
         options = content.get("options")
         if not isinstance(options, (list, dict)) or len(options) < 2:
             return False
-        if question_type == "single_choice" and isinstance(
-            answer, (list, tuple, set, dict)
-        ):
-            return len(answer) == 1
+        valid_keys = _option_keys(options)
+        answer_keys = _answer_keys(answer)
+        if not answer_keys or not answer_keys.issubset(valid_keys):
+            return False
+        if question_type == "single_choice" and len(answer_keys) != 1:
+            return False
+        if question_type == "multiple_choice" and not answer_keys:
+            return False
     if question_type == "true_false":
         if isinstance(answer, bool):
             return True
@@ -357,6 +362,32 @@ def _has_nonempty_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return bool(value)
     return bool(str(value).strip())
+
+
+def _option_keys(options: list[Any] | dict[Any, Any]) -> set[str]:
+    if isinstance(options, dict):
+        return {str(key).strip().upper() for key in options if str(key).strip()}
+    keys: set[str] = set()
+    for index, option in enumerate(options):
+        if isinstance(option, dict) and option.get("key"):
+            keys.add(str(option["key"]).strip().upper())
+            continue
+        match = re.match(r"^\s*([A-Za-z][0-9A-Za-z]*)\s*[.、:：)）]", str(option))
+        keys.add((match.group(1) if match else chr(ord("A") + index)).upper())
+    return keys
+
+
+def _answer_keys(answer: Any) -> set[str]:
+    if isinstance(answer, dict):
+        for key in ("key", "keys", "answer", "answers", "value"):
+            if key in answer:
+                return _answer_keys(answer[key])
+        return set()
+    if isinstance(answer, (list, tuple, set)):
+        values = answer
+    else:
+        values = re.split(r"[,，、/\\\s]+", str(answer).strip())
+    return {str(value).strip().upper() for value in values if str(value).strip()}
 
 
 def format_question_content(result: dict[str, Any]) -> str:

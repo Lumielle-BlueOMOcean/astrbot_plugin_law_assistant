@@ -34,6 +34,9 @@ const state = {
   libraryTab: "materials",
   libraryItemId: null,
   historyTab: "daily",
+  renderGeneration: 0,
+  viewRequests: Object.create(null),
+  planDrafts: Object.create(null),
 };
 const PAGE_I18N_NAMESPACE = "pages.law-assistant.";
 
@@ -128,6 +131,20 @@ function setFlash(message, error = false) {
   flash.hidden = !message;
 }
 
+function beginViewRequest(key) {
+  const next = (state.viewRequests[key] || 0) + 1;
+  state.viewRequests[key] = next;
+  return next;
+}
+
+function isCurrent(generation, route = state.route) {
+  return generation === state.renderGeneration && route === state.route;
+}
+
+function isCurrentRequest(key, requestId, generation, route = state.route) {
+  return isCurrent(generation, route) && state.viewRequests[key] === requestId;
+}
+
 async function apiGet(endpoint, params = {}) {
   const result = await bridge.apiGet(endpoint, params);
   if (result == null || result.success === false) throw new Error(result?.message || t("page.error.request", "请求失败"));
@@ -209,12 +226,17 @@ function keyValueRows(values) {
 }
 
 async function renderOverview() {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "overview";
+  const requestId = beginViewRequest(requestKey);
   const view = document.getElementById("view-overview");
   view.replaceChildren(sectionTitle(t("page.nav.overview", "总览"), t("page.overview.description", "查看插件、来源、学习资料与最近运行状态。")));
   const loading = node("p", t("page.loading", "正在加载…"), "muted");
   view.append(loading);
   try {
     const data = await apiGet("overview");
+    if (!isCurrentRequest(requestKey, requestId, generation, route)) return;
     loading.remove();
     const plugin = data.plugin || {};
     const radar = data.radar || {};
@@ -235,6 +257,7 @@ async function renderOverview() {
       ["error_summary", t("page.history.reason", "说明")],
     ]));
   } catch (error) {
+    if (!isCurrentRequest(requestKey, requestId, generation, route)) return;
     loading.textContent = error.message;
     setFlash(error.message, true);
   }
@@ -251,6 +274,8 @@ function tabBar(items, current, select) {
 }
 
 async function renderLibrary() {
+  const generation = state.renderGeneration;
+  const route = state.route;
   const view = document.getElementById("view-library");
   view.replaceChildren(sectionTitle(t("page.nav.library", "资料库"), t("page.library.description", "搜索资料、查看证据、修改允许字段并处理待复核条目。")));
   view.append(tabBar([
@@ -258,12 +283,16 @@ async function renderLibrary() {
     ["imports", t("page.library.imports", "文件导入")],
     ["reviews", t("page.library.reviews", "待复核")],
   ], state.libraryTab, (value) => { state.libraryTab = value; renderLibrary(); }));
+  if (!isCurrent(generation, route)) return;
   if (state.libraryTab === "imports") return renderImports(view);
   if (state.libraryTab === "reviews") return renderReviews(view);
   return renderMaterials(view);
 }
 
 async function renderMaterials(view) {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "library-materials";
   const controls = node("div", undefined, "toolbar");
   const query = textInput(); query.placeholder = t("page.library.searchPlaceholder", "关键词");
   const type = selectControl([
@@ -277,9 +306,11 @@ async function renderMaterials(view) {
   view.append(controls, result);
 
   async function runSearch() {
+    const requestId = beginViewRequest(requestKey);
     result.replaceChildren(node("p", t("page.loading", "正在加载…"), "muted"));
     try {
       const data = await apiGet("library/search", { query: query.value, type: type.value, subject: subject.value, limit: 50 });
+      if (!isCurrentRequest(requestKey, requestId, generation, route)) return;
       const rows = data.items || [];
       result.replaceChildren(node("p", `找到 ${data.count || 0} 条资料。`, "muted"));
       result.append(table(rows, [
@@ -287,17 +318,22 @@ async function renderMaterials(view) {
         ["subjects", "方向", (row) => node("span", (row.subjects || []).map(subjectLabel).join("、"))],
         ["verification_status", "核验"], ["updated_at", "更新时间"],
       ], (row) => button(t("page.actions.view", "查看"), () => renderLibraryDetail(result, row.id))));
-      if (state.libraryItemId) await renderLibraryDetail(result, state.libraryItemId);
-    } catch (error) { result.replaceChildren(node("p", error.message, "error-text")); }
+      if (state.libraryItemId) await renderLibraryDetail(result, state.libraryItemId, generation, route);
+    } catch (error) {
+      if (isCurrentRequest(requestKey, requestId, generation, route)) result.replaceChildren(node("p", error.message, "error-text"));
+    }
   }
   await runSearch();
 }
 
-async function renderLibraryDetail(container, itemId) {
+async function renderLibraryDetail(container, itemId, parentGeneration = state.renderGeneration, parentRoute = state.route) {
   state.libraryItemId = itemId;
+  const requestKey = `library-detail-${itemId}`;
+  const requestId = beginViewRequest(requestKey);
   let data;
   try { data = await apiGet("library/item", { id: itemId }); }
-  catch (error) { setFlash(error.message, true); return; }
+  catch (error) { if (isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) setFlash(error.message, true); return; }
+  if (!isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) return;
   const item = data.item || {};
   const panel = node("article", undefined, "detail-panel");
   panel.append(sectionTitle(`${t("page.library.detail", "资料详情")} #${item.id}`, item.title));
@@ -328,6 +364,8 @@ async function renderLibraryDetail(container, itemId) {
 }
 
 async function renderImports(view) {
+  const generation = state.renderGeneration;
+  const route = state.route;
   const box = node("div", undefined, "form-card");
   box.append(node("h3", t("page.library.upload", "文件导入")), node("p", "文件只会先写入插件数据目录并生成预览，确认后才归档。", "muted"));
   const file = document.createElement("input"); file.type = "file"; file.accept = ".txt,.md,.docx,.pdf";
@@ -337,8 +375,10 @@ async function renderImports(view) {
     upload.disabled = true;
     try {
       const staged = await bridge.upload("files/stage", file.files[0]);
+      if (!isCurrent(generation, route)) return;
       if (staged == null || staged.success === false) throw new Error(staged?.message || "文件 staging 失败");
       const prepared = await apiPost("imports/prepare", { staged_path: staged.staged_path, original_filename: staged.original_filename, content_kind: kind.value });
+      if (!isCurrent(generation, route)) return;
       renderImportPreview(box, prepared);
     } catch (error) { setFlash(error.message, true); } finally { upload.disabled = false; }
   }, "primary");
@@ -355,21 +395,28 @@ function renderImportPreview(container, prepared) {
 }
 
 async function renderReviews(view) {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "library-reviews";
   const controls = node("div", undefined, "toolbar");
   const status = selectControl([["pending", "pending"], ["resolved", "resolved"], ["superseded", "superseded"]]);
   const refresh = button(t("page.actions.refresh", "刷新"), load, "primary"); controls.append(status, refresh);
   const result = node("div"); view.append(controls, result);
   async function load() {
+    const requestId = beginViewRequest(requestKey);
     result.replaceChildren(node("p", t("page.loading", "正在加载…"), "muted"));
-    try { const data = await apiGet("reviews", { status: status.value, limit: 50 }); result.replaceChildren(table(data.items || [], [["id", "Review ID"], ["material_type", "资料类型"], ["locator", "定位"], ["review_reason", "原因"], ["status", "状态"], ["updated_at", "更新时间"]], (row) => button(t("page.actions.view", "查看"), () => renderReviewDetail(result, row.id)))); }
-    catch (error) { result.replaceChildren(node("p", error.message, "error-text")); }
+    try { const data = await apiGet("reviews", { status: status.value, limit: 50 }); if (!isCurrentRequest(requestKey, requestId, generation, route)) return; result.replaceChildren(table(data.items || [], [["id", "Review ID"], ["material_type", "资料类型"], ["locator", "定位"], ["review_reason", "原因"], ["status", "状态"], ["updated_at", "更新时间"]], (row) => button(t("page.actions.view", "查看"), () => renderReviewDetail(result, row.id, generation, route)))); }
+    catch (error) { if (isCurrentRequest(requestKey, requestId, generation, route)) result.replaceChildren(node("p", error.message, "error-text")); }
   }
   await load();
 }
 
-async function renderReviewDetail(container, reviewId) {
+async function renderReviewDetail(container, reviewId, parentGeneration = state.renderGeneration, parentRoute = state.route) {
+  const requestKey = `review-detail-${reviewId}`;
+  const requestId = beginViewRequest(requestKey);
   try {
     const data = await apiGet("review", { id: reviewId }); const item = data.item || {};
+    if (!isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) return;
     const panel = node("article", undefined, "detail-panel");
     panel.append(sectionTitle(`Review #${item.id}`, item.review_reason));
     panel.append(keyValueRows({ 资料类型: item.material_type, 定位: item.locator, 来源ID: item.source_id, 状态: item.status, 更新时间: item.updated_at }));
@@ -377,10 +424,13 @@ async function renderReviewDetail(container, reviewId) {
     if (item.status === "pending") panel.append(button("标记 resolved", () => updateReview(item.id, "resolved"), "primary"), button("标记 superseded", () => updateReview(item.id, "superseded")));
     container.append(panel);
     async function updateReview(id, nextStatus) { try { await apiPost("review/status", { review_id: id, status: nextStatus }); setFlash("复核状态已更新"); await renderLibrary(); } catch (error) { setFlash(error.message, true); } }
-  } catch (error) { setFlash(error.message, true); }
+  } catch (error) { if (isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) setFlash(error.message, true); }
 }
 
 async function renderRadar() {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "radar-events";
   const view = document.getElementById("view-radar");
   view.replaceChildren(sectionTitle(t("page.nav.radar", "活动雷达"), "查看活动证据、时间节点与来源状态。"));
   const controls = node("div", undefined, "toolbar");
@@ -389,21 +439,25 @@ async function renderRadar() {
   const scan = button(t("page.actions.scan", "立即扫描"), async () => { scan.disabled = true; try { const data = await apiPost("radar/scan"); setFlash(`扫描完成：发现 ${data.discovered_count || 0} 条`); await load(); } catch (error) { setFlash(error.message, true); } finally { scan.disabled = false; } }, "primary");
   controls.append(status, scan); view.append(controls, result);
   async function load() {
+    const requestId = beginViewRequest(requestKey);
     result.replaceChildren(node("p", t("page.loading", "正在加载…"), "muted"));
-    try { const rows = await apiGet("radar/events", { status: status.value, limit: 50 }); result.replaceChildren(table(rows || [], [["id", "ID"], ["title", "标题"], ["event_type", "类型"], ["radar_status", "状态"], ["organizer", "主办方"], ["source_url", "来源", (row) => safeLink(row.source_url, "打开来源")]], (row) => button(t("page.actions.view", "查看"), () => renderRadarDetail(result, row.id)))); }
-    catch (error) { result.replaceChildren(node("p", error.message, "error-text")); }
+    try { const rows = await apiGet("radar/events", { status: status.value, limit: 50 }); if (!isCurrentRequest(requestKey, requestId, generation, route)) return; result.replaceChildren(table(rows || [], [["id", "ID"], ["title", "标题"], ["event_type", "类型"], ["radar_status", "状态"], ["organizer", "主办方"], ["source_url", "来源", (row) => safeLink(row.source_url, "打开来源")]], (row) => button(t("page.actions.view", "查看"), () => renderRadarDetail(result, row.id, generation, route)))); }
+    catch (error) { if (isCurrentRequest(requestKey, requestId, generation, route)) result.replaceChildren(node("p", error.message, "error-text")); }
   }
   status.addEventListener("change", load); await load();
 }
 
-async function renderRadarDetail(container, eventId) {
+async function renderRadarDetail(container, eventId, parentGeneration = state.renderGeneration, parentRoute = state.route) {
+  const requestKey = `radar-detail-${eventId}`;
+  const requestId = beginViewRequest(requestKey);
   try {
     const event = await apiGet("radar/event", { id: eventId }); const panel = node("article", undefined, "detail-panel");
+    if (!isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) return;
     panel.append(sectionTitle(`活动 #${event.id}`, event.title));
     panel.append(keyValueRows({ 活动类型: event.event_type, 雷达状态: event.radar_status, 主办方: event.organizer, 参赛对象: event.eligibility, 报名方式: event.registration_method, 来源发布时间: event.source_published_at, 修订版: event.revision }));
     panel.append(detailBlock("摘要", event.summary), detailBlock("时间节点与 evidence", (event.dates || []).map((date) => `${date.kind} ${date.datetime || ""} ${date.label}\n${date.evidence_text}`)), detailBlock("来源 URL", safeLink(event.source_url, event.source_url)));
     container.append(panel);
-  } catch (error) { setFlash(error.message, true); }
+  } catch (error) { if (isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) setFlash(error.message, true); }
 }
 
 function rotationEditor(label, values, options) {
@@ -413,24 +467,50 @@ function rotationEditor(label, values, options) {
   wrap.append(node("span", label, "field-label"), list, addSelect); render(); wrap.getValues = () => [...current]; return wrap;
 }
 
-function planForm(contentType, plan, onPreview) {
+function planForm(contentType, plan, onPreview, draftKey = contentType) {
+  const savedDraft = state.planDrafts[draftKey] || {};
+  const effective = { ...plan, ...savedDraft };
   const form = node("div", undefined, "plan-editor");
-  const enabled = document.createElement("input"); enabled.type = "checkbox"; enabled.checked = Boolean(plan.enabled);
-  const time = textInput(plan.time || "08:00", "time");
-  const mode = selectControl([["random", "随机"], ["fixed", "固定"], ["rotation", "轮换"]], plan.selection_mode || "random");
-  const fixedSubject = selectControl([["", "请选择方向"], ...SUBJECTS], plan.fixed_subject || "");
-  const startDate = textInput(plan.rotation_start_date || "", "date"); const startIndex = textInput(plan.rotation_start_index || 0, "number");
-  const subjectRotation = rotationEditor("方向顺序", plan.rotation_subjects || [], SUBJECTS);
-  const origin = contentType === "daily_question" ? selectControl([["random", "随机来源"], ["real", "真题"], ["mock", "模拟题"]], plan.question_origin || "random") : null;
-  const typeMode = contentType === "daily_question" ? selectControl([["random", "随机题型"], ["fixed", "固定题型"], ["rotation", "题型轮换"]], plan.question_type_selection_mode || "random") : null;
-  const fixedType = contentType === "daily_question" ? selectControl([["", "请选择题型"], ...QUESTION_TYPES], plan.fixed_question_type || plan.question_type || "") : null;
-  const typeStartDate = contentType === "daily_question" ? textInput(plan.question_type_rotation_start_date || "", "date") : null;
-  const typeStartIndex = contentType === "daily_question" ? textInput(plan.question_type_rotation_start_index || 0, "number") : null;
-  const typeRotation = contentType === "daily_question" ? rotationEditor("题型顺序", plan.rotation_question_types || [], QUESTION_TYPES) : null;
+  const enabled = document.createElement("input"); enabled.type = "checkbox"; enabled.checked = Boolean(effective.enabled);
+  const time = textInput(effective.time || "08:00", "time");
+  const mode = selectControl([["random", "随机"], ["fixed", "固定"], ["rotation", "轮换"]], effective.selection_mode || "random");
+  const fixedSubject = selectControl([["", "请选择方向"], ...SUBJECTS], effective.fixed_subject || "");
+  const startDate = textInput(effective.rotation_start_date || "", "date"); const startIndex = textInput(effective.rotation_start_index || 0, "number");
+  const subjectRotation = rotationEditor("方向顺序", effective.rotation_subjects || [], SUBJECTS);
+  const origin = contentType === "daily_question" ? selectControl([["random", "随机来源"], ["real", "真题"], ["mock", "模拟题"]], effective.question_origin || "random") : null;
+  const typeMode = contentType === "daily_question" ? selectControl([["random", "随机题型"], ["fixed", "固定题型"], ["rotation", "题型轮换"]], effective.question_type_selection_mode || "random") : null;
+  const fixedType = contentType === "daily_question" ? selectControl([["", "请选择题型"], ...QUESTION_TYPES], effective.fixed_question_type || effective.question_type || "") : null;
+  const typeStartDate = contentType === "daily_question" ? textInput(effective.question_type_rotation_start_date || "", "date") : null;
+  const typeStartIndex = contentType === "daily_question" ? textInput(effective.question_type_rotation_start_index || 0, "number") : null;
+  const typeRotation = contentType === "daily_question" ? rotationEditor("题型顺序", effective.rotation_question_types || [], QUESTION_TYPES) : null;
+  const remember = () => {
+    state.planDrafts[draftKey] = {
+      enabled: enabled.checked,
+      time: time.value,
+      selection_mode: mode.value,
+      fixed_subject: fixedSubject.value || null,
+      rotation_subjects: subjectRotation.getValues(),
+      rotation_start_date: startDate.value || null,
+      rotation_start_index: Number(startIndex.value || 0),
+      ...(origin ? {
+        question_origin: origin.value,
+        question_type_selection_mode: typeMode.value,
+        fixed_question_type: fixedType.value || null,
+        rotation_question_types: typeRotation.getValues(),
+        question_type_rotation_start_date: typeStartDate.value || null,
+        question_type_rotation_start_index: Number(typeStartIndex.value || 0),
+      } : {}),
+    };
+  };
+  [enabled, time, mode, fixedSubject, startDate, startIndex, origin, typeMode, fixedType, typeStartDate, typeStartIndex].filter(Boolean).forEach((control) => {
+    control.addEventListener("input", remember);
+    control.addEventListener("change", remember);
+  });
   const fields = node("div", undefined, "form-grid");
   fields.append(labeled("启用", enabled, "checkbox-field"), labeled("发送时间", time), labeled("方向模式", mode), labeled("固定方向", fixedSubject), labeled("轮换起始日期", startDate), labeled("起始位置", startIndex), subjectRotation);
   if (origin) fields.append(labeled("题目来源", origin), labeled("题型模式", typeMode), labeled("固定题型", fixedType), labeled("题型起始日期", typeStartDate), labeled("题型起始位置", typeStartIndex), typeRotation);
   const preview = button(t("page.actions.preview", "预览修改"), () => {
+    remember();
     const changes = { enabled: enabled.checked, time: time.value, selection_mode: mode.value, fixed_subject: fixedSubject.value || null, rotation_subjects: subjectRotation.getValues(), rotation_start_date: startDate.value || null, rotation_start_index: Number(startIndex.value || 0) };
     if (origin) Object.assign(changes, { question_origin: origin.value, question_type_selection_mode: typeMode.value, fixed_question_type: fixedType.value || null, rotation_question_types: typeRotation.getValues(), question_type_rotation_start_date: typeStartDate.value || null, question_type_rotation_start_index: Number(typeStartIndex.value || 0) });
     onPreview(changes);
@@ -480,12 +560,18 @@ function renderPlanResetConfirmation(container, prepared, onDone) {
 }
 
 async function renderPlans() {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "plans";
+  const requestId = beginViewRequest(requestKey);
   const view = document.getElementById("view-plans"); view.replaceChildren(sectionTitle(t("page.nav.plans", "每日计划"), "全局默认与群级覆盖分别管理；页面不自行计算轮换。"));
   try {
     const data = await apiGet("plans", { days: 14 });
+    if (!isCurrentRequest(requestKey, requestId, generation, route)) return;
     const renderPlan = (container, scope, target, contentType, entry, title) => {
       const card = node("article", undefined, "plan-card"); card.append(node("h3", title), node("p", entry.override ? "群级覆盖" : "继承全局"));
-      card.append(planForm(contentType, entry.plan, async (changes) => { try { const prepared = await apiPost("plans/prepare", { scope, target, content_type: contentType, changes }); renderPlanConfirmation(card, prepared, renderPlans); } catch (error) { setFlash(error.message, true); } }));
+      const draftKey = `${scope}:${target || "global"}:${contentType}`;
+      card.append(planForm(contentType, entry.plan, async (changes) => { try { const prepared = await apiPost("plans/prepare", { scope, target, content_type: contentType, changes }); if (!isCurrent(generation, route)) return; delete state.planDrafts[draftKey]; renderPlanConfirmation(card, prepared, renderPlans); } catch (error) { if (isCurrent(generation, route)) setFlash(error.message, true); } }, draftKey));
       if (scope === "target" && entry.override) card.append(button(t("page.plans.restoreGlobal", "恢复全局计划"), async () => { try { const prepared = await apiPost("plans/reset-prepare", { target, content_type: contentType }); renderPlanResetConfirmation(card, prepared, renderPlans); } catch (error) { setFlash(error.message, true); } }));
       container.append(card);
     };
@@ -496,9 +582,14 @@ async function renderPlans() {
 }
 
 async function renderTargets() {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "targets";
+  const requestId = beginViewRequest(requestKey);
   const view = document.getElementById("view-targets"); view.replaceChildren(sectionTitle(t("page.nav.targets", "群与发布"), "只显示已明确绑定的目标；页面不会根据群名猜测 UMO。"));
   try {
     const targets = await apiGet("targets");
+    if (!isCurrentRequest(requestKey, requestId, generation, route)) return;
     if (!targets.length) { view.append(node("p", "暂无绑定群。请在目标 QQ 群中执行 /law bind <别名>。", "muted")); return; }
     view.append(table(targets, [["id", "ID"], ["label", "别名"], ["unified_msg_origin", "UMO"], ["enabled", "启用"], ["updated_at", "更新时间"]], (row) => {
       const wrap = node("div", undefined, "actions"); const input = textInput(row.label || ""); wrap.append(input, button(t("page.actions.rename", "改名"), async () => { try { await apiPost("target/rename", { target: String(row.id), label: input.value }); setFlash("群别名已更新"); await renderTargets(); } catch (error) { setFlash(error.message, true); } }));
@@ -515,35 +606,76 @@ const historyConfig = {
 };
 
 async function renderHistory() {
+  const generation = state.renderGeneration;
+  const route = state.route;
+  const requestKey = "history";
   const view = document.getElementById("view-history"); view.replaceChildren(sectionTitle(t("page.nav.history", "运行记录"), "每日内容、活动发布、DDL 提醒和来源运行分别查看有限历史。"));
   view.append(tabBar([["daily", "每日内容"], ["publications", "活动发布"], ["reminders", "DDL 提醒"], ["sources", "来源运行"]], state.historyTab, (value) => { state.historyTab = value; renderHistory(); }));
   const result = node("div"); const refresh = button(t("page.actions.refresh", "刷新"), load, "primary"); view.append(refresh, result);
-  async function load() { result.replaceChildren(node("p", t("page.loading", "正在加载…"), "muted")); try { const [endpoint, columns] = historyConfig[state.historyTab]; result.replaceChildren(table(await apiGet(endpoint, { limit: 50 }), columns)); } catch (error) { result.replaceChildren(node("p", error.message, "error-text")); } }
+  async function load() { const requestId = beginViewRequest(requestKey); result.replaceChildren(node("p", t("page.loading", "正在加载…"), "muted")); try { const [endpoint, columns] = historyConfig[state.historyTab]; const data = await apiGet(endpoint, { limit: 50 }); if (!isCurrentRequest(requestKey, requestId, generation, route)) return; result.replaceChildren(table(data, columns)); } catch (error) { if (isCurrentRequest(requestKey, requestId, generation, route)) result.replaceChildren(node("p", error.message, "error-text")); } }
   await load();
 }
 
 async function renderRoute() {
-  document.querySelectorAll(".view").forEach((view) => { view.hidden = view.id !== `view-${state.route}`; }); renderNavigation();
-  const renderer = { overview: renderOverview, library: renderLibrary, radar: renderRadar, plans: renderPlans, targets: renderTargets, history: renderHistory }[state.route]; if (renderer) await renderer();
+  const generation = ++state.renderGeneration;
+  document.querySelectorAll(".view").forEach((view) => { view.hidden = view.id !== `view-${state.route}`; });
+  renderNavigation();
+  const renderer = { overview: renderOverview, library: renderLibrary, radar: renderRadar, plans: renderPlans, targets: renderTargets, history: renderHistory }[state.route];
+  if (renderer) await renderer(generation);
 }
 
-async function navigate(route) { state.route = labels[route] ? route : "overview"; window.location.hash = state.route; await renderRoute(); }
+async function navigate(route) {
+  const nextRoute = labels[route] ? route : "overview";
+  if (nextRoute !== state.route) {
+    state.route = nextRoute;
+    if (window.location.hash.slice(1) !== state.route) {
+      window.location.hash = state.route;
+      return;
+    }
+  }
+  await renderRoute();
+}
 
 async function init() {
   if (!bridge) { setFlash("AstrBot Plugin Page Bridge 不可用", true); return; }
   await bridge.ready(); state.context = bridge.getContext?.() || {};
   let pageInitialized = false;
   const updateContext = (context) => {
+    const previousLocale = state.context.locale;
+    const previousTheme = state.context.isDark;
     state.context = context || {};
     document.documentElement.dataset.theme = state.context.isDark ? "dark" : "light";
     document.getElementById("context-badge").textContent = state.context.locale || "Dashboard";
-    renderNavigation();
-    if (pageInitialized) renderRoute().catch((error) => setFlash(error.message, true));
+    if (!pageInitialized || previousLocale !== state.context.locale) {
+      renderNavigation();
+      if (pageInitialized) renderRoute().catch((error) => setFlash(error.message, true));
+    } else if (previousTheme !== state.context.isDark) {
+      renderNavigation();
+    }
   };
   updateContext(state.context); bridge.onContext?.(updateContext);
   const requested = window.location.hash.slice(1); state.route = labels[requested] ? requested : "overview"; await renderRoute();
   pageInitialized = true;
 }
 
-window.addEventListener("hashchange", () => navigate(window.location.hash.slice(1)));
+window.addEventListener("hashchange", () => {
+  const nextRoute = window.location.hash.slice(1);
+  state.route = labels[nextRoute] ? nextRoute : "overview";
+  renderRoute().catch((error) => setFlash(error.message, true));
+});
 init().catch((error) => setFlash(error.message, true));
+
+if (globalThis.__LAW_ASSISTANT_TEST__) {
+  globalThis.__lawAssistantTest = {
+    apiGet,
+    apiPost,
+    navigate,
+    renderOverview,
+    renderMaterials,
+    renderImports,
+    renderPlans,
+    renderTargets,
+    renderHistory,
+    state,
+  };
+}

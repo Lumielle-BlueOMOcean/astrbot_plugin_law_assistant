@@ -37,9 +37,10 @@ def parse_chinese_dates(
     seen: set[tuple[str, str | None]] = set()
 
     for match in _DATE_RE.finditer(text):
-        value = _parse_match(match, reference_year, zone)
-        if value is None:
+        parsed = _parse_match(match, reference_year, zone)
+        if parsed is None:
             continue
+        value, precision = parsed
         kind = _infer_kind(text, match.start())
         evidence = _evidence_text(text, match.start(), match.end(), kind)
         key = (kind, value.isoformat())
@@ -54,6 +55,7 @@ def parse_chinese_dates(
                 label=_label_for_kind(kind),
                 evidence_text=evidence,
                 confirmed=True,
+                precision=precision,
             )
         )
     return result
@@ -83,6 +85,22 @@ def parse_datetime_value(
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
     return parsed
+
+
+def date_is_on_or_after(
+    value: datetime,
+    *,
+    precision: str,
+    now: datetime,
+    timezone_name: str,
+) -> bool:
+    """Compare date-only values by local calendar day, not an invented time."""
+    zone = ZoneInfo(timezone_name)
+    local_value = value.astimezone(zone)
+    local_now = now.astimezone(zone) if now.tzinfo else now.replace(tzinfo=zone)
+    if precision == "date":
+        return local_value.date() >= local_now.date()
+    return local_value >= local_now
 
 
 def extract_publication_year(text: str, fallback: int | None = None) -> int:
@@ -127,6 +145,7 @@ def _parse_match(match: re.Match[str], reference_year: int, zone: ZoneInfo):
             month, day = map(int, re.findall(r"\d+", match.group("month_date")))
         hour_text = match.group("hour")
         minute = int(match.group("minute") or 0)
+        precision = "minute" if hour_text is not None else "date"
         if hour_text is None:
             meridiem = match.group("meridiem")
             hour = {
@@ -142,7 +161,7 @@ def _parse_match(match: re.Match[str], reference_year: int, zone: ZoneInfo):
                 hour += 12
             if meridiem == "中午" and hour < 11:
                 hour += 12
-        return datetime(year, month, day, hour, minute, tzinfo=zone)
+        return datetime(year, month, day, hour, minute, tzinfo=zone), precision
     except ValueError:
         return None
 

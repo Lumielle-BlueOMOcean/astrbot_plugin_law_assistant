@@ -85,7 +85,7 @@ async def test_generic_adapter_uses_same_list_detail_pipeline() -> None:
     documents = await adapter.fetch()
 
     assert documents[0].source_key == "extra:law-school"
-    assert documents[0].source_item_key == "1.html"
+    assert documents[0].source_item_key == "notices/1.html"
 
 
 @pytest.mark.asyncio

@@ -606,22 +606,16 @@ class LibraryService:
     ) -> int:
         """Propagate an operator classification to matching official segments."""
         updated = 0
-        for item in self.repository.search(
-            item_type="case", identity="official_case", limit=50
+        for item in self.repository.list_by_source_metadata(
+            created_by=f"source:{source_key}",
+            key="source_item_key",
+            value=source_item_key,
+            identity="official_case",
+            active_only=False,
         ):
             if item.id is None:
                 continue
-            bundle = self.repository.get(item.id)
-            if bundle is None:
-                continue
-            if (
-                any(
-                    source.metadata.get("adapter_key") == source_key
-                    and source.metadata.get("source_item_key") == source_item_key
-                    for source in bundle.sources
-                )
-                and self.repository.update(item.id, {"subjects": subjects}) is not None
-            ):
+            if self.repository.update(item.id, {"subjects": subjects}) is not None:
                 updated += 1
         return updated
 

@@ -14,6 +14,7 @@ class EventDate:
     label: str
     evidence_text: str
     confirmed: bool = True
+    precision: str = "minute"
     id: int | None = None
 
 

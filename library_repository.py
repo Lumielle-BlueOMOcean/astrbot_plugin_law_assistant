@@ -27,6 +27,10 @@ else:
         LibrarySourceLink,
         QuestionDetail,
     )
+try:
+    from .content import subject_filter
+except ImportError:
+    from content import subject_filter
 
 
 def _json(value: Any) -> str:
@@ -355,6 +359,40 @@ class LibraryRepository:
         ).fetchall()
         return [_item_from_row(row) for row in rows]
 
+    def list_by_source_metadata(
+        self,
+        *,
+        created_by: str,
+        key: str,
+        value: str,
+        identity: str = "",
+        active_only: bool = False,
+    ) -> list[LearningItem]:
+        """Return every item linked to sources with a stable upstream identity."""
+        source_ids = self.source_ids_by_metadata(
+            created_by=created_by, key=key, value=value
+        )
+        if not source_ids:
+            return []
+        placeholders = ", ".join("?" for _ in source_ids)
+        clauses = [f"link.source_id IN ({placeholders})"]
+        params: list[Any] = list(source_ids)
+        if identity:
+            clauses.append("i.identity = ?")
+            params.append(identity)
+        if active_only:
+            clauses.append("i.active = 1")
+        rows = self.connection.execute(
+            f"""
+            SELECT DISTINCT i.* FROM learning_items AS i
+            JOIN learning_item_sources AS link ON link.item_id = i.id
+            WHERE {" AND ".join(clauses)}
+            ORDER BY i.id
+            """,
+            params,
+        ).fetchall()
+        return [_item_from_row(row) for row in rows]
+
     def source_ids_by_metadata(
         self, *, created_by: str, key: str, value: str
     ) -> list[int]:
@@ -533,7 +571,7 @@ class LibraryRepository:
         item_type: str = "",
         identity: str = "",
         subject: str = "",
-        limit: int = 10,
+        limit: int | None = 10,
         include_inactive: bool = False,
     ) -> list[LearningItem]:
         clauses = ["1 = 1"]
@@ -547,8 +585,14 @@ class LibraryRepository:
             clauses.append("i.identity = ?")
             params.append(identity)
         if subject:
-            clauses.append("i.subjects_json LIKE ?")
-            params.append(f"%{subject}%")
+            subjects = subject_filter(subject)
+            if subjects is None:
+                raise ValueError(f"不支持的资料方向：{subject}")
+            subject_clauses = []
+            for candidate in sorted(subjects):
+                subject_clauses.append("i.subjects_json LIKE ?")
+                params.append(f'%"{candidate}"%')
+            clauses.append(f"({' OR '.join(subject_clauses)})")
         if query:
             term = f"%{query}%"
             clauses.append(
@@ -557,8 +601,11 @@ class LibraryRepository:
                 "OR q.stem LIKE ? OR q.explanation LIKE ? OR i.metadata_json LIKE ?)"
             )
             params.extend([term] * 8)
-        safe_limit = max(1, min(int(limit), 50))
-        params.append(safe_limit)
+        limit_clause = ""
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 5000))
+            params.append(safe_limit)
+            limit_clause = " LIMIT ?"
         rows = self.connection.execute(
             f"""
             SELECT DISTINCT i.* FROM learning_items AS i
@@ -568,7 +615,7 @@ class LibraryRepository:
             LEFT JOIN learning_questions AS q ON q.item_id = i.id
             WHERE {" AND ".join(clauses)}
             ORDER BY i.updated_at DESC, i.id DESC
-            LIMIT ?
+            {limit_clause}
             """,
             params,
         ).fetchall()
@@ -624,14 +671,12 @@ class LibraryRepository:
             if "subjects" in changes:
                 item_updates.append("subjects_json = ?")
                 params.append(_json(list(changes["subjects"])))
-                if row["identity"] == "official_case":
-                    metadata = json.loads(row["metadata_json"])
-                    metadata["manual_subjects"] = True
-                    item_updates.append("metadata_json = ?")
-                    params.append(_json(metadata))
-            if "note" in changes:
+            if "subjects" in changes or "note" in changes:
                 metadata = json.loads(row["metadata_json"])
-                metadata["note"] = str(changes["note"])
+                if "subjects" in changes and row["identity"] == "official_case":
+                    metadata["manual_subjects"] = True
+                if "note" in changes:
+                    metadata["note"] = str(changes["note"])
                 item_updates.append("metadata_json = ?")
                 params.append(_json(metadata))
             if item_updates or "practice_notes" in changes or "explanation" in changes:

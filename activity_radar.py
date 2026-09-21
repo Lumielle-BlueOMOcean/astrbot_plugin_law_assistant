@@ -8,8 +8,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 if __package__ and "." in __package__:
+    from .date_parser import date_is_on_or_after
     from .models import LegalEvent
 else:
+    from date_parser import date_is_on_or_after
     from models import LegalEvent
 
 
@@ -45,12 +47,19 @@ def derive_radar_status(
         item for item in event.dates if item.confirmed and item.datetime is not None
     ]
     deadlines = [
-        item.datetime
+        item
         for item in confirmed
         if item.datetime is not None and item.kind.endswith("deadline")
     ]
     future_deadlines = [
-        value for value in deadlines if _as_local(value, zone) >= local_now
+        value
+        for value in deadlines
+        if date_is_on_or_after(
+            value.datetime,
+            precision=value.precision,
+            now=local_now,
+            timezone_name=zone.key,
+        )
     ]
     if future_deadlines:
         return "current"
@@ -74,7 +83,12 @@ def derive_radar_status(
         return "historical"
 
     future_activity = any(
-        _as_local(item.datetime, zone) >= local_now
+        date_is_on_or_after(
+            item.datetime,
+            precision=item.precision,
+            now=local_now,
+            timezone_name=zone.key,
+        )
         for item in confirmed
         if item.datetime is not None and not item.kind.endswith("deadline")
     )

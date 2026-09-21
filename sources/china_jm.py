@@ -53,8 +53,12 @@ class ChinaJMSourceAdapter(GenericEventSourceAdapter):
             if len(documents) >= self.max_items:
                 break
             detail = await self.http.fetch_document(link.url)
+            if not self._is_allowed_detail_url(detail.url):
+                continue
             content, attachments, warnings = await fetch_relevant_pdf_attachments(
-                self.http, detail
+                self.http,
+                detail,
+                allowed_hosts={urlparse(self.index_url).netloc.lower()},
             )
             documents.append(
                 SourceDocument(

@@ -88,7 +88,11 @@ def item_key_from_url(url: str) -> str:
 
 
 async def fetch_relevant_pdf_attachments(
-    http: Any, detail: Any
+    http: Any,
+    detail: Any,
+    *,
+    allowed_hosts: set[str] | None = None,
+    max_bytes: int = 8 * 1024 * 1024,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     """Fetch linked PDFs only when the HTML body points to an attachment."""
     if "pdf" in str(getattr(detail, "content_type", "")).lower():
@@ -105,9 +109,19 @@ async def fetch_relevant_pdf_attachments(
     for link in extract_links(getattr(detail, "text", ""), getattr(detail, "url", "")):
         if not link.url.lower().split("?", 1)[0].endswith(".pdf"):
             continue
-        attachments.append(link.url)
+        parsed = urlparse(link.url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if allowed_hosts and parsed.netloc.lower() not in allowed_hosts:
+            warnings.append("attachment_host_rejected")
+            continue
         try:
-            pdf = await http.fetch_document(link.url)
+            pdf = await http.fetch_document(link.url, max_bytes=max_bytes)
+            final_host = urlparse(str(getattr(pdf, "url", link.url))).netloc.lower()
+            if allowed_hosts and final_host not in allowed_hosts:
+                warnings.append("attachment_redirect_rejected")
+                continue
+            attachments.append(link.url)
             if getattr(pdf, "text", ""):
                 combined = f"{combined}\n\n[附件原文 {link.url}]\n{pdf.text}"
         except Exception as exc:  # noqa: BLE001 - optional attachment is fail-soft

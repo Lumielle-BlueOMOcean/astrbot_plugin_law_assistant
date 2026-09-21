@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -12,10 +13,12 @@ from typing import Any
 if __package__ and "." in __package__:
     from .content import RealQuestion, subject_filter
     from .daily_plans import DailyPlan
+    from .date_parser import date_is_on_or_after
     from .models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 else:
     from content import RealQuestion, subject_filter
     from daily_plans import DailyPlan
+    from date_parser import date_is_on_or_after
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
 SCHEMA_VERSION = 9
@@ -23,6 +26,16 @@ SCHEMA_VERSION = 9
 
 class UnsupportedSchemaVersionError(RuntimeError):
     """Raised when a database requires a schema newer than this plugin supports."""
+
+
+def _finish_status(*, success: bool | None, status: str | None) -> str:
+    if status is None:
+        if success is None:
+            raise ValueError("finish status or success is required")
+        return "sent" if success else "failed"
+    if status not in {"sent", "failed", "unknown"}:
+        raise ValueError(f"unsupported delivery status: {status}")
+    return status
 
 
 def _migrate_0_to_1(connection: sqlite3.Connection) -> None:
@@ -90,6 +103,17 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
     return row is not None
+
+
+def _stored_date_precision(datetime_value: str | None, evidence: str) -> str:
+    """Recover date-only precision without changing the established v9 schema."""
+    if not datetime_value:
+        return "minute"
+    has_explicit_time = re.search(
+        r"(?:上午|下午|中午|晚上)?\s*\d{1,2}[:：]\d{2}|\d{1,2}\s*点",
+        evidence or "",
+    )
+    return "minute" if has_explicit_time else "date"
 
 
 def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
@@ -393,7 +417,7 @@ def _migrate_4_to_5(connection: sqlite3.Connection) -> None:
 
 def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
     """Create the evidence-preserving user learning library."""
-    connection.executescript(
+    connection.execute(
         """
         CREATE TABLE IF NOT EXISTS library_sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -410,9 +434,14 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
             storage_path TEXT,
             metadata_json TEXT NOT NULL,
             UNIQUE(created_by, content_hash)
-        );
-        CREATE INDEX IF NOT EXISTS idx_library_sources_hash
-            ON library_sources(content_hash);
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_library_sources_hash ON library_sources(content_hash)"
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS learning_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             item_type TEXT NOT NULL,
@@ -427,20 +456,31 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
             created_by TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
             UNIQUE(created_by, item_hash)
-        );
-        CREATE INDEX IF NOT EXISTS idx_learning_items_type
-            ON learning_items(item_type);
-        CREATE INDEX IF NOT EXISTS idx_learning_items_subjects
-            ON learning_items(subjects_json);
-        CREATE INDEX IF NOT EXISTS idx_learning_items_created_by
-            ON learning_items(created_by);
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_learning_items_type ON learning_items(item_type)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_learning_items_subjects ON learning_items(subjects_json)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_learning_items_created_by ON learning_items(created_by)"
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS learning_item_sources (
             item_id INTEGER NOT NULL REFERENCES learning_items(id) ON DELETE CASCADE,
             source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
             locator TEXT NOT NULL,
             relationship TEXT NOT NULL,
             PRIMARY KEY(item_id, source_id, relationship)
-        );
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS learning_cases (
             item_id INTEGER PRIMARY KEY REFERENCES learning_items(id) ON DELETE CASCADE,
             case_number TEXT NOT NULL,
@@ -450,7 +490,11 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
             reasoning TEXT NOT NULL,
             result_text TEXT NOT NULL,
             practice_notes_json TEXT NOT NULL
-        );
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS learning_questions (
             item_id INTEGER PRIMARY KEY REFERENCES learning_items(id) ON DELETE CASCADE,
             question_identity TEXT NOT NULL,
@@ -464,7 +508,7 @@ def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
             paper TEXT NOT NULL,
             question_number TEXT NOT NULL,
             answer_source TEXT NOT NULL
-        );
+        )
         """
     )
 
@@ -662,7 +706,7 @@ def _migrate_8_to_9(connection: sqlite3.Connection) -> None:
         ("resolved_origin", "TEXT"),
     ):
         _add_column_if_missing(connection, "daily_contents", column, definition)
-    connection.executescript(
+    connection.execute(
         """
         CREATE TABLE IF NOT EXISTS event_relations (
             event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -671,15 +715,20 @@ def _migrate_8_to_9(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY(event_id, related_event_id),
             CHECK(event_id <> related_event_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_event_relations_canonical
-            ON event_relations(canonical_key);
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_event_relations_canonical ON event_relations(canonical_key)"
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS canonical_publications (
             canonical_key TEXT NOT NULL,
             target_id INTEGER,
             first_published_at TEXT NOT NULL,
             PRIMARY KEY(canonical_key, target_id)
-        );
+        )
         """
     )
 
@@ -975,6 +1024,9 @@ class SQLiteStorage:
                 "label": row["label"],
                 "evidence_text": row["evidence_text"],
                 "confirmed": bool(row["confirmed"]),
+                "precision": _stored_date_precision(
+                    row["datetime"], row["evidence_text"]
+                ),
             }
             for row in rows
         ]
@@ -1160,7 +1212,12 @@ class SQLiteStorage:
                     continue
                 if not date.confirmed or date.datetime is None:
                     continue
-                if now is not None and date.datetime < now:
+                if now is not None and not date_is_on_or_after(
+                    date.datetime,
+                    precision=date.precision,
+                    now=now,
+                    timezone_name=date.timezone,
+                ):
                     continue
                 result.append({"event": event, "date": date})
         result.sort(key=lambda item: item["date"].datetime)
@@ -1393,44 +1450,50 @@ class SQLiteStorage:
         source_name: str | None = None,
         exam_year: str | None = None,
         exclude_ids: set[int] | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[RealQuestion]:
-        rows = self._connection.execute(
-            "SELECT * FROM real_questions WHERE verification_status IN "
-            "('verified', 'official', 'user_verified') ORDER BY id LIMIT ?",
-            (max(1, min(limit, 1000)),),
-        ).fetchall()
         requested_subjects = subject_filter(subject)
-        excluded = exclude_ids or set()
-        result: list[RealQuestion] = []
-        for row in rows:
-            if int(row["id"]) in excluded:
-                continue
-            if (
-                requested_subjects is not None
-                and row["subject"] not in requested_subjects
-            ):
-                continue
-            if question_type and row["question_type"] != question_type:
-                continue
-            if source_name and row["source_name"] != source_name:
-                continue
-            if exam_year and row["exam_year"] != str(exam_year):
-                continue
-            result.append(_real_question_from_row(row))
-        return result
+        clauses = ["verification_status IN ('verified', 'official', 'user_verified')"]
+        params: list[Any] = []
+        if requested_subjects is not None:
+            placeholders = ", ".join("?" for _ in requested_subjects)
+            clauses.append(f"subject IN ({placeholders})")
+            params.extend(sorted(requested_subjects))
+        if question_type:
+            clauses.append("question_type = ?")
+            params.append(question_type)
+        if source_name:
+            clauses.append("source_name = ?")
+            params.append(source_name)
+        if exam_year:
+            clauses.append("exam_year = ?")
+            params.append(str(exam_year))
+        if exclude_ids:
+            placeholders = ", ".join("?" for _ in exclude_ids)
+            clauses.append(f"id NOT IN ({placeholders})")
+            params.extend(sorted(exclude_ids))
+        limit_clause = ""
+        if limit is not None:
+            params.append(max(1, min(int(limit), 10000)))
+            limit_clause = " LIMIT ?"
+        rows = self._connection.execute(
+            f"SELECT * FROM real_questions WHERE {' AND '.join(clauses)} "
+            f"ORDER BY id{limit_clause}",
+            params,
+        ).fetchall()
+        return [_real_question_from_row(row) for row in rows]
 
     def count_real_questions(
         self, *, subject: Any = None, question_type: str | None = None
     ) -> int:
         return len(
             self.list_real_questions(
-                subject=subject, question_type=question_type, limit=1000
+                subject=subject, question_type=question_type, limit=None
             )
         )
 
     def real_question_inventory(self) -> dict[str, Any]:
-        questions = self.list_real_questions(limit=1000)
+        questions = self.list_real_questions(limit=None)
         by_subject: dict[str, int] = {}
         by_type: dict[str, int] = {}
         for question in questions:
@@ -1542,15 +1605,21 @@ class SQLiteStorage:
         return int(cursor.lastrowid) if cursor.rowcount else None
 
     def finish_publication(
-        self, publication_id: int, *, success: bool, error_summary: str | None = None
+        self,
+        publication_id: int,
+        *,
+        success: bool | None = None,
+        status: str | None = None,
+        error_summary: str | None = None,
     ) -> None:
+        final_status = _finish_status(success=success, status=status)
         self._connection.execute(
             """
             UPDATE publications SET status = ?, finished_at = ?, error_summary = ?
             WHERE id = ?
             """,
             (
-                "sent" if success else "failed",
+                final_status,
                 _serialize_datetime(DateTime.now(timezone.utc)),
                 error_summary,
                 publication_id,
@@ -1593,15 +1662,21 @@ class SQLiteStorage:
         return int(cursor.lastrowid) if cursor.rowcount else None
 
     def finish_reminder(
-        self, reminder_id: int, *, success: bool, error_summary: str | None = None
+        self,
+        reminder_id: int,
+        *,
+        success: bool | None = None,
+        status: str | None = None,
+        error_summary: str | None = None,
     ) -> None:
+        final_status = _finish_status(success=success, status=status)
         self._connection.execute(
             """
             UPDATE reminders SET status = ?, finished_at = ?, error_summary = ?
             WHERE id = ?
             """,
             (
-                "sent" if success else "failed",
+                final_status,
                 _serialize_datetime(DateTime.now(timezone.utc)),
                 error_summary,
                 reminder_id,
@@ -1754,15 +1829,21 @@ class SQLiteStorage:
         )
 
     def finish_daily_content(
-        self, content_id: int, *, success: bool, error_summary: str | None = None
+        self,
+        content_id: int,
+        *,
+        success: bool | None = None,
+        status: str | None = None,
+        error_summary: str | None = None,
     ) -> None:
+        final_status = _finish_status(success=success, status=status)
         self._connection.execute(
             """
             UPDATE daily_contents SET status = ?, finished_at = ?, error_summary = ?
             WHERE id = ?
             """,
             (
-                "sent" if success else "failed",
+                final_status,
                 _serialize_datetime(DateTime.now(timezone.utc)),
                 error_summary,
                 content_id,
@@ -1898,6 +1979,9 @@ class SQLiteStorage:
                     label=date_row["label"],
                     evidence_text=date_row["evidence_text"],
                     confirmed=bool(date_row["confirmed"]),
+                    precision=_stored_date_precision(
+                        date_row["datetime"], date_row["evidence_text"]
+                    ),
                 )
                 for date_row in date_rows
             ),
@@ -1970,6 +2054,7 @@ def _dates_snapshot(dates: Iterable[EventDate]) -> list[dict[str, Any]]:
             "label": date.label,
             "evidence_text": date.evidence_text,
             "confirmed": bool(date.confirmed),
+            "precision": date.precision,
         }
         for date in dates
     ]

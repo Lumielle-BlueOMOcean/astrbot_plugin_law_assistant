@@ -47,8 +47,12 @@ class GenericEventSourceAdapter:
             if len(documents) >= self.max_items:
                 break
             detail = await self.http.fetch_document(link.url)
+            if not self._is_allowed_detail_url(detail.url):
+                continue
             content, attachments, warnings = await fetch_relevant_pdf_attachments(
-                self.http, detail
+                self.http,
+                detail,
+                allowed_hosts={urlparse(self.index_url).netloc.lower()},
             )
             documents.append(
                 SourceDocument(
@@ -74,12 +78,16 @@ class GenericEventSourceAdapter:
         """Allow a specialized source to exclude navigation links."""
         return True
 
+    def _is_allowed_detail_url(self, url: str) -> bool:
+        parsed = urlparse(url)
+        base = urlparse(self.index_url)
+        return parsed.scheme in {"http", "https"} and (
+            parsed.netloc.lower() == base.netloc.lower()
+        )
+
 
 def _generic_item_key(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.query:
-        return item_key_from_url(url).lstrip("/")
-    return parsed.path.rstrip("/").split("/")[-1] or "/"
+    return item_key_from_url(url).lstrip("/")
 
 
 def _now_iso() -> str:
