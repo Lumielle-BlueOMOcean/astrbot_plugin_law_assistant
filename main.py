@@ -29,6 +29,7 @@ if __package__:
     from .sources.generic import GenericEventSourceAdapter
     from .sources.law_updates import LawUpdateExtractor
     from .storage import SQLiteStorage
+    from .structured_ingestion import StructuredMaterialIngestionService
     from .web_api import LawAssistantWebApi
 else:
     from config import PluginConfig
@@ -47,6 +48,7 @@ else:
     from sources.generic import GenericEventSourceAdapter
     from sources.law_updates import LawUpdateExtractor
     from storage import SQLiteStorage
+    from structured_ingestion import StructuredMaterialIngestionService
     from web_api import LawAssistantWebApi
 
 PLUGIN_NAME = "astrbot_plugin_law_assistant"
@@ -153,6 +155,10 @@ class LawAssistant(Star):
             data_dir,
             self.library_service,
         )
+        self.structured_ingestion = StructuredMaterialIngestionService(
+            data_dir,
+            self.library_service,
+        )
         self.learning_service.library_service = self.library_service
         self.service = LawAssistantService(
             self.storage,
@@ -163,6 +169,7 @@ class LawAssistant(Star):
             learning_service=self.learning_service,
             library_service=self.library_service,
             document_ingestion=self.document_ingestion,
+            structured_ingestion=self.structured_ingestion,
             config=self.plugin_config,
             logger=logger,
         )

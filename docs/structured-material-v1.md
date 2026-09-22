@@ -167,12 +167,16 @@
 - `counts.questions/cases/materials`；
 - `counts.processable`、`counts.entry_errors`、`counts.review_items`；
 - 材料块数；
-- 每题原始题号、题型、题干段数、小问数、答案状态和复核状态；
-- 每个案例的标题、块数和复核状态；
+- 每题标题/原始题号、方向、题型、公共材料引用、题干与解析块数、小问数、答案状态/来源、定位和复核状态；
+- 每个案例的标题、方向、块数、定位和复核状态；
 - 全部 issues 及其路径。
 
-预览不核对未提供的原始 PDF，不生成正式导入确认 token，也不写入数据库。下一阶段接入现有 `prepare → preview → confirm` 时，应继续保留这些证据和待复核状态。
+预览不核对未提供的原始 PDF，不生成正式导入确认 token，也不写入数据库。0.4B 的正式导入同时接收原始 PDF 与本 JSON：后端重新计算 PDF 字节 SHA-256、JSON 原文 SHA-256 和规范化 payload SHA-256，只有三者与 prepare 快照一致时才允许 confirm。prepare 阶段不写资料库；confirm 通过后才把原始 PDF、JSON、公共材料、内容块、小问、来源关系和候选条目写入 SQLite。
+
+正式导入保留两条来源记录：原始文件来源和结构化 JSON 来源。条目写入 `learning_items` 作为兼容检索索引，同时写入结构化表保存原始顺序和富结构。题目身份固定为 `real_question_candidate`，案例身份固定为用户候选；`verification_status` 为 `pending_review`，不会因为 JSON 中的声明自动升级为核验真题或官方案例。带有缺失定位、未提供答案或外部整理答案的条目会在预览中标为 review，并关联 `learning_review_items`。
+
+当前 Plugin Page 只允许以原始 PDF + JSON 的组合启动 0.4B 导入；旧的 TXT/Markdown/DOCX/PDF `prepare → confirm` 仍走原有分段路径，不能用旧正则分段器替代结构化导入。原始资料和 JSON 只保存于插件数据目录，不进入 Git。
 
 ## 当前边界
 
-0.4A 不修改 schema v9，不把模板写入正式学习库存，不改现有 TXT/Markdown/DOCX/PDF 导入，不实现 QQ 续读、答题、揭晓答案或每日调度行为。下一阶段使用真实 PDF 验证后，v1 可以增加向后兼容字段，但不得静默改变现有字段含义。
+0.4B 不实现官方身份升级、答案继续作答协议、独立会话系统、RAG 或每日任务接管。正式导入仍是候选资料保存与检索基础；真实 PDF 的内容、版权和逐题核验责任由操作者承担，插件不会把外部模型整理结果当作官方事实。

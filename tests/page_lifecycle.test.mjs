@@ -77,7 +77,7 @@ test("stale asynchronous overview render cannot overwrite the newest generation"
   page.state.route = "overview";
   page.state.renderGeneration = 1;
   const first = page.renderOverview();
-  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 9 });
+  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 10 });
   page.state.renderGeneration = 2;
   const second = page.renderOverview();
   await second;
@@ -155,4 +155,24 @@ test("navigate plus hashchange performs one effective route render", async () =>
   window.location.hash = "#library";
   await handlers.hashchange();
   assert.equal(librarySearchCalls, 1);
+});
+
+test("structured import preview renders candidate identity and review counts", async () => {
+  const { elements, page } = await loadPage();
+  page.renderStructuredImportPreview(elements.get("view-library"), {
+    token: "structured-token",
+    preview: {
+      original_filename: "verified.pdf",
+      schema_version: "1.0",
+      counts: { questions: 1, cases: 1, materials: 1, processable: 2, entry_errors: 0, review_items: 1 },
+      review: 1,
+      questions: [{ id: "q-1", source_number: "2022-一", question_type: "short_answer", title: "知识产权简答题", stem_block_count: 1, subquestion_count: 1, answer_status: "provided", review_status: "pending_review" }],
+      cases: [{ id: "c-1", title: "合同纠纷案例", review_status: "ready" }],
+    },
+  });
+  const text = textOf(elements.get("view-library"));
+  assert.match(text, /verified\.pdf/);
+  assert.match(text, /知识产权简答题/);
+  assert.match(text, /合同纠纷案例/);
+  assert.match(text, /review 1/);
 });

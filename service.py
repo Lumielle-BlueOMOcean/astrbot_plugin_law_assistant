@@ -37,6 +37,11 @@ if __package__ and "." in __package__:
     from .publisher import format_deadline_reminder, format_event
     from .sources.base import Extractor, SourceAdapter, Validator
     from .storage import SQLiteStorage
+    from .structured_ingestion import (
+        PreparedStructuredImport,
+        StructuredImportError,
+        StructuredMaterialIngestionService,
+    )
 else:
     from activity_radar import (
         canonical_event_key,
@@ -61,6 +66,11 @@ else:
     from publisher import format_deadline_reminder, format_event
     from sources.base import Extractor, SourceAdapter, Validator
     from storage import SQLiteStorage
+    from structured_ingestion import (
+        PreparedStructuredImport,
+        StructuredImportError,
+        StructuredMaterialIngestionService,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +136,15 @@ class PendingImport:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingStructuredImport:
+    token: str
+    prepared: PreparedStructuredImport
+    created_at: datetime
+    expires_at: datetime
+    owner_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ContentReference:
     content_type: str
     content: dict[str, Any]
@@ -169,6 +188,7 @@ class LawAssistantService:
         learning_service: LearningService | None = None,
         library_service: LibraryService | None = None,
         document_ingestion: Any | None = None,
+        structured_ingestion: StructuredMaterialIngestionService | None = None,
         config: Any | None = None,
         clock: Any | None = None,
     ) -> None:
@@ -183,12 +203,14 @@ class LawAssistantService:
         self.learning_service = learning_service
         self.library_service = library_service
         self.document_ingestion = document_ingestion
+        self.structured_ingestion = structured_ingestion
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._scan_lock = asyncio.Lock()
         self._publish_confirmations: dict[str, PendingPublication] = {}
         self._plan_confirmations: dict[str, PendingPlanUpdate] = {}
         self._plan_reset_confirmations: dict[str, PendingPlanReset] = {}
         self._import_confirmations: dict[str, PendingImport] = {}
+        self._structured_import_confirmations: dict[str, PendingStructuredImport] = {}
         self._unbind_confirmations: dict[
             str, tuple[int, datetime, datetime, str | None]
         ] = {}
@@ -1824,6 +1846,103 @@ class LawAssistantService:
                 "message": str(exc),
             }
         return {"success": True, **result}
+
+    async def stage_structured_upload(
+        self, filename: str, data: bytes
+    ) -> dict[str, Any]:
+        if self.structured_ingestion is None:
+            return {"success": False, "error": "structured_ingestion_unavailable"}
+        try:
+            staged = await self.structured_ingestion.stage_json_upload(filename, data)
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": "invalid_structured_upload",
+                "message": str(exc),
+            }
+        return {"success": True, **staged}
+
+    async def prepare_structured_learning_import(
+        self,
+        original_staged_path: str,
+        structured_staged_path: str,
+        *,
+        created_by: str,
+        session_origin: str,
+        owner_id: str | None = None,
+        original_filename: str | None = None,
+        structured_filename: str | None = None,
+    ) -> dict[str, Any]:
+        if self.structured_ingestion is None:
+            return {"success": False, "error": "structured_ingestion_unavailable"}
+        try:
+            prepared = await self.structured_ingestion.prepare(
+                original_staged_path,
+                structured_staged_path,
+                created_by=created_by,
+                session_origin=session_origin,
+                original_filename=original_filename,
+                structured_filename=structured_filename,
+            )
+        except StructuredImportError as exc:
+            return {"success": False, "error": exc.code, "message": str(exc)}
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": "invalid_structured_import",
+                "message": str(exc),
+            }
+        token = secrets.token_urlsafe(16)
+        now = self._now_utc()
+        self._structured_import_confirmations[token] = PendingStructuredImport(
+            token=token,
+            prepared=prepared,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+            owner_id=owner_id,
+        )
+        return {
+            "success": True,
+            "token": token,
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            "preview": copy.deepcopy(prepared.preview),
+        }
+
+    async def confirm_structured_learning_import(
+        self, token: str, *, owner_id: str | None = None
+    ) -> dict[str, Any]:
+        key = str(token or "").strip()
+        pending = self._structured_import_confirmations.pop(key, None)
+        if pending is None:
+            return {
+                "success": False,
+                "error": "invalid_token",
+                "message": "结构化导入 token 无效或已使用",
+            }
+        if pending.owner_id and pending.owner_id != owner_id:
+            self._structured_import_confirmations[key] = pending
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "结构化导入 token 不属于当前会话",
+            }
+        if self._now_utc() > pending.expires_at:
+            return {
+                "success": False,
+                "error": "expired_token",
+                "message": "结构化导入 token 已过期",
+            }
+        try:
+            result = await self.structured_ingestion.confirm(pending.prepared)
+        except StructuredImportError as exc:
+            return {"success": False, "error": exc.code, "message": str(exc)}
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": "invalid_structured_import",
+                "message": str(exc),
+            }
+        return result
 
     async def search_learning_library(self, **kwargs: Any) -> dict[str, Any]:
         if self.library_service is None:

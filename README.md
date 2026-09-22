@@ -1,6 +1,6 @@
 # 微光·法务助手 / Lumielle Law Assistant
 
-AstrBot QQ 法律信息助手。`0.3.0` 支持活动、官方案例、法规更新、学习资料库、受控文档导入、每日任务、多群定向发布和 AstrBot 4.25+ 嵌入式管理页；以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
+AstrBot QQ 法律信息助手。`0.4.0` 在活动、官方案例、法规更新、学习资料库、受控文档导入、每日任务、多群定向发布和 AstrBot 4.25+ 嵌入式管理页基础上，增加 PDF + structured-material v1 的无损候选导入；以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
 
 ## Implemented
 
@@ -27,6 +27,7 @@ AstrBot QQ 法律信息助手。`0.3.0` 支持活动、官方案例、法规更�
 - 自动 scheduler 默认关闭；计划在运行中经确认启用后会唤醒同一个 scheduler，不需要手动 reload；reload/terminate 会取消任务。
 - Python 3.12 单元测试、ruff、compile 和真实 AstrBot 4.22.0/4.25.0 loader smoke。
 - AstrBot 4.25+ Plugin Page：总览、资料库搜索/详情、受控 TXT/DOCX/PDF 上传的 prepare/confirm 导入、待复核状态、活动雷达扫描、每日计划预览、群目标和运行记录。
+- 结构化资料导入：Plugin Page 的“结构化资料导入”同时接收原始 PDF 和 `structured-material-v1.json`，prepare 只生成预览，confirm 后以 `real_question_candidate` / `pending_review`（案例为用户候选）写入资料库；它不会调用旧正则拆分器，也不会授予核验真题或官方案例身份。公共材料、题干/答案/解析块、小问、定位和来源关系均持久化。
 - 页面使用原生 HTML/CSS/Vanilla ES Modules 与 `window.AstrBotPluginPage` Bridge，不需要 Node、npm、CDN 或独立 HTTP server。
 
 ## Planned / deferred
@@ -74,7 +75,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 
 ### Plugin ZIP
 
-在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.3.0.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
+在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.4.0.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
 
 完整嵌入式 WebUI 需要 AstrBot `>=4.25`；基础插件功能兼容 `>=4.22.0,<5`。页面认证由 AstrBot Dashboard 提供，插件不建立第二套账号密码系统。
 
@@ -113,7 +114,13 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `9`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
+当前 schema version 为 `10`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
+
+### 结构化资料导入
+
+准备一个原始 PDF 和一份符合 `docs/structured-material-v1.md` 的 JSON。JSON 的 `document.original_file_sha256` 必须等于原始 PDF 的 SHA-256。Plugin Page → 资料库 → 文件导入 → 结构化资料导入会分别 staging 两个文件，后端显示题目、材料、块、小问、答案状态、定位和 fatal/error/review 统计；确认前不会写 SQLite，任一文件或 JSON 内容变化都会使 token 失效。
+
+结构化题目默认只是 `real_question_candidate` / `pending_review`，不会进入 `origin=real` 的核验真题库存。原始文件和 JSON 会保存在插件数据目录的 `assets/` 与 `imports/` 下，来源 hash、创建者、会话、PDF 定位和 JSON payload 均保留。真实题库内容必须由用户依法取得并逐题核验；仓库不内置题库，也不把 PDF 提交到 Git。
 
 该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
 
@@ -250,6 +257,6 @@ python scripts/build_release.py --output dist
 
 `.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；4.25.0 额外验证 Plugin Page discovery、`/api/plug/astrbot_plugin_law_assistant/...` route contract 和解压 ZIP 的页面加载；required failure 不用 `continue-on-error` 隐藏。
 
-CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.3.0.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
+CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.4.0.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
 
 本地的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用 deterministic fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取、Dashboard 浏览器操作和真实 LLM provider 仍需后续实机验收。

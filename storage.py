@@ -21,7 +21,7 @@ else:
     from date_parser import date_is_on_or_after
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -733,6 +733,136 @@ def _migrate_8_to_9(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_9_to_10(connection: sqlite3.Connection) -> None:
+    """Add lossless, candidate-only structured-material persistence."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_source_id INTEGER NOT NULL REFERENCES library_sources(id),
+            structured_source_id INTEGER NOT NULL REFERENCES library_sources(id),
+            schema_version TEXT NOT NULL,
+            original_file_sha256 TEXT NOT NULL,
+            structured_json_sha256 TEXT NOT NULL,
+            structured_payload_sha256 TEXT NOT NULL,
+            preparation_method TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(created_by, original_file_sha256, structured_json_sha256,
+                   structured_payload_sha256)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL REFERENCES structured_imports(id)
+                ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(import_id, external_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_item_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL REFERENCES structured_imports(id)
+                ON DELETE CASCADE,
+            item_id INTEGER NOT NULL REFERENCES learning_items(id)
+                ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            source_number TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            structure_version TEXT NOT NULL,
+            review_status TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            UNIQUE(import_id, external_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_subquestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            binding_id INTEGER NOT NULL REFERENCES structured_item_bindings(id)
+                ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            source_number TEXT NOT NULL,
+            order_index INTEGER NOT NULL,
+            answer_status TEXT NOT NULL,
+            answer_reason TEXT NOT NULL,
+            locators_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            UNIQUE(binding_id, external_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL REFERENCES structured_imports(id)
+                ON DELETE CASCADE,
+            item_id INTEGER REFERENCES learning_items(id) ON DELETE CASCADE,
+            material_id INTEGER REFERENCES structured_materials(id)
+                ON DELETE CASCADE,
+            subquestion_id INTEGER REFERENCES structured_subquestions(id)
+                ON DELETE CASCADE,
+            section TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            order_index INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            provenance TEXT NOT NULL,
+            metadata_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS structured_material_relations (
+            binding_id INTEGER NOT NULL REFERENCES structured_item_bindings(id)
+                ON DELETE CASCADE,
+            material_id INTEGER NOT NULL REFERENCES structured_materials(id)
+                ON DELETE CASCADE,
+            relation_order INTEGER NOT NULL,
+            PRIMARY KEY(binding_id, material_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_structured_blocks_item
+            ON structured_blocks(item_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_structured_blocks_material
+            ON structured_blocks(material_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_structured_bindings_item
+            ON structured_item_bindings(item_id)
+        """
+    )
+    _add_column_if_missing(
+        connection,
+        "learning_review_items",
+        "structured_import_id",
+        "INTEGER REFERENCES structured_imports(id)",
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -743,6 +873,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     6: _migrate_6_to_7,
     7: _migrate_7_to_8,
     8: _migrate_8_to_9,
+    9: _migrate_9_to_10,
 }
 
 

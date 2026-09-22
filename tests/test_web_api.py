@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from library_repository import LibraryRepository
 from library_service import LibraryService
 from service import LawAssistantService
 from storage import SQLiteStorage
+from structured_ingestion import StructuredMaterialIngestionService
+from tests.test_structured_ingestion import _payload, _text_pdf_bytes
 from web_api import LawAssistantWebApi
 
 
@@ -38,10 +41,12 @@ def _service(tmp_path: Path) -> LawAssistantService:
     storage = SQLiteStorage(tmp_path / "law.sqlite3")
     library = LibraryService(LibraryRepository(storage.connection))
     ingestion = DocumentIngestionService(tmp_path, library)
+    structured_ingestion = StructuredMaterialIngestionService(tmp_path, library)
     return LawAssistantService(
         storage,
         library_service=library,
         document_ingestion=ingestion,
+        structured_ingestion=structured_ingestion,
         config=SimpleNamespace(timezone="Asia/Shanghai"),
     )
 
@@ -62,6 +67,9 @@ def test_web_api_routes_use_plugin_namespace():
         ("/astrbot_plugin_law_assistant/library/search", "GET"),
         ("/astrbot_plugin_law_assistant/radar/scan", "POST"),
         ("/astrbot_plugin_law_assistant/files/stage", "POST"),
+        ("/astrbot_plugin_law_assistant/structured/stage-json", "POST"),
+        ("/astrbot_plugin_law_assistant/structured/prepare", "POST"),
+        ("/astrbot_plugin_law_assistant/structured/confirm", "POST"),
         ("/astrbot_plugin_law_assistant/plans/prepare", "POST"),
     }
 
@@ -77,8 +85,67 @@ async def test_web_api_registers_overview_and_returns_stable_json(tmp_path):
 
     assert response.status_code == 200
     assert payload["success"] is True
-    assert payload["data"]["schema_version"] == 9
+    assert payload["data"]["schema_version"] == 10
     assert "learning" in payload["data"]
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_api_structured_prepare_and_confirm_uses_two_hash_bound_files(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    app = _app_for(LawAssistantWebApi(service))
+    pdf_bytes = _text_pdf_bytes()
+    payload = _payload(pdf_bytes)
+
+    async with app.test_client() as client:
+        staged_pdf = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/files/stage",
+            files={
+                "file": FileStorage(
+                    stream=io.BytesIO(pdf_bytes), filename="verified.pdf"
+                )
+            },
+        )
+        pdf_data = (await staged_pdf.get_json())["data"]
+        staged_json = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/structured/stage-json",
+            files={
+                "file": FileStorage(
+                    stream=io.BytesIO(json.dumps(payload, ensure_ascii=False).encode()),
+                    filename="verified material.json",
+                )
+            },
+        )
+        json_data = (await staged_json.get_json())["data"]
+        prepared = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/structured/prepare",
+            json={
+                "original_staged_path": pdf_data["staged_path"],
+                "structured_staged_path": json_data["staged_path"],
+                "original_filename": "verified.pdf",
+                "structured_filename": "verified material.json",
+            },
+        )
+        prepared_payload = await prepared.get_json()
+        assert prepared_payload["success"] is True
+        assert prepared_payload["data"]["preview"]["counts"]["processable"] == 2
+        assert (
+            service.storage.connection.execute(
+                "SELECT COUNT(*) FROM structured_imports"
+            ).fetchone()[0]
+            == 0
+        )
+
+        confirmed = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/structured/confirm",
+            json={"token": prepared_payload["data"]["token"]},
+        )
+        confirmed_payload = await confirmed.get_json()
+        assert confirmed_payload["success"] is True
+        assert confirmed_payload["data"]["archived"] == 2
+
     service.storage.close()
 
 

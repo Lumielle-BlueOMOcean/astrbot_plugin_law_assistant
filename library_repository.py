@@ -90,6 +90,11 @@ def _review_from_row(row: sqlite3.Row) -> LearningReviewItem:
         status=str(row["status"]),
         created_at=_parse_datetime(str(row["created_at"])),
         updated_at=_parse_datetime(str(row["updated_at"])),
+        structured_import_id=(
+            int(row["structured_import_id"])
+            if row["structured_import_id"] is not None
+            else None
+        ),
     )
 
 
@@ -164,116 +169,510 @@ class LibraryRepository:
         if source.id is not None or item.id is not None:
             raise ValueError("archive expects unsaved source and item models")
         with self.connection:
-            source_id = self.ensure_source(source)
+            return self._archive_inner(
+                source,
+                item,
+                case=case,
+                question=question,
+                locator=locator,
+                relationship=relationship,
+            )
 
+    def _archive_inner(
+        self,
+        source: LibrarySource,
+        item: LearningItem,
+        *,
+        case: CaseDetail | None = None,
+        question: QuestionDetail | None = None,
+        locator: str = "",
+        relationship: str = "primary_evidence",
+    ) -> LibraryArchiveResult:
+        source_id = self.ensure_source(source)
+
+        existing = self.connection.execute(
+            """
+            SELECT * FROM learning_items
+            WHERE created_by = ? AND item_hash = ?
+            """,
+            (item.created_by, item.item_hash),
+        ).fetchone()
+        if existing is not None:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO learning_item_sources(
+                    item_id, source_id, locator, relationship
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (int(existing["id"]), source_id, locator, relationship),
+            )
+            if not bool(existing["active"]):
+                self.connection.execute(
+                    "UPDATE learning_items SET active = 1 WHERE id = ?",
+                    (int(existing["id"]),),
+                )
+            return LibraryArchiveResult(
+                source_id=source_id,
+                item_id=int(existing["id"]),
+                duplicate=True,
+            )
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO learning_items(
+                item_type, identity, item_hash, title, subjects_json,
+                verification_status, source_summary, created_at, updated_at,
+                created_by, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.item_type,
+                item.identity,
+                item.item_hash,
+                item.title,
+                _json(list(item.subjects)),
+                item.verification_status,
+                item.source_summary,
+                item.created_at.isoformat(),
+                item.updated_at.isoformat(),
+                item.created_by,
+                _json(item.metadata),
+            ),
+        )
+        item_id = int(cursor.lastrowid)
+        self.connection.execute(
+            """
+            INSERT INTO learning_item_sources(item_id, source_id, locator, relationship)
+            VALUES (?, ?, ?, ?)
+            """,
+            (item_id, source_id, locator, relationship),
+        )
+        if case is not None:
+            self.connection.execute(
+                """
+                INSERT INTO learning_cases(
+                    item_id, case_number, authority, case_summary, issues_json,
+                    reasoning, result_text, practice_notes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    case.case_number,
+                    case.authority,
+                    case.case_summary,
+                    _json(list(case.issues)),
+                    case.reasoning,
+                    case.result_text,
+                    _json(list(case.practice_notes)),
+                ),
+            )
+        if question is not None:
+            self.connection.execute(
+                """
+                INSERT INTO learning_questions(
+                    item_id, question_identity, question_type, stem, options_json,
+                    answer_json, explanation, exam_name, exam_year, paper,
+                    question_number, answer_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    question.question_identity,
+                    question.question_type,
+                    question.stem,
+                    _json(list(question.options)),
+                    _json(question.answer),
+                    question.explanation,
+                    question.exam_name,
+                    question.exam_year,
+                    question.paper,
+                    question.question_number,
+                    question.answer_source,
+                ),
+            )
+        return LibraryArchiveResult(
+            source_id=source_id, item_id=item_id, duplicate=False
+        )
+
+    def archive_structured_import(
+        self,
+        *,
+        original_source: LibrarySource,
+        structured_source: LibrarySource,
+        schema_version: str,
+        original_file_sha256: str,
+        structured_json_sha256: str,
+        structured_payload_sha256: str,
+        preparation_method: str,
+        payload_json: str,
+        created_by: str,
+        created_at: datetime,
+        materials: list[dict[str, Any]],
+        item_records: list[dict[str, Any]],
+        review_records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist one validated structured document in one transaction.
+
+        ``learning_items`` remains the compatibility index.  The structured
+        tables below it retain the validated payload, ordered blocks and
+        relations without asking the legacy segmenter to infer boundaries.
+        """
+
+        def add_blocks(
+            *,
+            import_id: int,
+            blocks: Any,
+            section: str,
+            item_id: int | None = None,
+            material_id: int | None = None,
+            subquestion_id: int | None = None,
+        ) -> int:
+            if not isinstance(blocks, list):
+                return 0
+            count = 0
+            for index, block in enumerate(blocks, 1):
+                if not isinstance(block, dict):
+                    continue
+                text = str(block.get("text") or "").strip()
+                if not text:
+                    continue
+                self.connection.execute(
+                    """
+                    INSERT INTO structured_blocks(
+                        import_id, item_id, material_id, subquestion_id, section,
+                        external_id, order_index, kind, text, locator, provenance,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        import_id,
+                        item_id,
+                        material_id,
+                        subquestion_id,
+                        section,
+                        str(block.get("id") or f"{section}-{index}"),
+                        int(block.get("order") or index),
+                        str(block.get("kind") or "paragraph"),
+                        text,
+                        str(block.get("locator") or ""),
+                        str(block.get("provenance") or "unknown"),
+                        _json(
+                            {
+                                key: value
+                                for key, value in block.items()
+                                if key
+                                not in {
+                                    "id",
+                                    "order",
+                                    "kind",
+                                    "text",
+                                    "locator",
+                                    "provenance",
+                                }
+                            }
+                        ),
+                    ),
+                )
+                count += 1
+            return count
+
+        def block_locator(item: dict[str, Any]) -> str:
+            locators = item.get("locators")
+            if isinstance(locators, list) and locators:
+                return str(locators[0])
+            for field in ("stem_blocks", "blocks", "basic_facts_blocks"):
+                values = item.get(field)
+                if isinstance(values, list) and values:
+                    return str(values[0].get("locator") or "")
+            return ""
+
+        with self.connection:
+            original_source_id = self.ensure_source(original_source)
+            structured_source_id = self.ensure_source(structured_source)
             existing = self.connection.execute(
                 """
-                SELECT * FROM learning_items
-                WHERE created_by = ? AND item_hash = ?
+                SELECT id, original_source_id, structured_source_id
+                FROM structured_imports
+                WHERE created_by = ? AND original_file_sha256 = ?
+                  AND structured_json_sha256 = ?
+                  AND structured_payload_sha256 = ?
                 """,
-                (item.created_by, item.item_hash),
+                (
+                    created_by,
+                    original_file_sha256,
+                    structured_json_sha256,
+                    structured_payload_sha256,
+                ),
             ).fetchone()
             if existing is not None:
+                return {
+                    "duplicate": True,
+                    "import_id": int(existing["id"]),
+                    "original_source_id": int(existing["original_source_id"]),
+                    "structured_source_id": int(existing["structured_source_id"]),
+                    "archived": 0,
+                    "failed": 0,
+                    "needs_review": 0,
+                    "items": [],
+                }
+
+            cursor = self.connection.execute(
+                """
+                INSERT INTO structured_imports(
+                    original_source_id, structured_source_id, schema_version,
+                    original_file_sha256, structured_json_sha256,
+                    structured_payload_sha256, preparation_method, payload_json,
+                    created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    original_source_id,
+                    structured_source_id,
+                    schema_version,
+                    original_file_sha256,
+                    structured_json_sha256,
+                    structured_payload_sha256,
+                    preparation_method,
+                    payload_json,
+                    created_by,
+                    created_at.isoformat(),
+                ),
+            )
+            import_id = int(cursor.lastrowid)
+            material_ids: dict[str, int] = {}
+            material_count = 0
+            for material in materials:
+                external_id = str(material.get("id") or "").strip()
+                if not external_id:
+                    continue
+                material_cursor = self.connection.execute(
+                    """
+                    INSERT INTO structured_materials(
+                        import_id, external_id, title, metadata_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        import_id,
+                        external_id,
+                        str(material.get("title") or ""),
+                        _json(
+                            {
+                                key: value
+                                for key, value in material.items()
+                                if key not in {"id", "title", "blocks"}
+                            }
+                        ),
+                    ),
+                )
+                material_id = int(material_cursor.lastrowid)
+                material_ids[external_id] = material_id
+                add_blocks(
+                    import_id=import_id,
+                    blocks=material.get("blocks"),
+                    section="material",
+                    material_id=material_id,
+                )
+                material_count += 1
+
+            archived = 0
+            duplicates = 0
+            item_results: list[dict[str, Any]] = []
+            for record in item_records:
+                payload = dict(record["payload"])
+                item = record["item"]
+                archive_result = self._archive_inner(
+                    original_source,
+                    item,
+                    case=record.get("case"),
+                    question=record.get("question"),
+                    locator=block_locator(payload),
+                    relationship="structured_evidence",
+                )
+                if archive_result.duplicate:
+                    duplicates += 1
+                else:
+                    archived += 1
+                item_id = archive_result.item_id
                 self.connection.execute(
                     """
                     INSERT OR IGNORE INTO learning_item_sources(
                         item_id, source_id, locator, relationship
                     ) VALUES (?, ?, ?, ?)
                     """,
+                    (item_id, structured_source_id, "", "structured_derivation"),
+                )
+                binding_cursor = self.connection.execute(
+                    """
+                    INSERT INTO structured_item_bindings(
+                        import_id, item_id, external_id, source_number, item_kind,
+                        structure_version, review_status, payload_json, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (
-                        int(existing["id"]),
-                        source_id,
-                        locator,
-                        relationship,
+                        import_id,
+                        item_id,
+                        str(payload.get("id") or ""),
+                        str(payload.get("source_number") or ""),
+                        str(record.get("item_kind") or "question"),
+                        schema_version,
+                        str(record.get("review_status") or "pending_review"),
+                        _json(payload),
+                        _json(record.get("metadata") or {}),
                     ),
                 )
-                if not bool(existing["active"]):
-                    self.connection.execute(
-                        "UPDATE learning_items SET active = 1 WHERE id = ?",
-                        (int(existing["id"]),),
+                binding_id = int(binding_cursor.lastrowid)
+                for relation_order, material_ref in enumerate(
+                    payload.get("material_refs") or [], 1
+                ):
+                    material_id = material_ids.get(str(material_ref))
+                    if material_id is not None:
+                        self.connection.execute(
+                            """
+                            INSERT INTO structured_material_relations(
+                                binding_id, material_id, relation_order
+                            ) VALUES (?, ?, ?)
+                            """,
+                            (binding_id, material_id, relation_order),
+                        )
+                add_blocks(
+                    import_id=import_id,
+                    blocks=payload.get("stem_blocks"),
+                    section="stem",
+                    item_id=item_id,
+                )
+                add_blocks(
+                    import_id=import_id,
+                    blocks=payload.get("explanation_blocks"),
+                    section="explanation",
+                    item_id=item_id,
+                )
+                answer = payload.get("answer")
+                if isinstance(answer, dict):
+                    add_blocks(
+                        import_id=import_id,
+                        blocks=answer.get("blocks"),
+                        section="answer",
+                        item_id=item_id,
                     )
-                return LibraryArchiveResult(
-                    source_id=source_id,
-                    item_id=int(existing["id"]),
-                    duplicate=True,
+                if isinstance(payload.get("options"), list):
+                    option_blocks = [
+                        {
+                            "id": f"{payload.get('id')}-option-{index}",
+                            "order": index,
+                            "kind": "paragraph",
+                            "text": f"{option.get('key', '')}. {option.get('text', '')}",
+                            "locator": str(
+                                option.get("locator") or block_locator(payload)
+                            ),
+                            "provenance": "source_text",
+                        }
+                        for index, option in enumerate(payload["options"], 1)
+                        if isinstance(option, dict)
+                    ]
+                    add_blocks(
+                        import_id=import_id,
+                        blocks=option_blocks,
+                        section="options",
+                        item_id=item_id,
+                    )
+                for index, subquestion in enumerate(
+                    payload.get("subquestions") or [], 1
+                ):
+                    if not isinstance(subquestion, dict):
+                        continue
+                    sub_cursor = self.connection.execute(
+                        """
+                        INSERT INTO structured_subquestions(
+                            binding_id, external_id, source_number, order_index,
+                            answer_status, answer_reason, locators_json, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            binding_id,
+                            str(subquestion.get("id") or f"sub-{index}"),
+                            str(subquestion.get("source_number") or ""),
+                            index,
+                            str(
+                                subquestion.get("answer_status")
+                                or (
+                                    "provided"
+                                    if subquestion.get("answer") is not None
+                                    else "unresolved"
+                                )
+                            ),
+                            str(subquestion.get("answer_reason") or ""),
+                            _json(subquestion.get("locators") or []),
+                            _json(subquestion),
+                        ),
+                    )
+                    subquestion_id = int(sub_cursor.lastrowid)
+                    add_blocks(
+                        import_id=import_id,
+                        blocks=subquestion.get("stem_blocks"),
+                        section="subquestion_stem",
+                        item_id=item_id,
+                        subquestion_id=subquestion_id,
+                    )
+                    add_blocks(
+                        import_id=import_id,
+                        blocks=subquestion.get("explanation_blocks"),
+                        section="subquestion_explanation",
+                        item_id=item_id,
+                        subquestion_id=subquestion_id,
+                    )
+                    sub_answer = subquestion.get("answer")
+                    if isinstance(sub_answer, dict):
+                        add_blocks(
+                            import_id=import_id,
+                            blocks=sub_answer.get("blocks"),
+                            section="subquestion_answer",
+                            item_id=item_id,
+                            subquestion_id=subquestion_id,
+                        )
+                item_results.append(
+                    {
+                        "item_id": item_id,
+                        "external_id": payload.get("id"),
+                        "source_number": payload.get("source_number", ""),
+                        "status": "duplicate"
+                        if archive_result.duplicate
+                        else "archived",
+                        "review_status": record.get("review_status", "pending_review"),
+                    }
                 )
 
-            cursor = self.connection.execute(
-                """
-                INSERT INTO learning_items(
-                    item_type, identity, item_hash, title, subjects_json,
-                    verification_status, source_summary, created_at, updated_at,
-                    created_by, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    item.item_type,
-                    item.identity,
-                    item.item_hash,
-                    item.title,
-                    _json(list(item.subjects)),
-                    item.verification_status,
-                    item.source_summary,
-                    item.created_at.isoformat(),
-                    item.updated_at.isoformat(),
-                    item.created_by,
-                    _json(item.metadata),
-                ),
-            )
-            item_id = int(cursor.lastrowid)
-            self.connection.execute(
-                """
-                INSERT INTO learning_item_sources(item_id, source_id, locator, relationship)
-                VALUES (?, ?, ?, ?)
-                """,
-                (item_id, source_id, locator, relationship),
-            )
-            if case is not None:
-                self.connection.execute(
-                    """
-                    INSERT INTO learning_cases(
-                        item_id, case_number, authority, case_summary, issues_json,
-                        reasoning, result_text, practice_notes_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        item_id,
-                        case.case_number,
-                        case.authority,
-                        case.case_summary,
-                        _json(list(case.issues)),
-                        case.reasoning,
-                        case.result_text,
-                        _json(list(case.practice_notes)),
-                    ),
+            review_items: list[dict[str, Any]] = []
+            for review in review_records:
+                review_id = self.record_review_item(
+                    source_id=original_source_id,
+                    candidate_key=str(review["candidate_key"]),
+                    material_type=str(review.get("material_type") or "structured"),
+                    locator=str(review.get("locator") or ""),
+                    raw_fragment=str(review.get("raw_fragment") or ""),
+                    proposed_structure=dict(review.get("proposed_structure") or {}),
+                    review_reason=str(review.get("review_reason") or "需要人工复核"),
+                    now=created_at,
+                    structured_import_id=import_id,
                 )
-            if question is not None:
-                self.connection.execute(
-                    """
-                    INSERT INTO learning_questions(
-                        item_id, question_identity, question_type, stem, options_json,
-                        answer_json, explanation, exam_name, exam_year, paper,
-                        question_number, answer_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        item_id,
-                        question.question_identity,
-                        question.question_type,
-                        question.stem,
-                        _json(list(question.options)),
-                        _json(question.answer),
-                        question.explanation,
-                        question.exam_name,
-                        question.exam_year,
-                        question.paper,
-                        question.question_number,
-                        question.answer_source,
-                    ),
-                )
-        return LibraryArchiveResult(
-            source_id=source_id, item_id=item_id, duplicate=False
-        )
+                review_items.append({"id": review_id, **review})
+
+        return {
+            "duplicate": False,
+            "import_id": import_id,
+            "original_source_id": original_source_id,
+            "structured_source_id": structured_source_id,
+            "archived": archived,
+            "duplicate_items": duplicates,
+            "failed": 0,
+            "needs_review": len(review_records)
+            + sum(
+                record.get("review_status") == "pending_review"
+                for record in item_records
+            ),
+            "materials": material_count,
+            "items": item_results,
+            "review_items": review_items,
+        }
 
     def get(self, item_id: int) -> LibraryItemBundle | None:
         row = self.connection.execute(
@@ -332,6 +731,7 @@ class LibraryRepository:
                 question_number=str(question_row["question_number"]),
                 answer_source=str(question_row["answer_source"]),
             )
+        structured = self._structured_for_item(item_id)
         return LibraryItemBundle(
             item=item,
             sources=tuple(_source_from_row(source) for source in source_rows),
@@ -345,7 +745,139 @@ class LibraryRepository:
             ),
             case=case,
             question=question,
+            structured=structured["structured"] if structured else None,
+            shared_materials=tuple(
+                structured["shared_materials"] if structured else ()
+            ),
+            stem_blocks=tuple(structured["stem_blocks"] if structured else ()),
+            subquestions=tuple(structured["subquestions"] if structured else ()),
+            explanation_blocks=tuple(
+                structured["explanation_blocks"] if structured else ()
+            ),
         )
+
+    def _structured_for_item(self, item_id: int) -> dict[str, Any] | None:
+        binding = self.connection.execute(
+            """
+            SELECT b.*, i.schema_version, i.original_file_sha256,
+                   i.structured_json_sha256, i.structured_payload_sha256,
+                   i.preparation_method, i.created_by AS import_created_by,
+                   i.created_at AS import_created_at
+            FROM structured_item_bindings AS b
+            JOIN structured_imports AS i ON i.id = b.import_id
+            WHERE b.item_id = ?
+            ORDER BY b.id DESC LIMIT 1
+            """,
+            (item_id,),
+        ).fetchone()
+        if binding is None:
+            return None
+
+        def block_dict(row: sqlite3.Row) -> dict[str, Any]:
+            metadata = json.loads(row["metadata_json"])
+            return {
+                "id": row["external_id"],
+                "order": int(row["order_index"]),
+                "kind": row["kind"],
+                "text": row["text"],
+                "locator": row["locator"],
+                "provenance": row["provenance"],
+                **metadata,
+            }
+
+        item_blocks = self.connection.execute(
+            """
+            SELECT * FROM structured_blocks
+            WHERE item_id = ? AND subquestion_id IS NULL
+            ORDER BY section, order_index, id
+            """,
+            (item_id,),
+        ).fetchall()
+        stem_blocks = [
+            block_dict(row) for row in item_blocks if row["section"] == "stem"
+        ]
+        explanation_blocks = [
+            block_dict(row) for row in item_blocks if row["section"] == "explanation"
+        ]
+        shared_materials: list[dict[str, Any]] = []
+        material_rows = self.connection.execute(
+            """
+            SELECT m.* FROM structured_materials AS m
+            JOIN structured_material_relations AS r ON r.material_id = m.id
+            WHERE r.binding_id = ? ORDER BY r.relation_order
+            """,
+            (int(binding["id"]),),
+        ).fetchall()
+        for material in material_rows:
+            blocks = self.connection.execute(
+                """
+                SELECT * FROM structured_blocks
+                WHERE material_id = ? ORDER BY order_index, id
+                """,
+                (int(material["id"]),),
+            ).fetchall()
+            shared_materials.append(
+                {
+                    "id": material["external_id"],
+                    "title": material["title"],
+                    "metadata": json.loads(material["metadata_json"]),
+                    "blocks": [block_dict(row) for row in blocks],
+                }
+            )
+
+        subquestions: list[dict[str, Any]] = []
+        sub_rows = self.connection.execute(
+            """
+            SELECT * FROM structured_subquestions
+            WHERE binding_id = ? ORDER BY order_index, id
+            """,
+            (int(binding["id"]),),
+        ).fetchall()
+        for subquestion in sub_rows:
+            sub_blocks = self.connection.execute(
+                """
+                SELECT * FROM structured_blocks
+                WHERE subquestion_id = ? ORDER BY section, order_index, id
+                """,
+                (int(subquestion["id"]),),
+            ).fetchall()
+            payload = json.loads(subquestion["payload_json"])
+            payload["id"] = subquestion["external_id"]
+            payload["source_number"] = subquestion["source_number"]
+            payload["answer_status"] = subquestion["answer_status"]
+            payload["answer_reason"] = subquestion["answer_reason"]
+            payload["locators"] = json.loads(subquestion["locators_json"])
+            payload["stem_blocks"] = [
+                block_dict(row)
+                for row in sub_blocks
+                if row["section"] == "subquestion_stem"
+            ]
+            payload["explanation_blocks"] = [
+                block_dict(row)
+                for row in sub_blocks
+                if row["section"] == "subquestion_explanation"
+            ]
+            subquestions.append(payload)
+
+        return {
+            "structured": {
+                "import_id": int(binding["import_id"]),
+                "external_id": binding["external_id"],
+                "source_number": binding["source_number"],
+                "item_kind": binding["item_kind"],
+                "schema_version": binding["schema_version"],
+                "review_status": binding["review_status"],
+                "original_file_sha256": binding["original_file_sha256"],
+                "structured_json_sha256": binding["structured_json_sha256"],
+                "structured_payload_sha256": binding["structured_payload_sha256"],
+                "preparation_method": binding["preparation_method"],
+                "payload": json.loads(binding["payload_json"]),
+            },
+            "shared_materials": shared_materials,
+            "stem_blocks": stem_blocks,
+            "subquestions": subquestions,
+            "explanation_blocks": explanation_blocks,
+        }
 
     def list_by_source(self, source_id: int) -> list[LearningItem]:
         rows = self.connection.execute(
@@ -478,20 +1010,26 @@ class LibraryRepository:
         proposed_structure: dict[str, Any],
         review_reason: str,
         now: datetime,
+        structured_import_id: int | None = None,
     ) -> int:
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO learning_review_items(
                     source_id, candidate_key, material_type, locator, raw_fragment,
-                    proposed_structure_json, review_reason, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    proposed_structure_json, review_reason, status, created_at, updated_at,
+                    structured_import_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 ON CONFLICT(source_id, candidate_key) DO UPDATE SET
                     material_type = excluded.material_type,
                     locator = excluded.locator,
                     raw_fragment = excluded.raw_fragment,
                     proposed_structure_json = excluded.proposed_structure_json,
                     review_reason = excluded.review_reason,
+                    structured_import_id = COALESCE(
+                        excluded.structured_import_id,
+                        learning_review_items.structured_import_id
+                    ),
                     status = CASE
                         WHEN learning_review_items.status = 'resolved'
                         THEN learning_review_items.status
@@ -509,6 +1047,7 @@ class LibraryRepository:
                     review_reason,
                     now.isoformat(),
                     now.isoformat(),
+                    structured_import_id,
                 ),
             )
             row = self.connection.execute(
@@ -596,11 +1135,19 @@ class LibraryRepository:
         if query:
             term = f"%{query}%"
             clauses.append(
-                "(i.title LIKE ? OR i.source_summary LIKE ? OR s.raw_text LIKE ? "
+                "(i.title LIKE ? OR i.source_summary LIKE ? OR "
+                "(COALESCE(s.source_kind, '') NOT IN "
+                "('structured_original', 'structured_json') AND s.raw_text LIKE ?) "
                 "OR c.case_summary LIKE ? OR c.practice_notes_json LIKE ? "
-                "OR q.stem LIKE ? OR q.explanation LIKE ? OR i.metadata_json LIKE ?)"
+                "OR q.stem LIKE ? OR q.explanation LIKE ? OR i.metadata_json LIKE ? "
+                "OR EXISTS (SELECT 1 FROM structured_blocks AS sb "
+                "WHERE sb.item_id = i.id AND sb.text LIKE ?) "
+                "OR EXISTS (SELECT 1 FROM structured_material_relations AS smr "
+                "JOIN structured_item_bindings AS sib ON sib.id = smr.binding_id "
+                "JOIN structured_blocks AS smb ON smb.material_id = smr.material_id "
+                "WHERE sib.item_id = i.id AND smb.text LIKE ?))"
             )
-            params.extend([term] * 8)
+            params.extend([term] * 10)
         limit_clause = ""
         if limit is not None:
             safe_limit = max(1, min(int(limit), 5000))

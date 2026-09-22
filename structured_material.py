@@ -1,9 +1,9 @@
-"""Validation and preview helpers for the Phase 0.4A material contract.
+"""Validation and preview helpers for the Phase 0.4 structured-material contract.
 
 This module deliberately has no database, network, LLM, or filesystem side
-effects.  It validates a UTF-8 JSON exchange document and returns a stable
-preview that a later prepare page can render without treating declarations as
-verified legal identities.
+effects. It validates a UTF-8 JSON exchange document and returns a stable
+preview for the separate hash-bound PDF import service without treating
+declarations as verified legal identities.
 """
 
 from __future__ import annotations
@@ -1146,12 +1146,22 @@ def _question_summary(
     return {
         "index": index,
         "id": item_id,
+        "title": item.get("title", ""),
+        "subjects": copy.deepcopy(item.get("subjects", [])),
         "source_number": item.get("source_number", ""),
         "question_type": item.get("question_type", ""),
+        "material_refs": copy.deepcopy(item.get("material_refs", [])),
         "stem_block_count": len(item.get("stem_blocks", [])),
+        "explanation_block_count": len(item.get("explanation_blocks", [])),
         "subquestion_count": len(item.get("subquestions", [])),
         "answer_status": item.get("answer_status")
         or ("provided" if item.get("answer") is not None else "not_provided"),
+        "answer_provenance": (
+            item.get("answer", {}).get("provenance")
+            if isinstance(item.get("answer"), dict)
+            else None
+        ),
+        "locators": copy.deepcopy(item.get("locators", [])),
         "review_status": "pending_review" if item_id in review_ids else "ready",
         "identity_granted": False,
     }
@@ -1178,7 +1188,9 @@ def _case_summary(
         "index": index,
         "id": item_id,
         "title": item.get("title", ""),
+        "subjects": copy.deepcopy(item.get("subjects", [])),
         "block_count": block_count,
+        "locators": copy.deepcopy(item.get("locators", [])),
         "review_status": "pending_review" if item_id in review_ids else "ready",
         "identity_granted": False,
     }

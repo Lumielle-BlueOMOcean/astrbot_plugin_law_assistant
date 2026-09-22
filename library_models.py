@@ -52,6 +52,7 @@ class LearningReviewItem:
     created_at: datetime
     updated_at: datetime
     id: int | None = None
+    structured_import_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,3 +102,8 @@ class LibraryItemBundle:
     source_links: tuple[LibrarySourceLink, ...] = ()
     case: CaseDetail | None = None
     question: QuestionDetail | None = None
+    structured: dict[str, Any] | None = None
+    shared_materials: tuple[dict[str, Any], ...] = ()
+    stem_blocks: tuple[dict[str, Any], ...] = ()
+    subquestions: tuple[dict[str, Any], ...] = ()
+    explanation_blocks: tuple[dict[str, Any], ...] = ()

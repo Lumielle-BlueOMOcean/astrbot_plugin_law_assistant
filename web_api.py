@@ -42,6 +42,12 @@ class LawAssistantWebApi:
             ("library/update", self.library_update, ["POST"], "Update learning item"),
             ("files/stage", self.stage_file, ["POST"], "Stage learning file"),
             (
+                "structured/stage-json",
+                self.stage_structured_json,
+                ["POST"],
+                "Stage structured material JSON",
+            ),
+            (
                 "imports/prepare",
                 self.prepare_import,
                 ["POST"],
@@ -52,6 +58,18 @@ class LawAssistantWebApi:
                 self.confirm_import,
                 ["POST"],
                 "Confirm learning import",
+            ),
+            (
+                "structured/prepare",
+                self.prepare_structured_import,
+                ["POST"],
+                "Prepare structured material import",
+            ),
+            (
+                "structured/confirm",
+                self.confirm_structured_import,
+                ["POST"],
+                "Confirm structured material import",
             ),
             ("reviews", self.reviews, ["GET"], "List review items"),
             ("review", self.review, ["GET"], "Get review item"),
@@ -197,6 +215,41 @@ class LawAssistantWebApi:
                 session_origin="webui",
                 owner_id="webui",
                 original_filename=_bounded_text(body.get("original_filename", ""), 200),
+            )
+        )
+
+    async def stage_structured_json(self) -> Any:
+        files = await request.files
+        uploaded = files.get("file")
+        if uploaded is None:
+            return _error("missing_file", "请上传 structured-material-v1.json")
+        return _service_payload(
+            await self.service.stage_structured_upload(
+                uploaded.filename or "", uploaded.read()
+            )
+        )
+
+    async def prepare_structured_import(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.prepare_structured_learning_import(
+                _bounded_text(body.get("original_staged_path", ""), 300),
+                _bounded_text(body.get("structured_staged_path", ""), 300),
+                created_by="webui",
+                session_origin="webui",
+                owner_id="webui",
+                original_filename=_bounded_text(body.get("original_filename", ""), 200),
+                structured_filename=_bounded_text(
+                    body.get("structured_filename", ""), 200
+                ),
+            )
+        )
+
+    async def confirm_structured_import(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_structured_learning_import(
+                body.get("token", ""), owner_id="webui"
             )
         )
 

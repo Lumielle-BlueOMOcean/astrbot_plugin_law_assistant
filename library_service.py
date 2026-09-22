@@ -474,6 +474,262 @@ class LibraryService:
             "items": items,
         }
 
+    def archive_structured_material(
+        self,
+        *,
+        payload: dict[str, Any],
+        validation: Any,
+        original_filename: str,
+        original_mime_type: str,
+        original_storage_path: str,
+        original_text: str,
+        original_file_sha256: str,
+        structured_json_text: str,
+        structured_storage_path: str,
+        structured_json_sha256: str,
+        structured_payload_sha256: str,
+        created_by: str,
+        session_origin: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Persist a validated v1 document without invoking legacy segmentation."""
+
+        def block_text(values: Any) -> str:
+            if not isinstance(values, list):
+                return ""
+            return "\n".join(
+                str(block.get("text") or "").strip()
+                for block in values
+                if isinstance(block, dict) and str(block.get("text") or "").strip()
+            ).strip()
+
+        def all_item_text(item: dict[str, Any]) -> str:
+            parts = [block_text(item.get("stem_blocks"))]
+            answer = item.get("answer")
+            if isinstance(answer, dict):
+                parts.append(block_text(answer.get("blocks")))
+            parts.append(block_text(item.get("explanation_blocks")))
+            for subquestion in item.get("subquestions") or []:
+                if isinstance(subquestion, dict):
+                    parts.append(block_text(subquestion.get("stem_blocks")))
+            return "\n".join(part for part in parts if part).strip()
+
+        def item_locator(item: dict[str, Any]) -> str:
+            locators = item.get("locators")
+            if isinstance(locators, list) and locators:
+                return str(locators[0])
+            for field in ("stem_blocks", "blocks", "basic_facts_blocks"):
+                values = item.get(field)
+                if isinstance(values, list) and values:
+                    return str(values[0].get("locator") or "")
+            return ""
+
+        def answer_source(item: dict[str, Any]) -> str:
+            answer = item.get("answer")
+            if not isinstance(answer, dict):
+                return "not_provided"
+            provenance = str(answer.get("provenance") or "").strip()
+            return provenance or "not_provided"
+
+        def question_details(item: dict[str, Any]) -> QuestionDetail:
+            options = tuple(
+                f"{option.get('key', '')}. {option.get('text', '')}".strip()
+                for option in item.get("options") or []
+                if isinstance(option, dict)
+            )
+            answer = item.get("answer")
+            if isinstance(answer, dict) and "value" in answer:
+                answer = answer["value"]
+            return QuestionDetail(
+                question_identity="real_question_candidate",
+                question_type=str(item.get("question_type") or ""),
+                stem=block_text(item.get("stem_blocks")),
+                options=options,
+                answer=answer,
+                explanation=block_text(item.get("explanation_blocks")),
+                exam_name=str(item.get("exam_name") or ""),
+                exam_year=str(item.get("exam_year") or ""),
+                paper=str(item.get("paper") or ""),
+                question_number=str(item.get("source_number") or ""),
+                answer_source=answer_source(item),
+            )
+
+        def case_details(item: dict[str, Any]) -> CaseDetail:
+            return CaseDetail(
+                case_number=str(item.get("source_number") or ""),
+                authority=str(item.get("authority") or ""),
+                case_summary=block_text(
+                    item.get("basic_facts_blocks") or item.get("blocks")
+                ),
+                issues=tuple(
+                    block_text(item.get("issues_blocks")).splitlines()
+                    if block_text(item.get("issues_blocks"))
+                    else ()
+                ),
+                reasoning=block_text(item.get("holding_blocks")),
+                result_text=block_text(item.get("result_blocks")),
+                practice_notes=tuple(
+                    block_text(item.get("learning_points_blocks")).splitlines()
+                    if block_text(item.get("learning_points_blocks"))
+                    else ()
+                ),
+            )
+
+        original_source = LibrarySource(
+            source_kind="structured_original",
+            title=original_filename,
+            raw_text=original_text,
+            source_url=str(payload.get("document", {}).get("source_url") or ""),
+            content_hash=original_file_sha256,
+            created_at=now,
+            created_by=created_by,
+            session_origin=session_origin,
+            original_filename=original_filename,
+            mime_type=original_mime_type,
+            storage_path=original_storage_path,
+            metadata={
+                "file_hash": original_file_sha256,
+                "structured_import": True,
+                "schema_version": payload.get("schema_version", ""),
+            },
+        )
+        structured_source = LibrarySource(
+            source_kind="structured_json",
+            title=f"{original_filename}.structured-material.json",
+            raw_text=structured_json_text,
+            source_url="",
+            content_hash=structured_json_sha256,
+            created_at=now,
+            created_by=created_by,
+            session_origin=session_origin,
+            original_filename=f"{original_filename}.structured-material.json",
+            mime_type="application/json",
+            storage_path=structured_storage_path,
+            metadata={
+                "file_hash": structured_json_sha256,
+                "payload_hash": structured_payload_sha256,
+                "structured_import": True,
+            },
+        )
+
+        item_records: list[dict[str, Any]] = []
+        for item_kind, items in (
+            ("question", list(validation.valid_question_items)),
+            ("case", list(validation.valid_case_items)),
+        ):
+            for item in items:
+                identity = (
+                    "real_question_candidate"
+                    if item_kind == "question"
+                    else "user_case"
+                )
+                subjects = tuple(
+                    subject
+                    for subject in (
+                        parse_subject(value) for value in item.get("subjects") or []
+                    )
+                    if subject
+                )
+                item_text = all_item_text(item)
+                learning_item = LearningItem(
+                    item_type="question" if item_kind == "question" else "case",
+                    identity=identity,
+                    item_hash=_hash(
+                        _canonical(
+                            {
+                                "original_file_sha256": original_file_sha256,
+                                "item_kind": item_kind,
+                                "external_id": item.get("id"),
+                                "payload": item,
+                            }
+                        )
+                    ),
+                    title=str(
+                        item.get("title")
+                        or item.get("source_number")
+                        or "结构化学习资料"
+                    )[:200],
+                    subjects=subjects,
+                    verification_status="pending_review",
+                    source_summary=item_text[:300],
+                    created_at=now,
+                    updated_at=now,
+                    created_by=created_by,
+                    metadata={
+                        "structured_import": True,
+                        "external_id": item.get("id"),
+                        "source_number": item.get("source_number", ""),
+                    },
+                )
+                item_records.append(
+                    {
+                        "payload": item,
+                        "item": learning_item,
+                        "item_kind": item_kind,
+                        "review_status": "pending_review",
+                        "question": question_details(item)
+                        if item_kind == "question"
+                        else None,
+                        "case": case_details(item) if item_kind == "case" else None,
+                        "metadata": {"candidate_only": True},
+                    }
+                )
+
+        review_ids = validation.entry_error_item_ids | validation.review_item_ids
+        review_records: list[dict[str, Any]] = []
+        issue_by_item: dict[str, list[str]] = {}
+        for issue in validation.issues:
+            if issue.item_id and issue.severity in {"error", "review"}:
+                issue_by_item.setdefault(issue.item_id, []).append(issue.message)
+        for collection_name, values, material_type in (
+            ("questions", validation.questions, "real_question_candidate"),
+            ("cases", validation.cases, "case"),
+        ):
+            for item in values:
+                external_id = str(item.get("id") or "")
+                if external_id not in review_ids:
+                    continue
+                review_records.append(
+                    {
+                        "candidate_key": _hash(
+                            _canonical(
+                                {
+                                    "original_file_sha256": original_file_sha256,
+                                    "collection": collection_name,
+                                    "payload": item,
+                                }
+                            )
+                        ),
+                        "material_type": material_type,
+                        "locator": item_locator(item),
+                        "raw_fragment": json.dumps(
+                            item, ensure_ascii=False, sort_keys=True
+                        ),
+                        "proposed_structure": item,
+                        "review_reason": "；".join(
+                            issue_by_item.get(external_id, ["结构化条目需要人工复核"])
+                        ),
+                    }
+                )
+
+        return self.repository.archive_structured_import(
+            original_source=original_source,
+            structured_source=structured_source,
+            schema_version=str(payload.get("schema_version") or ""),
+            original_file_sha256=original_file_sha256,
+            structured_json_sha256=structured_json_sha256,
+            structured_payload_sha256=structured_payload_sha256,
+            preparation_method=str(
+                payload.get("document", {}).get("preparation_method") or "mixed"
+            ),
+            payload_json=_canonical(payload),
+            created_by=created_by,
+            created_at=now,
+            materials=[dict(item) for item in validation.materials],
+            item_records=item_records,
+            review_records=review_records,
+        )
+
     async def archive_official_cases(
         self,
         *,
@@ -837,6 +1093,12 @@ class LibraryService:
                 "question_number": bundle.question.question_number,
                 "answer_source": bundle.question.answer_source,
             }
+        if bundle.structured is not None:
+            result["structured"] = bundle.structured
+            result["shared_materials"] = list(bundle.shared_materials)
+            result["stem_blocks"] = list(bundle.stem_blocks)
+            result["subquestions"] = list(bundle.subquestions)
+            result["explanation_blocks"] = list(bundle.explanation_blocks)
         return result
 
 

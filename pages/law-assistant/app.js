@@ -383,6 +383,33 @@ async function renderImports(view) {
     } catch (error) { setFlash(error.message, true); } finally { upload.disabled = false; }
   }, "primary");
   const controls = node("div", undefined, "toolbar"); controls.append(file, kind, upload); box.append(controls); view.append(box);
+  const structuredBox = node("div", undefined, "form-card");
+  structuredBox.append(
+    node("h3", "结构化资料导入"),
+    node("p", "需要同时提供原始 PDF 与 structured-material-v1.json；确认前不会写入资料库。", "muted")
+  );
+  const original = document.createElement("input"); original.type = "file"; original.accept = ".pdf";
+  const jsonFile = document.createElement("input"); jsonFile.type = "file"; jsonFile.accept = ".json";
+  const structuredUpload = button("上传结构化资料并预览", async () => {
+    if (!original.files?.[0] || !jsonFile.files?.[0]) return setFlash("请选择原始 PDF 和结构化 JSON", true);
+    structuredUpload.disabled = true;
+    try {
+      const stagedOriginal = await bridge.upload("files/stage", original.files[0]);
+      if (stagedOriginal == null || stagedOriginal.success === false) throw new Error(stagedOriginal?.message || "原始文件 staging 失败");
+      const stagedJson = await bridge.upload("structured/stage-json", jsonFile.files[0]);
+      if (stagedJson == null || stagedJson.success === false) throw new Error(stagedJson?.message || "结构化 JSON staging 失败");
+      const prepared = await apiPost("structured/prepare", {
+        original_staged_path: stagedOriginal.staged_path,
+        structured_staged_path: stagedJson.staged_path,
+        original_filename: stagedOriginal.original_filename,
+        structured_filename: stagedJson.original_filename,
+      });
+      if (!isCurrent(generation, route)) return;
+      renderStructuredImportPreview(structuredBox, prepared);
+    } catch (error) { setFlash(error.message, true); } finally { structuredUpload.disabled = false; }
+  }, "primary");
+  const structuredControls = node("div", undefined, "toolbar"); structuredControls.append(original, jsonFile, structuredUpload);
+  structuredBox.append(structuredControls); view.append(structuredBox);
 }
 
 function renderImportPreview(container, prepared) {
@@ -391,6 +418,30 @@ function renderImportPreview(container, prepared) {
   panel.append(node("h3", "导入预览"), node("p", `候选 ${preview.total_candidates || 0} 条，待复核 ${preview.needs_review || 0} 条，失败 ${preview.failed || 0} 条。`));
   panel.append(table(preview.items || [], [["index", "序号"], ["status", "状态"], ["locator", "定位"], ["reason", "说明"]]));
   panel.append(button("确认归档", async () => { try { await apiPost("imports/confirm", { token: prepared.token }); setFlash("导入完成"); panel.remove(); } catch (error) { setFlash(error.message, true); } }, "primary"), button(t("page.actions.cancel", "取消"), () => panel.remove()));
+  container.append(panel);
+}
+
+function renderStructuredImportPreview(container, prepared) {
+  const preview = prepared.preview || {};
+  const counts = preview.counts || {};
+  const panel = node("article", undefined, "confirm-panel");
+  panel.append(
+    node("h3", "结构化资料预览"),
+    node("p", `${preview.original_filename || "原始文件"} · SHA-256 ${preview.original_file_sha256 || "—"}`),
+    node("p", `schema ${preview.schema_version || "—"}；题目 ${counts.questions || 0}；材料 ${counts.materials || 0}；可归档 ${counts.processable || 0}；error ${preview.errors || counts.entry_errors || 0}；review ${preview.review || counts.review_items || 0}`)
+  );
+  const entries = [...(preview.questions || []), ...(preview.cases || [])].slice(0, 100);
+  panel.append(table(entries, [
+    ["id", "ID"], ["source_number", "原始题号"], ["question_type", "题型"],
+    ["title", "标题"], ["stem_block_count", "题干块"], ["subquestion_count", "小问"],
+    ["answer_status", "答案状态"], ["review_status", "复核状态"]
+  ]));
+  const confirm = button("确认结构化归档", async () => {
+    confirm.disabled = true;
+    try { await apiPost("structured/confirm", { token: prepared.token }); setFlash("结构化资料已归档"); panel.remove(); }
+    catch (error) { setFlash(error.message, true); confirm.disabled = false; }
+  }, "primary");
+  panel.append(confirm, button(t("page.actions.cancel", "取消"), () => panel.remove()));
   container.append(panel);
 }
 
@@ -673,6 +724,7 @@ if (globalThis.__LAW_ASSISTANT_TEST__) {
     renderOverview,
     renderMaterials,
     renderImports,
+    renderStructuredImportPreview,
     renderPlans,
     renderTargets,
     renderHistory,
