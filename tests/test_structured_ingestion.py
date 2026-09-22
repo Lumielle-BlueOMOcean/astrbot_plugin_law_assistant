@@ -93,6 +93,14 @@ def _payload(pdf_bytes: bytes) -> dict[str, object]:
                 "explanation_blocks": [
                     _block("question-1-explain-1", 1, "依据题库答案整理。", "第1页")
                 ],
+                "answer_requirements": [
+                    {
+                        "order": 1,
+                        "text": "虚构测试要求：回答时说明理由。",
+                        "locator": "PDF第1页",
+                        "provenance": "source_text",
+                    }
+                ],
                 "locators": ["第1页"],
                 "verification_status": "pending_review",
                 "subquestions": [
@@ -107,6 +115,14 @@ def _payload(pdf_bytes: bytes) -> dict[str, object]:
                         "answer": None,
                         "answer_reason": "原始 PDF 未提供该小问的独立答案",
                         "locators": ["第1页"],
+                        "answer_requirements": [
+                            {
+                                "order": 1,
+                                "text": "虚构小问要求：简要作答。",
+                                "locator": "PDF第1页",
+                                "provenance": "source_text",
+                            }
+                        ],
                     }
                 ],
             }
@@ -166,6 +182,12 @@ async def test_structured_pdf_json_prepare_confirm_persists_rich_candidate_data(
         "questions": 1,
         "cases": 1,
         "materials": 1,
+        "subquestions": 1,
+        "answer_requirements": 2,
+        "answer_mappings_resolved": 0,
+        "answer_mappings_unresolved": 1,
+        "duplicate_warnings": 0,
+        "contamination_warnings": 0,
         "processable": 2,
         "entry_errors": 0,
         "review_items": 1,
@@ -229,11 +251,37 @@ async def test_structured_pdf_json_prepare_confirm_persists_rich_candidate_data(
     assert bundle.shared_materials[0]["blocks"][0]["text"] == "甲乙合同材料"
     assert bundle.stem_blocks[0]["text"] == "请说明商标权保护要件。"
     assert bundle.subquestions[0]["answer_reason"] == "原始 PDF 未提供该小问的独立答案"
+    assert bundle.structured["answer_requirements"][0]["text"] == (
+        "虚构测试要求：回答时说明理由。"
+    )
+    assert bundle.subquestions[0]["answer_requirements"][0]["text"] == (
+        "虚构小问要求：简要作答。"
+    )
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM structured_blocks WHERE section = 'answer_requirement'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM structured_blocks "
+            "WHERE section = 'subquestion_answer_requirement'"
+        ).fetchone()[0]
+        == 1
+    )
     assert bundle.explanation_blocks[0]["text"] == "依据题库答案整理。"
     assert (
         ingestion.library_service.repository.search(query="商标权保护", limit=10)[0].id
         == question_id
     )
+    assert (
+        ingestion.library_service.repository.search(query="虚构测试要求", limit=10)[
+            0
+        ].id
+        == question_id
+    )
+    assert "虚构测试要求" not in bundle.question.stem
     assert payload["document"]["original_file_sha256"] == prepared.original_file_sha256
     storage.close()
 

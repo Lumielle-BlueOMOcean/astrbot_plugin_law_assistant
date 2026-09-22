@@ -386,6 +386,28 @@ class LibraryRepository:
                     return str(values[0].get("locator") or "")
             return ""
 
+        def answer_requirement_blocks(
+            item: dict[str, Any], prefix: str
+        ) -> list[dict[str, Any]]:
+            values = item.get("answer_requirements")
+            if not isinstance(values, list):
+                return []
+            blocks: list[dict[str, Any]] = []
+            for index, requirement in enumerate(values, 1):
+                if not isinstance(requirement, dict):
+                    continue
+                blocks.append(
+                    {
+                        "id": str(requirement.get("id") or f"{prefix}-{index}"),
+                        "order": int(requirement.get("order") or index),
+                        "kind": "paragraph",
+                        "text": str(requirement.get("text") or ""),
+                        "locator": str(requirement.get("locator") or ""),
+                        "provenance": str(requirement.get("provenance") or "unknown"),
+                    }
+                )
+            return blocks
+
         with self.connection:
             original_source_id = self.ensure_source(original_source)
             structured_source_id = self.ensure_source(structured_source)
@@ -546,6 +568,14 @@ class LibraryRepository:
                     section="explanation",
                     item_id=item_id,
                 )
+                add_blocks(
+                    import_id=import_id,
+                    blocks=answer_requirement_blocks(
+                        payload, f"{payload.get('id')}-requirement"
+                    ),
+                    section="answer_requirement",
+                    item_id=item_id,
+                )
                 answer = payload.get("answer")
                 if isinstance(answer, dict):
                     add_blocks(
@@ -617,6 +647,16 @@ class LibraryRepository:
                         import_id=import_id,
                         blocks=subquestion.get("explanation_blocks"),
                         section="subquestion_explanation",
+                        item_id=item_id,
+                        subquestion_id=subquestion_id,
+                    )
+                    add_blocks(
+                        import_id=import_id,
+                        blocks=answer_requirement_blocks(
+                            subquestion,
+                            f"{payload.get('id')}-sub-{index}-requirement",
+                        ),
+                        section="subquestion_answer_requirement",
                         item_id=item_id,
                         subquestion_id=subquestion_id,
                     )
@@ -799,6 +839,11 @@ class LibraryRepository:
         explanation_blocks = [
             block_dict(row) for row in item_blocks if row["section"] == "explanation"
         ]
+        answer_requirements = [
+            block_dict(row)
+            for row in item_blocks
+            if row["section"] == "answer_requirement"
+        ]
         shared_materials: list[dict[str, Any]] = []
         material_rows = self.connection.execute(
             """
@@ -857,6 +902,11 @@ class LibraryRepository:
                 for row in sub_blocks
                 if row["section"] == "subquestion_explanation"
             ]
+            payload["answer_requirements"] = [
+                block_dict(row)
+                for row in sub_blocks
+                if row["section"] == "subquestion_answer_requirement"
+            ]
             subquestions.append(payload)
 
         return {
@@ -872,6 +922,7 @@ class LibraryRepository:
                 "structured_payload_sha256": binding["structured_payload_sha256"],
                 "preparation_method": binding["preparation_method"],
                 "payload": json.loads(binding["payload_json"]),
+                "answer_requirements": answer_requirements,
             },
             "shared_materials": shared_materials,
             "stem_blocks": stem_blocks,

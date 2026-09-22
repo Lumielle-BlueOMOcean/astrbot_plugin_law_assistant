@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -58,6 +59,7 @@ _QUESTION_MARKER = re.compile(
     r"(?:第\s*[一二三四五六七八九十百千万\d]+\s*[题问]|"
     r"(?<![\w])\d+\s*[、.)．])"
 )
+_SECTION_CONTAMINATION = re.compile(r"[\[【]\s*(?:问题|答题要求|参考答案)\s*[\]】]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +142,7 @@ class _Validator:
         self.review_item_ids: set[str] = set()
         self.registered_ids: dict[str, str] = {}
         self.material_ids: set[str] = set()
+        self.material_text_by_id: dict[str, str] = {}
         self.valid_questions: list[dict[str, Any]] = []
         self.valid_cases: list[dict[str, Any]] = []
 
@@ -264,6 +267,19 @@ class _Validator:
                 material["blocks"] = sorted(
                     copy.deepcopy(material["blocks"]), key=lambda block: block["order"]
                 )
+                combined_text = "\n".join(
+                    str(block.get("text") or "") for block in material["blocks"]
+                )
+                if material_id:
+                    self.material_text_by_id[material_id] = combined_text
+                if _SECTION_CONTAMINATION.search(combined_text):
+                    self.add(
+                        "material.section_contamination",
+                        f"{path}.blocks",
+                        "review",
+                        "公共材料包含问题、答题要求或答案区段标记，需重新分层",
+                        item_id=material_id or None,
+                    )
             if not isinstance(material.get("title", ""), str):
                 self.add(
                     "material.title_type",
@@ -454,11 +470,14 @@ class _Validator:
                             "material_ref 未指向同一模板中的材料",
                             item_id=item_id,
                         )
+            has_subquestions = bool(question.get("subquestions"))
+            if question.get("stem_blocks") is None and has_subquestions:
+                question["stem_blocks"] = []
             stem_ok = self.validate_blocks(
                 question.get("stem_blocks"),
                 f"{path}.stem_blocks",
                 item_id=item_id,
-                required=True,
+                required=not has_subquestions,
             )
             if (
                 isinstance(question.get("stem_blocks"), list)
@@ -467,7 +486,7 @@ class _Validator:
                     isinstance(block, dict) and str(block.get("text") or "").strip()
                     for block in question["stem_blocks"]
                 )
-            ):
+            ) or (not question.get("stem_blocks") and not has_subquestions):
                 self.add(
                     "question.stem_missing",
                     f"{path}.stem_blocks",
@@ -486,6 +505,12 @@ class _Validator:
             question_ok = options_ok and question_ok
             if not self._validate_answer(question, question_type, path, item_id):
                 question_ok = False
+            if not self._validate_answer_requirements(
+                question.get("answer_requirements", []),
+                f"{path}.answer_requirements",
+                item_id,
+            ):
+                question_ok = False
             explanation_ok = self._validate_optional_blocks(
                 question.get("explanation_blocks", []),
                 f"{path}.explanation_blocks",
@@ -498,6 +523,7 @@ class _Validator:
                 question_ok = False
             sub_ok = self._validate_subquestions(question, path, item_id)
             question_ok = sub_ok and question_ok
+            self._check_material_stem_duplication(question, path, item_id)
             if not self._validate_review_identity(
                 question, f"{path}.verification_status", item_id, "question"
             ):
@@ -631,6 +657,8 @@ class _Validator:
             )
             return False
         if answer is None:
+            if status == "provided" and _all_subquestions_answered(question):
+                return True
             if (
                 status not in {"not_provided", "unresolved", "supplemental"}
                 or not isinstance(reason, str)
@@ -730,6 +758,135 @@ class _Validator:
             return False
         return True
 
+    def _validate_answer_requirements(
+        self, values: Any, path: str, item_id: str
+    ) -> bool:
+        if values in (None, []):
+            return True
+        if not isinstance(values, list):
+            self.add(
+                "answer_requirement.type",
+                path,
+                "error",
+                "answer_requirements 必须是数组",
+                item_id=item_id,
+            )
+            return False
+        ok = True
+        seen_orders: set[int] = set()
+        for index, requirement in enumerate(values):
+            requirement_path = f"{path}[{index}]"
+            if not isinstance(requirement, dict):
+                self.add(
+                    "answer_requirement.object_required",
+                    requirement_path,
+                    "error",
+                    "答题要求必须是对象",
+                    item_id=item_id,
+                )
+                ok = False
+                continue
+            order = requirement.get("order")
+            if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+                self.add(
+                    "answer_requirement.order_invalid",
+                    f"{requirement_path}.order",
+                    "error",
+                    "答题要求 order 必须是正整数",
+                    item_id=item_id,
+                )
+                ok = False
+            elif order in seen_orders:
+                self.add(
+                    "answer_requirement.order_duplicate",
+                    f"{requirement_path}.order",
+                    "error",
+                    "答题要求 order 不能重复",
+                    item_id=item_id,
+                )
+                ok = False
+            else:
+                seen_orders.add(order)
+            text = requirement.get("text")
+            if not isinstance(text, str) or not text.strip():
+                self.add(
+                    "answer_requirement.text_missing",
+                    f"{requirement_path}.text",
+                    "error",
+                    "答题要求必须包含非空 text",
+                    item_id=item_id,
+                )
+                ok = False
+            elif len(text) > MAX_BLOCK_TEXT_CHARS:
+                self.add(
+                    "answer_requirement.text_too_long",
+                    f"{requirement_path}.text",
+                    "error",
+                    "单条答题要求超过长度限制",
+                    item_id=item_id,
+                )
+                ok = False
+            locator = requirement.get("locator")
+            if not isinstance(locator, str) or not locator.strip():
+                self.add(
+                    "answer_requirement.locator_missing",
+                    f"{requirement_path}.locator",
+                    "review",
+                    "答题要求缺少原文定位，需人工复核",
+                    item_id=item_id,
+                )
+            provenance = requirement.get("provenance")
+            if provenance not in PROVENANCES:
+                self.add(
+                    "answer_requirement.provenance_missing",
+                    f"{requirement_path}.provenance",
+                    "review",
+                    "答题要求缺少可识别的来源标记",
+                    item_id=item_id,
+                )
+        values.sort(
+            key=lambda item: item.get("order", 0) if isinstance(item, dict) else 0
+        )
+        return ok
+
+    def _check_material_stem_duplication(
+        self, question: dict[str, Any], path: str, item_id: str
+    ) -> None:
+        stem_blocks = question.get("stem_blocks", [])
+        material_refs = question.get("material_refs", [])
+        if not isinstance(stem_blocks, list) or not isinstance(material_refs, list):
+            return
+        stem_text = "\n".join(
+            str(block.get("text") or "")
+            for block in stem_blocks
+            if isinstance(block, dict)
+        )
+        normalized_stem = _comparison_text(stem_text)
+        if len(normalized_stem) < 60:
+            return
+        for material_ref in material_refs:
+            material_text = self.material_text_by_id.get(str(material_ref), "")
+            normalized_material = _comparison_text(material_text)
+            if not normalized_material:
+                continue
+            shorter, longer = sorted((normalized_stem, normalized_material), key=len)
+            common_prefix = 0
+            for left, right in zip(normalized_stem, normalized_material):
+                if left != right:
+                    break
+                common_prefix += 1
+            if shorter == longer or (
+                len(shorter) >= 60 and common_prefix / len(shorter) >= 0.8
+            ):
+                self.add(
+                    "question.material_stem_duplicate",
+                    f"{path}.stem_blocks",
+                    "review",
+                    "题干与其引用的公共材料高度重复，需确认是否重复保存",
+                    item_id=item_id,
+                )
+                return
+
     def _validate_optional_blocks(self, values: Any, path: str, item_id: str) -> bool:
         if values in (None, []):
             return True
@@ -763,6 +920,7 @@ class _Validator:
             )
             return False
         ok = True
+        requirement_like: list[bool] = []
         for index, subquestion in enumerate(values):
             sub_path = f"{path}.subquestions[{index}]"
             if not isinstance(subquestion, dict):
@@ -810,6 +968,12 @@ class _Validator:
                 item_id,
             ):
                 ok = False
+            if not self._validate_answer_requirements(
+                subquestion.get("answer_requirements", []),
+                f"{sub_path}.answer_requirements",
+                item_id,
+            ):
+                ok = False
             if not self._validate_locators(
                 subquestion.get("locators"), f"{sub_path}.locators", item_id
             ):
@@ -843,6 +1007,38 @@ class _Validator:
                     f"{sub_path}.answer.provenance",
                     "review",
                     "小问答案缺少来源标记",
+                    item_id=item_id,
+                )
+            stem_text = "\n".join(
+                str(block.get("text") or "")
+                for block in subquestion.get("stem_blocks", [])
+                if isinstance(block, dict)
+            )
+            requirement_like.append(_looks_like_answer_requirement(stem_text))
+        grouped_requirement_sequence = (
+            len(values) >= 2
+            and sum(requirement_like) >= 2
+            and all(
+                not re.search(r"[?？]|(?:如何|是否|为什么|请分析|请说明|请判断)", text)
+                and len(text.strip()) <= 160
+                for subquestion in values
+                if isinstance(subquestion, dict)
+                for text in [
+                    "\n".join(
+                        str(block.get("text") or "")
+                        for block in subquestion.get("stem_blocks", [])
+                        if isinstance(block, dict)
+                    )
+                ]
+            )
+        )
+        for index, likely in enumerate(requirement_like):
+            if likely or grouped_requirement_sequence:
+                self.add(
+                    "subquestion.possible_answer_requirement",
+                    f"{path}.subquestions[{index}].stem_blocks",
+                    "review",
+                    "小问文本呈现答题规范或评分要求特征，需确认是否应改为 answer_requirements",
                     item_id=item_id,
                 )
         return ok
@@ -1109,6 +1305,33 @@ def build_structured_material_preview(
         _case_summary(item, result.review_item_ids, item_index)
         for item_index, item in enumerate(result.cases)
     ]
+    subquestions = [
+        subquestion
+        for question in result.questions
+        for subquestion in (
+            question.get("subquestions")
+            if isinstance(question.get("subquestions"), list)
+            else []
+        )
+        if isinstance(subquestion, dict)
+    ]
+    resolved_mappings = sum(
+        _has_answer_content(subquestion.get("answer")) for subquestion in subquestions
+    )
+    answer_requirement_count = sum(
+        _list_count(question.get("answer_requirements"))
+        + sum(
+            _list_count(subquestion.get("answer_requirements"))
+            for subquestion in (
+                question.get("subquestions")
+                if isinstance(question.get("subquestions"), list)
+                else []
+            )
+            if isinstance(subquestion, dict)
+        )
+        for question in result.questions
+    )
+    issue_codes = [issue.code for issue in result.issues]
     return {
         "schema_version": (
             result.payload.get("schema_version") if result.payload else None
@@ -1118,6 +1341,14 @@ def build_structured_material_preview(
             "questions": len(result.questions),
             "cases": len(result.cases),
             "materials": len(result.materials),
+            "subquestions": len(subquestions),
+            "answer_requirements": answer_requirement_count,
+            "answer_mappings_resolved": resolved_mappings,
+            "answer_mappings_unresolved": len(subquestions) - resolved_mappings,
+            "duplicate_warnings": issue_codes.count("question.material_stem_duplicate"),
+            "contamination_warnings": issue_codes.count(
+                "material.section_contamination"
+            ),
             "processable": result.usable_questions + result.usable_cases,
             "entry_errors": len(entry_error_ids),
             "review_items": result.review_items,
@@ -1153,7 +1384,35 @@ def _question_summary(
         "material_refs": copy.deepcopy(item.get("material_refs", [])),
         "stem_block_count": len(item.get("stem_blocks", [])),
         "explanation_block_count": len(item.get("explanation_blocks", [])),
-        "subquestion_count": len(item.get("subquestions", [])),
+        "subquestion_count": _list_count(item.get("subquestions")),
+        "answer_requirement_count": _list_count(item.get("answer_requirements"))
+        + sum(
+            _list_count(subquestion.get("answer_requirements"))
+            for subquestion in (
+                item.get("subquestions")
+                if isinstance(item.get("subquestions"), list)
+                else []
+            )
+            if isinstance(subquestion, dict)
+        ),
+        "answer_mappings_resolved": sum(
+            _has_answer_content(subquestion.get("answer"))
+            for subquestion in (
+                item.get("subquestions")
+                if isinstance(item.get("subquestions"), list)
+                else []
+            )
+            if isinstance(subquestion, dict)
+        ),
+        "answer_mappings_unresolved": sum(
+            not _has_answer_content(subquestion.get("answer"))
+            for subquestion in (
+                item.get("subquestions")
+                if isinstance(item.get("subquestions"), list)
+                else []
+            )
+            if isinstance(subquestion, dict)
+        ),
         "answer_status": item.get("answer_status")
         or ("provided" if item.get("answer") is not None else "not_provided"),
         "answer_provenance": (
@@ -1285,6 +1544,140 @@ def _answer_boolean(answer: Any) -> bool | None:
     return None
 
 
+def _comparison_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace()
+        and not unicodedata.category(character).startswith(("P", "Z"))
+    )
+
+
+def _list_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _has_answer_content(answer: Any) -> bool:
+    if not isinstance(answer, dict):
+        return False
+    if isinstance(answer.get("blocks"), list):
+        return any(
+            isinstance(block, dict) and str(block.get("text") or "").strip()
+            for block in answer["blocks"]
+        )
+    return any(
+        key in answer and answer[key] not in (None, "", [], {})
+        for key in ("keys", "correct_keys", "answers", "key", "value", "text")
+    )
+
+
+def _all_subquestions_answered(question: dict[str, Any]) -> bool:
+    subquestions = question.get("subquestions")
+    return (
+        isinstance(subquestions, list)
+        and bool(subquestions)
+        and all(
+            isinstance(subquestion, dict)
+            and _has_answer_content(subquestion.get("answer"))
+            for subquestion in subquestions
+        )
+    )
+
+
+def _looks_like_answer_requirement(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    if not normalized or re.search(r"[?？]", normalized):
+        return False
+    signals = (
+        re.search(
+            r"(?:不少于|不得少于|不得超过|总字数|字数|字以内|字以上)", normalized
+        ),
+        re.search(r"(?:不得分|不计分|得分|计分|评分|满分)", normalized),
+        re.search(
+            r"(?:作答|答题|回答|表达|表述).{0,12}(?:要求|正确|完整|准确|规范|不得|应当|必须)",
+            normalized,
+        ),
+        re.search(
+            r"(?:观点|论述|理由|结论).{0,12}(?:正确|完整|准确|清晰|不得|应当|必须)",
+            normalized,
+        ),
+        re.search(r"(?:无观点|照搬材料|不符合要求|未按要求)", normalized),
+        re.search(
+            r"(?:不得|必须|应当).{0,16}(?:观点|论述|材料|作答|表述|字|分)", normalized
+        ),
+    )
+    return sum(signal is not None for signal in signals) >= 2
+
+
+def match_numbered_answer_entries(
+    question_numbers: list[int | str],
+    question_stems: list[str],
+    answer_entries: list[Mapping[str, Any]],
+) -> dict[int, int]:
+    """Map source-numbered answer headings to questions without semantic guessing.
+
+    A complete one-to-one numbered sequence is mapped by position. Otherwise,
+    an answer entry is accepted only when its same-number heading has one unique
+    long exact-text prefix match to that question. Returned indexes are zero-based.
+    """
+
+    if len(question_numbers) != len(question_stems):
+        return {}
+    try:
+        normalized_numbers = [int(number) for number in question_numbers]
+        candidate_numbers = [int(entry.get("number")) for entry in answer_entries]
+    except (TypeError, ValueError):
+        return {}
+    if candidate_numbers == normalized_numbers:
+        return {index: index for index in range(len(normalized_numbers))}
+
+    def normalize(value: str) -> str:
+        text = unicodedata.normalize("NFKC", value)
+        return "".join(
+            character
+            for character in text
+            if not character.isspace()
+            and not unicodedata.category(character).startswith(("P", "Z"))
+        )
+
+    def match_score(left: str, right: str) -> int:
+        best = 0
+        for left_skip in range(min(4, len(left)) + 1):
+            for right_skip in range(min(4, len(right)) + 1):
+                length = 0
+                for left_char, right_char in zip(left[left_skip:], right[right_skip:]):
+                    if left_char != right_char:
+                        break
+                    length += 1
+                best = max(best, length)
+        return best
+
+    mapping: dict[int, int] = {}
+    used_entries: set[int] = set()
+    for question_index, (number, stem) in enumerate(
+        zip(normalized_numbers, question_stems)
+    ):
+        target = normalize(stem)
+        candidates = [
+            (index, answer_entries[index])
+            for index, candidate_number in enumerate(candidate_numbers)
+            if candidate_number == number and index not in used_entries
+        ]
+        scores = [
+            (match_score(target, normalize(str(entry.get("text") or ""))), index)
+            for index, entry in candidates
+        ]
+        if not scores:
+            continue
+        best_score = max(score for score, _ in scores)
+        best_indexes = [index for score, index in scores if score == best_score]
+        if best_score >= 12 and len(best_indexes) == 1:
+            mapping[question_index] = best_indexes[0]
+            used_entries.add(best_indexes[0])
+    return mapping
+
+
 __all__ = [
     "BLOCK_KINDS",
     "MAX_BLOCK_TEXT_CHARS",
@@ -1295,5 +1688,6 @@ __all__ = [
     "ValidationIssue",
     "ValidationResult",
     "build_structured_material_preview",
+    "match_numbered_answer_entries",
     "validate_structured_material",
 ]

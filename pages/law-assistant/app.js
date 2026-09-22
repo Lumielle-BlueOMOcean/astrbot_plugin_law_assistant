@@ -428,12 +428,14 @@ function renderStructuredImportPreview(container, prepared) {
   panel.append(
     node("h3", "结构化资料预览"),
     node("p", `${preview.original_filename || "原始文件"} · SHA-256 ${preview.original_file_sha256 || "—"}`),
-    node("p", `schema ${preview.schema_version || "—"}；题目 ${counts.questions || 0}；材料 ${counts.materials || 0}；可归档 ${counts.processable || 0}；error ${preview.errors || counts.entry_errors || 0}；review ${preview.review || counts.review_items || 0}`)
+    node("p", `schema ${preview.schema_version || "—"}；顶层题目 ${counts.questions || 0}；真实小问 ${counts.subquestions || 0}；答题要求 ${counts.answer_requirements || 0}；答案映射已关联 ${counts.answer_mappings_resolved || 0} / 未解决 ${counts.answer_mappings_unresolved || 0}；公共材料 ${counts.materials || 0}；可归档 ${counts.processable || 0}；重复警告 ${counts.duplicate_warnings || 0}；材料污染警告 ${counts.contamination_warnings || 0}；error ${preview.errors || counts.entry_errors || 0}；review ${preview.review || counts.review_items || 0}`)
   );
   const entries = [...(preview.questions || []), ...(preview.cases || [])].slice(0, 100);
   panel.append(table(entries, [
     ["id", "ID"], ["source_number", "原始题号"], ["question_type", "题型"],
     ["title", "标题"], ["stem_block_count", "题干块"], ["subquestion_count", "小问"],
+    ["answer_requirement_count", "答题要求"], ["answer_mappings_resolved", "已映射答案"],
+    ["answer_mappings_unresolved", "未映射答案"],
     ["answer_status", "答案状态"], ["review_status", "复核状态"]
   ]));
   const confirm = button("确认结构化归档", async () => {

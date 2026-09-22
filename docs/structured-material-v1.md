@@ -63,7 +63,7 @@
 
 ## questions：题目
 
-每道题需要文档内唯一的 `id`、原始 `source_number`、规范 `question_type`、`stem_blocks` 和 `locators`。题型使用现有规范值：
+每道题需要文档内唯一的 `id`、原始 `source_number`、规范 `question_type`、`stem_blocks` 和 `locators`。如果所有具体问题都保存在 `subquestions` 中，顶层 `stem_blocks` 可以为空；否则题干必须有实质内容。题型使用现有规范值：
 
 - `single_choice`
 - `multiple_choice`
@@ -71,7 +71,7 @@
 - `short_answer`
 - `case_analysis`
 
-题干的每个段落保留为独立 block。公共材料通过 `material_refs` 引用，所有引用必须指向同一文档中存在的材料 ID。
+题干的每个段落保留为独立 block。公共材料通过 `material_refs` 引用，所有引用必须指向同一文档中存在的材料 ID。`materials[].blocks` 只保存共享事实、案情、论述材料、法条附件或其他上下文；问题正文、答题要求和参考答案不能放入公共材料。引用了公共材料的题干不得再复制同一材料正文。
 
 ```json
 {
@@ -79,12 +79,29 @@
   "source_number": "第1题",
   "question_type": "single_choice",
   "material_refs": ["M01"],
-  "stem_blocks": [],
+  "stem_blocks": [
+    {
+      "id": "Q001-S01",
+      "order": 1,
+      "kind": "paragraph",
+      "text": "请根据公共材料判断甲的行为。",
+      "locator": "PDF第13页",
+      "provenance": "source_text"
+    }
+  ],
   "options": [
     {"key": "A", "text": "选项一", "locator": "PDF第13页"},
     {"key": "B", "text": "选项二", "locator": "PDF第13页"}
   ],
   "subquestions": [],
+  "answer_requirements": [
+    {
+      "order": 1,
+      "text": "答题时应说明理由。",
+      "locator": "PDF第13页",
+      "provenance": "source_text"
+    }
+  ],
   "answer": {
     "keys": ["A"],
     "status": "provided",
@@ -111,6 +128,8 @@
 ```
 
 答案必须与题干分开。`external_model` 或 `human_authored` 只表示补充答案/学习解答，不会被识别为原始参考答案，并会进入待复核。模型不得根据题干自行填写官方答案。
+
+`answer_requirements` 是可选数组，用于保存字数限制、作答形式要求和评分说明。每项至少包含正整数 `order` 与非空 `text`，并可带 `locator`、`provenance`。它不是题干、小问、答案或解析，不得合并进这些字段；`PDF第N页` 这样的定位只属于 `locator` 元数据。导入时答题要求作为独立的 `answer_requirement` 结构化内容块持久化，可被资料搜索命中，但不并入默认题干或答案正文。
 
 ## 多小问
 
@@ -139,6 +158,8 @@
 
 一道只有多个自然段的长题仍然只使用一个 Question。不能把 block ID 当成题目 ID，也不能把“题干1、题干2”伪装成独立小问。
 
+只有原资料确实列出多个独立作答问题时才建立小问。编号列表本身不是充分依据：字数、评分和表达规范等答题要求属于 `answer_requirements`。小问答案只有在来源中的编号/题目标题能够确定性对应时才关联；无法唯一对应时保留 unresolved 状态，不按位置猜配。
+
 ## cases：案例
 
 案例至少需要唯一 `id`、`title`、`locators` 和一组有序内容块。可以使用 `blocks`，也可以按语义使用 `basic_facts_blocks`、`issues_blocks`、`holding_blocks`、`result_blocks`、`learning_points_blocks`。这些较长字段都使用和材料相同的 block 结构。
@@ -165,6 +186,8 @@
 
 - `schema_version`、`document`；
 - `counts.questions/cases/materials`；
+- 顶层题组数、真实小问数、答题要求数；
+- 小问答案已映射/未解决数，以及材料/题干重复和材料区段污染警告数；
 - `counts.processable`、`counts.entry_errors`、`counts.review_items`；
 - 材料块数；
 - 每题标题/原始题号、方向、题型、公共材料引用、题干与解析块数、小问数、答案状态/来源、定位和复核状态；
