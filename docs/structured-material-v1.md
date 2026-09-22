@@ -1,0 +1,178 @@
+# Structured Material Exchange v1
+
+本文件定义 Lumielle Law Assistant Phase 0.4A 使用的 UTF-8 JSON 交换格式。
+它用于外部模型或人工整理者向插件提交“待验证的结构化资料”，不代表资料已经成为核验真题或官方案例。
+
+## 顶层对象
+
+```json
+{
+  "schema_version": "1.0",
+  "document": {},
+  "materials": [],
+  "questions": [],
+  "cases": []
+}
+```
+
+`schema_version` 必填且目前只能是字符串 `"1.0"`。未知重大版本会被拒绝，插件不会静默解释未知字段。`materials`、`questions`、`cases` 可以为空；一份资料可以只包含题目、只包含案例，或包含公共材料与其中任意一种条目。
+
+校验入口是 `structured_material.validate_structured_material()`，预览入口是 `structured_material.build_structured_material_preview()`。两者都是纯校验/转换操作，不写 SQLite、不保存文件、不调用网络或 LLM。
+
+## document：原始资料身份
+
+以下字段为必填非空字符串：
+
+| 字段 | 含义 |
+| --- | --- |
+| `title` | 原始资料标题 |
+| `source_type` | 来源类别，例如 `synthetic_fixture`、`user_file` |
+| `original_filename` | 原始文件名 |
+| `original_file_sha256` | 原始文件实际字节的 SHA-256；模板中的值只是声明 |
+| `preparation_method` | `human_transcribed`、`external_model_assisted`、`plugin_extracted` 或 `mixed` |
+| `verification_status` | 当前资料真实性状态，例如 `pending_review` |
+
+可选字段包括 `source_url`、`source_description`、`exam_name`、`exam_year`、`paper`。原始文件哈希必须是 64 位十六进制字符串；下一阶段同时收到 PDF 和模板时，插件必须重新计算 PDF 字节哈希并核对，不能信任模型填入的哈希。
+
+`preparation_method` 只记录整理方式，不决定真题或官方案例身份。结构化模板中的 `verified_real_question`、`official_case`、`verified_official` 等声明会进入待复核，校验器不会授予这些身份。官方案例仍只能通过现有可信 `court_cases`/`spp_cases` 来源路径获得身份。
+
+## materials：公共材料
+
+每个材料需要文档内唯一的 `id`，并有 `blocks` 数组。块的 `order` 是正整数且不能重复；使用 `order` 排序，不依赖 JSON 对象键顺序。
+
+```json
+{
+  "id": "M01",
+  "title": "公共案情",
+  "blocks": [
+    {
+      "id": "M01-B01",
+      "order": 1,
+      "kind": "paragraph",
+      "text": "案情正文。",
+      "locator": "PDF第12页",
+      "provenance": "source_text"
+    }
+  ]
+}
+```
+
+支持的 `kind`：`paragraph`、`heading`、`list`、`table_text`、`image_reference`、`formula_text`。如果图片或公式没有可靠转录，仍可使用 `image_reference` 或 `formula_text` 保存引用状态，例如 `text` 写明“图片存在但尚未完整转录”，并将 `provenance` 设为 `unknown`。不能补写未读取到的条件。
+
+每个块应提供 `locator` 和 `provenance`。缺失定位或来源标记会进入人工复核，而不是被当作已核实原文。`provenance` 只能是 `source_text`、`external_model`、`human_authored` 或 `unknown`。
+
+## questions：题目
+
+每道题需要文档内唯一的 `id`、原始 `source_number`、规范 `question_type`、`stem_blocks` 和 `locators`。题型使用现有规范值：
+
+- `single_choice`
+- `multiple_choice`
+- `true_false`
+- `short_answer`
+- `case_analysis`
+
+题干的每个段落保留为独立 block。公共材料通过 `material_refs` 引用，所有引用必须指向同一文档中存在的材料 ID。
+
+```json
+{
+  "id": "Q001",
+  "source_number": "第1题",
+  "question_type": "single_choice",
+  "material_refs": ["M01"],
+  "stem_blocks": [],
+  "options": [
+    {"key": "A", "text": "选项一", "locator": "PDF第13页"},
+    {"key": "B", "text": "选项二", "locator": "PDF第13页"}
+  ],
+  "subquestions": [],
+  "answer": {
+    "keys": ["A"],
+    "status": "provided",
+    "provenance": "source_text",
+    "locator": "PDF第14页"
+  },
+  "answer_status": "provided",
+  "explanation_blocks": [],
+  "locators": ["PDF第13-14页"],
+  "verification_status": "pending_review"
+}
+```
+
+选择题 `options` 使用对象数组；单选答案必须只有一个存在的 `keys`，多选答案可以有多个但每个键都必须存在。判断题答案可使用 `{"value": true, "provenance": "source_text"}`。简答题和案例分析题可把答案写成带 `blocks` 的对象。
+
+没有原始参考答案时使用：
+
+```json
+{
+  "answer": null,
+  "answer_status": "not_provided",
+  "answer_reason": "原始资料未提供参考答案"
+}
+```
+
+答案必须与题干分开。`external_model` 或 `human_authored` 只表示补充答案/学习解答，不会被识别为原始参考答案，并会进入待复核。模型不得根据题干自行填写官方答案。
+
+## 多小问
+
+公共材料对应多个独立作答单元时，保留一个主 Question，并在 `subquestions` 中为每个小问提供独立 ID、原始小问编号、题干块、答案、解析块和定位：
+
+```json
+{
+  "id": "Q002",
+  "source_number": "材料题一",
+  "question_type": "case_analysis",
+  "material_refs": ["M01"],
+  "stem_blocks": [],
+  "subquestions": [
+    {
+      "id": "Q002-S01",
+      "source_number": "（1）",
+      "stem_blocks": [],
+      "answer": null,
+      "answer_reason": "原始资料未提供参考答案",
+      "explanation_blocks": [],
+      "locators": ["PDF第20页"]
+    }
+  ]
+}
+```
+
+一道只有多个自然段的长题仍然只使用一个 Question。不能把 block ID 当成题目 ID，也不能把“题干1、题干2”伪装成独立小问。
+
+## cases：案例
+
+案例至少需要唯一 `id`、`title`、`locators` 和一组有序内容块。可以使用 `blocks`，也可以按语义使用 `basic_facts_blocks`、`issues_blocks`、`holding_blocks`、`result_blocks`、`learning_points_blocks`。这些较长字段都使用和材料相同的 block 结构。
+
+`authority`、`case_number`、`verification_status` 只是模板声明。用户上传或外部模型整理的案例不能凭填写“最高人民法院”自动成为官方案例；校验预览会保留声明但设置 `identity_granted: false` 并进入待复核。真实官方身份仍由现有官方来源专属路径决定。
+
+## 错误分级
+
+每条 issue 都包含稳定的 `code`、定位 `path`、`severity` 和中文 `message`，必要时包含 `item_id`。
+
+- `fatal`：整份模板拒绝，例如 JSON 语法错误、未知版本、根字段类型错误、重复关键 ID、悬空 `material_ref`、超限或过深 JSON。
+- `error`：条目不能进入可用预览，例如题干为空、题型不支持、选择题选项不足、答案键不存在。其他独立条目仍可继续预览。
+- `review`：条目结构可读但必须人工确认，例如没有参考答案、没有定位、图片未转录、答案来自外部模型、题干疑似合并了多个题、官方身份声明。
+
+没有原始参考答案不等于整份资料损坏；只要明确提供 `answer_reason`，该题会保留并标记待复核。
+
+## 资源限制
+
+当前校验器限制 JSON 10 MiB、文本总长度 600000 字符、材料 500 份、题目 1000 道、案例 500 个、单条目内容块 500 个、单块文本 200000 字符、嵌套深度 20 层。超长题干本身不是错误，合理分段且不超过单块/总量限制即可。
+
+## 预览对象
+
+`build_structured_material_preview()` 返回可 JSON 序列化对象，包含：
+
+- `schema_version`、`document`；
+- `counts.questions/cases/materials`；
+- `counts.processable`、`counts.entry_errors`、`counts.review_items`；
+- 材料块数；
+- 每题原始题号、题型、题干段数、小问数、答案状态和复核状态；
+- 每个案例的标题、块数和复核状态；
+- 全部 issues 及其路径。
+
+预览不核对未提供的原始 PDF，不生成正式导入确认 token，也不写入数据库。下一阶段接入现有 `prepare → preview → confirm` 时，应继续保留这些证据和待复核状态。
+
+## 当前边界
+
+0.4A 不修改 schema v9，不把模板写入正式学习库存，不改现有 TXT/Markdown/DOCX/PDF 导入，不实现 QQ 续读、答题、揭晓答案或每日调度行为。下一阶段使用真实 PDF 验证后，v1 可以增加向后兼容字段，但不得静默改变现有字段含义。

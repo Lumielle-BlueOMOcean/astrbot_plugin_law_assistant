@@ -1,0 +1,142 @@
+{
+  "schema_version": "1.0",
+  "document": {
+    "title": "虚构结构化资料示例",
+    "source_type": "synthetic_fixture",
+    "original_filename": "synthetic-material.txt",
+    "original_file_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source_url": "",
+    "source_description": "人工编写的虚构样本，不对应任何真实考试或官方案例。",
+    "exam_name": "虚构练习资料",
+    "exam_year": "2099",
+    "paper": "示例卷",
+    "preparation_method": "human_transcribed",
+    "verification_status": "pending_review"
+  },
+  "materials": [
+    {
+      "id": "M01",
+      "title": "虚构公共材料",
+      "blocks": [
+        {
+          "id": "M01-B01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "甲乙之间发生一项仅用于演示的虚构法律争议。",
+          "locator": "示例第1页",
+          "provenance": "source_text"
+        },
+        {
+          "id": "M01-B02",
+          "order": 2,
+          "kind": "image_reference",
+          "text": "原始资料此处有图片，但本示例未转录图片内容。",
+          "locator": "示例第1页图片1",
+          "provenance": "unknown"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "Q001",
+      "source_number": "第1题",
+      "question_type": "single_choice",
+      "material_refs": ["M01"],
+      "stem_blocks": [
+        {
+          "id": "Q001-S01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "根据上述虚构材料，下列说法哪一项最符合本示例设定？",
+          "locator": "示例第1页",
+          "provenance": "source_text"
+        }
+      ],
+      "options": [
+        {
+          "key": "A",
+          "text": "甲的主张需要结合证据判断。",
+          "locator": "示例第1页"
+        },
+        {
+          "key": "B",
+          "text": "仅凭标题即可确定全部事实。",
+          "locator": "示例第1页"
+        }
+      ],
+      "subquestions": [],
+      "answer": {
+        "keys": ["A"],
+        "status": "provided",
+        "provenance": "source_text",
+        "locator": "示例第2页"
+      },
+      "answer_status": "provided",
+      "answer_reason": "",
+      "explanation_blocks": [
+        {
+          "id": "Q001-E01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "本解释是虚构样本的人工整理说明。",
+          "locator": "示例第2页",
+          "provenance": "human_authored"
+        }
+      ],
+      "locators": ["示例第1-2页"],
+      "verification_status": "pending_review"
+    }
+  ],
+  "cases": [
+    {
+      "id": "C001",
+      "title": "虚构合同案例",
+      "case_number": "虚构案号-001",
+      "authority": "测试机构（非官方声明）",
+      "verification_status": "pending_review",
+      "basic_facts_blocks": [
+        {
+          "id": "C001-F01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "这是人工编写的虚构案情，不对应真实裁判。",
+          "locator": "示例第3页",
+          "provenance": "source_text"
+        }
+      ],
+      "issues_blocks": [
+        {
+          "id": "C001-I01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "虚构材料中的争议焦点是什么？",
+          "locator": "示例第3页",
+          "provenance": "source_text"
+        }
+      ],
+      "holding_blocks": [
+        {
+          "id": "C001-H01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "本示例不提供真实裁判要旨。",
+          "locator": "示例第3页",
+          "provenance": "human_authored"
+        }
+      ],
+      "result_blocks": [],
+      "learning_points_blocks": [
+        {
+          "id": "C001-L01",
+          "order": 1,
+          "kind": "paragraph",
+          "text": "仅用于验证案例字段和原文定位。",
+          "locator": "示例第3页",
+          "provenance": "human_authored"
+        }
+      ],
+      "locators": ["示例第3页"]
+    }
+  ]
+}
