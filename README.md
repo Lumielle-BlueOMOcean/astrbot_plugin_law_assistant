@@ -152,7 +152,9 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law next
 /law next-question
 /law answer
+/law next-answer
 /law explanation
+/law next-explanation
 /law close
 /law import <imports目录相对路径> [case|mock_question|real_question_candidate]
 /law plans [群名]
@@ -173,7 +175,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_study_question`、`law_question_session`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。`law_generate_question` 与题目类 `law_get_learning_item` 返回答案隔离会话；`law_question_session` 的 action 为 `current`、`next`、`next-question`、`answer`、`explanation` 或 `close`。
+可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_study_question`、`law_question_session`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。`law_generate_question` 与题目类 `law_get_learning_item` 返回答案隔离会话；`law_question_session` 的 action 为 `current`、`next`、`next-question`、`answer`、`next-answer`、`explanation`、`next-explanation` 或 `close`。
 
 ### 学习资料库
 
@@ -187,7 +189,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 题面、共享材料、选项和原文答题要求先展示；不会把答案或解析包含在初次 Tool 返回、手动群发布预览或每日一题消息中。使用 `/law answer` 或自然语言明确要求答案后才显示当前小问答案；`/law explanation` 单独显示来源解析。若来源没有可靠答案/解析，会明确提示不可用，不调用 LLM 猜答案。
 
-长材料按保存顺序分页：`/law next` 继续材料或当前题干的下一页；材料展示完后继续显示当前题干；`/law next-question` 进入下一独立小问。`/law current` 查看当前页，`/law close` 结束会话。新题只 supersede 相同 `unified_msg_origin` 的活动会话，不覆盖其他聊天；会话快照、页码和答案/解析揭晓事件持久化在插件 SQLite。`real_question_candidate / pending_review` 可由 operator 手动学习，但绝不进入 `origin=real` verified inventory。
+题面、选项、答题要求、答案和解析按最终消息长度预算分页，标题、进度、来源和续读提示均计入 `question_message_max_chars`。长材料或题面使用 `/law next` 续读；答案分页使用 `/law next-answer`，解析分页使用 `/law next-explanation`，不会把答案续页误认为题面续读；`/law next-question` 进入下一独立小问。结构化多小问题会先展示公共题干，再展示当前小问及其专属答题要求，公共题干不会在小问中重复。`/law current` 显示当前小问各自的答案/解析揭晓状态，`/law close` 结束会话。新题只 supersede 相同 `unified_msg_origin` 的活动会话，不覆盖其他聊天；会话快照、页码和按小问记录的答案/解析揭晓事件持久化在插件 SQLite。`real_question_candidate / pending_review` 可由 operator 手动学习，但绝不进入 `origin=real` verified inventory。
 
 ### 真题导入格式
 

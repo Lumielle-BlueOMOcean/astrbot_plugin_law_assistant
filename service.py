@@ -40,6 +40,7 @@ if __package__ and "." in __package__:
         format_session_explanation,
         format_session_prompt,
         format_session_status,
+        prepare_question_session_snapshot,
     )
     from .question_session_repository import QuestionSessionRepository
     from .sources.base import Extractor, SourceAdapter, Validator
@@ -76,6 +77,7 @@ else:
         format_session_explanation,
         format_session_prompt,
         format_session_status,
+        prepare_question_session_snapshot,
     )
     from question_session_repository import QuestionSessionRepository
     from sources.base import Extractor, SourceAdapter, Validator
@@ -458,7 +460,8 @@ class LawAssistantService:
                 "session_id": session["id"],
                 "text": "已结束当前题目会话。",
             }
-        snapshot = session["snapshot"]
+        snapshot = prepare_question_session_snapshot(session["snapshot"])
+        session["snapshot"] = snapshot
         if action == "current":
             return {
                 "success": True,
@@ -466,6 +469,16 @@ class LawAssistantService:
                 "text": format_session_status(session),
             }
         if action == "next":
+            if session.get("current_stage") in {"answer", "explanation"}:
+                continuation = (
+                    "/law next-answer"
+                    if session["current_stage"] == "answer"
+                    else "/law next-explanation"
+                )
+                return {
+                    "success": False,
+                    "reason": f"当前正在阅读已揭晓内容；请使用 {continuation} 继续，不会跳转题面。",
+                }
             materials = snapshot.get("materials", [])
             material_index = session["current_material_index"]
             material_page = session["current_material_page"]
@@ -500,6 +513,57 @@ class LawAssistantService:
                 )
                 or session
             )
+            session["snapshot"] = snapshot
+        elif action in {"next-answer", "next-explanation"}:
+            kind = "answer" if action == "next-answer" else "explanation"
+            if session.get("current_stage") != kind:
+                reveal_command = (
+                    "/law answer" if kind == "answer" else "/law explanation"
+                )
+                return {
+                    "success": False,
+                    "reason": f"当前尚未进入{('答案' if kind == 'answer' else '解析')}分页；请先使用 {reveal_command}。",
+                }
+            prompt_index = session["current_prompt_index"]
+            page_index = session["current_prompt_page"] + 1
+            prompts = snapshot.get("prompts", [])
+            page_key = "answer_pages" if kind == "answer" else "explanation_pages"
+            pages = (
+                prompts[prompt_index].get(page_key, [])
+                if prompt_index < len(prompts)
+                else []
+            )
+            if page_index >= len(pages):
+                noun = "答案" if kind == "answer" else "解析"
+                return {
+                    "success": True,
+                    "session_id": session["id"],
+                    "text": f"当前小问的{noun}已展示完毕。",
+                }
+            session = (
+                self.question_sessions.advance(
+                    session["id"],
+                    actor_id=str(actor_id),
+                    at=self._now_utc().isoformat(),
+                    material_index=session["current_material_index"],
+                    material_page=session["current_material_page"],
+                    prompt_index=prompt_index,
+                    prompt_page=page_index,
+                    stage=kind,
+                )
+                or session
+            )
+            session["snapshot"] = snapshot
+            text = (
+                format_session_answer(
+                    snapshot, prompt_index=prompt_index, page_index=page_index
+                )
+                if kind == "answer"
+                else format_session_explanation(
+                    snapshot, prompt_index=prompt_index, page_index=page_index
+                )
+            )
+            return {"success": True, "session_id": session["id"], "text": text}
         elif action == "next-question":
             prompts = snapshot.get("prompts", [])
             next_index = session["current_prompt_index"] + 1
@@ -517,6 +581,7 @@ class LawAssistantService:
                 )
                 or session
             )
+            session["snapshot"] = snapshot
         elif action in {"answer", "explanation"}:
             unread_notice = (
                 action == "answer"
@@ -533,13 +598,23 @@ class LawAssistantService:
                 or session
             )
             prompt_index = session["current_prompt_index"]
+            page_index = session["current_prompt_page"]
             text = (
-                format_session_answer(snapshot, prompt_index=prompt_index)
+                format_session_answer(
+                    snapshot, prompt_index=prompt_index, page_index=page_index
+                )
                 if action == "answer"
-                else format_session_explanation(snapshot, prompt_index=prompt_index)
+                else format_session_explanation(
+                    snapshot, prompt_index=prompt_index, page_index=page_index
+                )
             )
             if unread_notice:
-                text = "提示：题目材料或题干尚未全部展开。\n" + text
+                notice = "提示：题目材料或题干尚未全部展开。"
+                if len(notice) + 1 + len(text) <= int(
+                    snapshot.get("message_max_chars", 1600)
+                ):
+                    text = f"{notice}\n{text}"
+            session["snapshot"] = snapshot
             return {"success": True, "session_id": session["id"], "text": text}
         else:
             return {"success": False, "reason": f"不支持的题目会话操作：{action}"}
@@ -551,16 +626,17 @@ class LawAssistantService:
 
     @staticmethod
     def _question_session_prompt(session: dict[str, Any]) -> str:
+        snapshot = prepare_question_session_snapshot(session["snapshot"])
         material_index = session["current_material_index"]
-        if material_index < len(session["snapshot"].get("materials", [])):
+        if material_index < len(snapshot.get("materials", [])):
             return format_session_prompt(
-                session["snapshot"],
+                snapshot,
                 material_index=material_index,
                 material_page=session["current_material_page"],
                 prompt_index=session["current_prompt_index"],
             )
         return format_session_prompt(
-            session["snapshot"],
+            snapshot,
             prompt_index=session["current_prompt_index"],
             prompt_page=session["current_prompt_page"],
         )
@@ -628,8 +704,10 @@ class LawAssistantService:
                         len(snapshot.get("materials", [])),
                     ),
                     "material_count": len(snapshot.get("materials", [])),
-                    "answer_revealed": session["answer_revealed"],
-                    "explanation_revealed": session["explanation_revealed"],
+                    "answer_revealed": session["current_prompt_answer_revealed"],
+                    "explanation_revealed": session[
+                        "current_prompt_explanation_revealed"
+                    ],
                     "updated_at": session["updated_at"],
                 }
             )

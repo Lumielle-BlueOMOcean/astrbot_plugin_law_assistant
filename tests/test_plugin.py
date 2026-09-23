@@ -133,6 +133,114 @@ async def test_command_requires_private_admin_or_operator_and_delegates(plugin_m
 
 
 @pytest.mark.asyncio
+async def test_question_command_returns_bounded_text_and_explicit_answer_continuation(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(
+        None, {"operator_ids": ["42"], "question_message_max_chars": 300}
+    )
+    scope = "aiocqhttp:FriendMessage:42"
+    opened = plugin.service.open_question_session(
+        {
+            "available": True,
+            "origin": "real",
+            "subject": "criminal_law",
+            "question_type": "case_analysis",
+            "content": {
+                "question": "分析甲的行为。",
+                "answer": "答案开头：" + "核验答案。" * 180 + "答案结束。",
+                "explanation": "解析开头：" + "核验解析。" * 180 + "解析结束。",
+            },
+        },
+        session_origin=scope,
+        actor_id="42",
+    )
+    assert len(opened["text"]) <= 300
+
+    answer = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law answer",
+            )
+        )
+    )
+    assert len(answer) <= 300
+    assert "【真题" in answer
+    assert '"success"' not in answer
+    assert "/law next-answer" in answer
+
+    ambiguous_next = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law next",
+            )
+        )
+    )
+    assert "/law next-answer" in ambiguous_next
+    assert "不会跳转题面" in ambiguous_next
+
+    next_answer = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law next-answer",
+            )
+        )
+    )
+    assert len(next_answer) <= 300
+    assert "核验答案。" in next_answer
+    repeated_answer = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law answer",
+            )
+        )
+    )
+    assert repeated_answer == next_answer
+    current_answer = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law current",
+            )
+        )
+    )
+    assert "答案页：2/" in current_answer
+
+    explanation = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law explanation",
+            )
+        )
+    )
+    assert len(explanation) <= 300
+    assert "/law next-explanation" in explanation
+    next_explanation = await anext(
+        plugin.law(
+            FakeEvent(
+                sender_id="42",
+                unified_msg_origin=scope,
+                message="/law next-explanation",
+            )
+        )
+    )
+    assert len(next_explanation) <= 300
+    assert "核验解析。" in next_explanation
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_llm_tools_use_same_service_and_authorization(plugin_module):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
     recording = RecordingService()
@@ -318,7 +426,7 @@ async def test_question_command_and_llm_tools_use_answer_gated_sessions(plugin_m
     assert "题干公开部分" in opened[0]
     assert "A. 甲" in opened[0]
     assert "解析仅主动请求后显示" not in opened[0]
-    assert '"session_id"' in opened[0]
+    assert '"session_id"' not in opened[0]
 
     denied_reveal = await plugin.law_question_session(
         FakeEvent(
@@ -460,7 +568,6 @@ async def test_question_command_rejects_unknown_explicit_parameters_at_entrypoin
         )
     ]
 
-    assert '"error": "invalid_parameter"' in response[0]
     assert reason_fragment in response[0]
     await plugin.terminate()
 

@@ -77,21 +77,32 @@ class QuestionSessionRepository:
         row = self.connection.execute(
             "SELECT * FROM question_sessions WHERE id = ?", (int(session_id),)
         ).fetchone()
-        return self._session_dict(row) if row else None
+        return (
+            self._with_current_prompt_reveal_state(self._session_dict(row))
+            if row
+            else None
+        )
 
     def get_active(self, scope_origin: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM question_sessions WHERE scope_origin = ? AND status = 'open'",
             (scope_origin,),
         ).fetchone()
-        return self._session_dict(row) if row else None
+        return (
+            self._with_current_prompt_reveal_state(self._session_dict(row))
+            if row
+            else None
+        )
 
     def list_active(self, *, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT * FROM question_sessions WHERE status = 'open' ORDER BY created_at DESC LIMIT ?",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        return [self._session_dict(row) for row in rows]
+        return [
+            self._with_current_prompt_reveal_state(self._session_dict(row))
+            for row in rows
+        ]
 
     def list_events(self, session_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -142,10 +153,6 @@ class QuestionSessionRepository:
                 for event in event_rows
             )
             if not already_recorded:
-                self.connection.execute(
-                    f"UPDATE question_sessions SET {column} = 1, current_stage = ?, updated_at = ? WHERE id = ?",
-                    (kind, at, int(session_id)),
-                )
                 self._event(
                     session_id,
                     event_kind,
@@ -153,11 +160,10 @@ class QuestionSessionRepository:
                     at,
                     {"prompt_index": int(prompt_index)},
                 )
-            else:
-                self.connection.execute(
-                    f"UPDATE question_sessions SET {column} = 1, current_stage = ?, updated_at = ? WHERE id = ?",
-                    (kind, at, int(session_id)),
-                )
+            self.connection.execute(
+                f"UPDATE question_sessions SET {column} = 1, current_prompt_page = CASE WHEN current_stage = ? THEN current_prompt_page ELSE 0 END, current_stage = ?, updated_at = ? WHERE id = ?",
+                (kind, kind, at, int(session_id)),
+            )
         return self.get(session_id)
 
     def advance(
@@ -234,6 +240,24 @@ class QuestionSessionRepository:
             ) VALUES (?, ?, ?, ?, ?)""",
             (int(session_id), kind, str(actor_id), at, _json(metadata or {})),
         )
+
+    def _with_current_prompt_reveal_state(
+        self, session: dict[str, Any]
+    ) -> dict[str, Any]:
+        prompt_index = int(session["current_prompt_index"])
+        reveals = {
+            event["event_kind"]: True
+            for event in self.list_events(session["id"])
+            if event["event_kind"] in {"answer_revealed", "explanation_revealed"}
+            and int(event["metadata"].get("prompt_index", 0)) == prompt_index
+        }
+        session["current_prompt_answer_revealed"] = reveals.get(
+            "answer_revealed", False
+        )
+        session["current_prompt_explanation_revealed"] = reveals.get(
+            "explanation_revealed", False
+        )
+        return session
 
     @staticmethod
     def _session_dict(row: sqlite3.Row) -> dict[str, Any]:

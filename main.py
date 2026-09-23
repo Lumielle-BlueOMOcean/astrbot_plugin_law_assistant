@@ -331,7 +331,7 @@ class LawAssistant(Star):
             )
         elif subcommand == "question":
             origin, subject, question_type = _parse_question_args(parts[2:])
-            text = _json_text(
+            text = _question_session_result_text(
                 await self.service.start_question_session(
                     subject=subject or "",
                     origin=origin,
@@ -341,7 +341,7 @@ class LawAssistant(Star):
                 )
             )
         elif subcommand == "study" and len(parts) > 2:
-            text = _json_text(
+            text = _question_session_result_text(
                 await self.service.start_library_question_session(
                     _safe_int(parts[2]),
                     session_origin=_session_origin(event),
@@ -351,12 +351,14 @@ class LawAssistant(Star):
         elif subcommand in {
             "current",
             "next",
+            "next-answer",
+            "next-explanation",
             "next-question",
             "answer",
             "explanation",
             "close",
         }:
-            text = _json_text(
+            text = _question_session_result_text(
                 await self.service.question_session_action(
                     subcommand,
                     session_origin=_session_origin(event),
@@ -554,7 +556,7 @@ class LawAssistant(Star):
         """继续当前题目或显式揭晓答案/解析。
 
         Args:
-            action(string): current、next、next-question、answer、explanation 或 close。
+            action(string): current、next、next-question、answer、explanation、next-answer、next-explanation 或 close。
         """
         if not self._authorized(event):
             return self._denial(event)
@@ -991,7 +993,7 @@ class LawAssistant(Star):
             "/law deadlines、"
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
             "/law study <资料题目ID>、/law current、/law next、/law next-question、"
-            "/law answer、/law explanation、/law close、"
+            "/law answer、/law next-answer、/law explanation、/law next-explanation、/law close、"
             "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
             "/law review [来源ID]、/law review-get <ID>、/law review-status <ID> <状态>、"
@@ -1177,6 +1179,16 @@ def _json_text(value: Any) -> str:
             _event_dict(item) if hasattr(item, "source_key") else item for item in value
         ]
     return json.dumps(value, ensure_ascii=False, default=_json_default, sort_keys=True)
+
+
+def _question_session_result_text(value: Any) -> str:
+    """Return only the bounded user-facing page for question-session entrypoints."""
+    if isinstance(value, dict):
+        if value.get("success") and isinstance(value.get("text"), str):
+            return value["text"]
+        if isinstance(value.get("reason"), str):
+            return value["reason"]
+    return _json_text(value)
 
 
 def _json_default(value: Any) -> Any:
