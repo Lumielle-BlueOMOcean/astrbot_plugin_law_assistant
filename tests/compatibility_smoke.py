@@ -77,6 +77,8 @@ def run_smoke(
             "law_list_deadlines",
             "law_get_daily_case",
             "law_generate_question",
+            "law_study_question",
+            "law_question_session",
             "law_question_inventory",
             "law_archive_learning_material",
             "law_import_learning_document",

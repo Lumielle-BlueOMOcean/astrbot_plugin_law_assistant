@@ -130,6 +130,13 @@
     "default": false,
     "description": "是否自动发布每日法考风格练习题；需要可用 LLM provider。"
   },
+  "question_message_max_chars": {
+    "type": "int",
+    "default": 1600,
+    "minimum": 300,
+    "maximum": 4000,
+    "description": "互动题目每条消息的字符上限；长材料和长题干将分阶段阅读。"
+  },
   "daily_question_time": {
     "type": "string",
     "default": "08:00",

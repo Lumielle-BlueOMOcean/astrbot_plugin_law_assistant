@@ -86,12 +86,49 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 10
+    assert storage.schema_version == SCHEMA_VERSION == 11
     assert storage.count_events() == 0
     storage.close()
 
 
-def test_schema_v9_to_v10_migration_adds_structured_tables_and_preserves_rows(
+def test_fresh_database_has_v11_question_session_tables(tmp_path) -> None:
+    storage = SQLiteStorage(tmp_path / "question-sessions.sqlite3")
+
+    tables = {
+        row[0]
+        for row in storage.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    columns = {
+        row[1]
+        for row in storage.connection.execute("PRAGMA table_info(question_sessions)")
+    }
+
+    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert {"question_sessions", "question_session_events"} <= tables
+    assert {
+        "scope_origin",
+        "target_id",
+        "source_kind",
+        "source_item_key",
+        "question_identity",
+        "question_snapshot_hash",
+        "question_snapshot_json",
+        "status",
+        "current_stage",
+        "current_material_index",
+        "current_material_page",
+        "current_prompt_index",
+        "current_prompt_page",
+        "answer_revealed",
+        "explanation_revealed",
+        "created_by",
+    } <= columns
+    storage.close()
+
+
+def test_schema_v9_migrates_through_v11_and_preserves_rows(
     tmp_path,
 ) -> None:
     db_path = tmp_path / "version-nine.sqlite3"
@@ -109,7 +146,7 @@ def test_schema_v9_to_v10_migration_adds_structured_tables_and_preserves_rows(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
-    assert migrated.schema_version == 10
+    assert migrated.schema_version == 11
     assert migrated.get_event(event_id).title == "迁移前活动"
     assert {
         "structured_imports",
@@ -122,9 +159,7 @@ def test_schema_v9_to_v10_migration_adds_structured_tables_and_preserves_rows(
     migrated.close()
 
 
-def test_schema_v9_to_v10_migration_rolls_back_on_failure(
-    tmp_path, monkeypatch
-) -> None:
+def test_schema_v9_migration_rolls_back_on_failure(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "migration-rollback.sqlite3"
     storage = SQLiteStorage(db_path)
     storage.close()
@@ -169,7 +204,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 10",
+        match=r"schema version 99 is newer than supported version 11",
     ):
         SQLiteStorage(db_path)
 
@@ -276,7 +311,7 @@ def test_schema_v9_adds_daily_axes_and_stable_content_identity(tmp_path) -> None
         for row in storage.connection.execute("PRAGMA table_info(daily_contents)")
     }
 
-    assert storage.schema_version == SCHEMA_VERSION == 10
+    assert storage.schema_version == SCHEMA_VERSION == 11
     assert {
         "question_type_selection_mode",
         "fixed_question_type",
@@ -363,7 +398,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 10
+    assert storage.schema_version == SCHEMA_VERSION == 11
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -408,7 +443,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 10
+    assert storage.schema_version == SCHEMA_VERSION == 11
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -503,7 +538,7 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 10
+    assert reopened.schema_version == 11
     reopened.close()
 
 
@@ -544,10 +579,71 @@ def test_storage_runs_the_v3_to_v8_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 10
+    assert migrated.schema_version == SCHEMA_VERSION == 11
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()
+
+
+def test_schema_v10_to_v11_preserves_existing_events_targets_and_plans(tmp_path):
+    db_path = tmp_path / "version-ten.sqlite3"
+    storage = SQLiteStorage(db_path)
+    event_id = storage.upsert_event(make_event(title="v10 活动"))
+    target = storage.bind_target("aiocqhttp:GroupMessage:session-v10", "v10 群")
+    storage.upsert_daily_plan(DailyPlan("daily_question", enabled=True), target["id"])
+    storage.close()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE question_session_events")
+        connection.execute("DROP TABLE question_sessions")
+        connection.execute("UPDATE schema_meta SET value = '10' WHERE key = 'version'")
+        connection.commit()
+
+    upgraded = SQLiteStorage(db_path)
+    assert upgraded.schema_version == 11
+    assert upgraded.get_event(event_id).title == "v10 活动"
+    assert upgraded.get_target(target["id"])["label"] == "v10 群"
+    assert upgraded.get_daily_plan(target["id"], "daily_question").enabled is True
+    assert (
+        upgraded.connection.execute(
+            "SELECT COUNT(*) FROM question_sessions"
+        ).fetchone()[0]
+        == 0
+    )
+    upgraded.close()
+
+
+def test_schema_v10_to_v11_migration_rolls_back_on_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "v11-rollback.sqlite3"
+    storage = SQLiteStorage(db_path)
+    storage.close()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE question_session_events")
+        connection.execute("DROP TABLE question_sessions")
+        connection.execute("UPDATE schema_meta SET value = '10' WHERE key = 'version'")
+        connection.commit()
+
+    def fail_after_write(connection):
+        connection.execute("CREATE TABLE migration_probe (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("synthetic v11 migration failure")
+
+    monkeypatch.setitem(storage_module._MIGRATIONS, 10, fail_after_write)
+    with pytest.raises(RuntimeError, match="synthetic v11 migration failure"):
+        SQLiteStorage(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        version = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert version == "10"
+    assert "migration_probe" not in tables
+    assert "question_sessions" not in tables
 
 
 def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None:
@@ -618,7 +714,7 @@ def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 10
+    assert storage.schema_version == SCHEMA_VERSION == 11
     assert [
         tuple(row)
         for row in storage.connection.execute(

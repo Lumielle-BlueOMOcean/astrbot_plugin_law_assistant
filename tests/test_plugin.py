@@ -290,6 +290,131 @@ async def test_learning_tools_archive_and_search_through_service(plugin_module):
 
 
 @pytest.mark.asyncio
+async def test_question_command_and_llm_tools_use_answer_gated_sessions(plugin_module):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+
+    async def fixed_question(*args, **kwargs):
+        return {
+            "available": True,
+            "origin": "mock",
+            "subject": "criminal_law",
+            "question_type": "single_choice",
+            "content": {
+                "question": "题干公开部分",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "A",
+                "explanation": "解析仅主动请求后显示",
+            },
+        }
+
+    plugin.service.generate_question = fixed_question
+    event = FakeEvent(
+        private=True,
+        sender_id="42",
+        unified_msg_origin="aiocqhttp:FriendMessage:42",
+        message="/law question mock 刑法 单选",
+    )
+    opened = [item async for item in plugin.law(event)]
+    assert "题干公开部分" in opened[0]
+    assert "A. 甲" in opened[0]
+    assert "解析仅主动请求后显示" not in opened[0]
+    assert '"session_id"' in opened[0]
+
+    denied_reveal = await plugin.law_question_session(
+        FakeEvent(
+            private=True,
+            sender_id="7",
+            unified_msg_origin=event.unified_msg_origin,
+        ),
+        action="answer",
+    )
+    assert "没有" in denied_reveal
+    assert "解析仅主动请求后显示" not in denied_reveal
+
+    answer = await plugin.law_question_session(event, action="answer")
+    assert "参考答案" in answer and "A" in answer
+    assert "解析仅主动请求后显示" not in answer
+    explanation = await plugin.law_question_session(event, action="explanation")
+    assert "解析仅主动请求后显示" in explanation
+    assert (
+        "law_question_session"
+        == plugin_module.LawAssistant.law_question_session._fake_llm_tool
+    )
+
+    tool_result = json.loads(
+        await plugin.law_generate_question(
+            event,
+            subject="刑法",
+            origin="mock",
+            question_type="single_choice",
+        )
+    )
+    assert tool_result["success"] is True
+    assert "题干公开部分" in tool_result["text"]
+    assert "解析仅主动请求后显示" not in json.dumps(tool_result, ensure_ascii=False)
+    tool_answer = json.loads(await plugin.law_question_session(event, action="answer"))
+    assert "参考答案" in tool_answer["text"]
+    assert "解析仅主动请求后显示" not in tool_answer["text"]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_study_tool_keeps_candidate_identity_pending_and_answer_gated(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    event = FakeEvent(
+        private=True,
+        sender_id="42",
+        unified_msg_origin="aiocqhttp:FriendMessage:42",
+    )
+    archived = await plugin.service.archive_learning_material(
+        raw_text="合成候选题原文",
+        material_type="real_question_candidate",
+        title="候选题 fixture",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "stem": "根据合成案情分析甲的责任。",
+                "question_type": "case_analysis",
+                "answer": "仅手动揭晓的参考答案",
+                "explanation": "仅手动揭晓的解析",
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin=event.unified_msg_origin,
+    )
+    real_selection = await plugin.service.generate_question(
+        origin="real", subject="刑法", session_origin=event.unified_msg_origin
+    )
+    assert real_selection["available"] is False
+    await plugin.service.bind_target("aiocqhttp:group:study", "学习群")
+
+    opened = json.loads(await plugin.law_get_learning_item(event, archived["item_id"]))
+    assert opened["success"] is True
+    assert "待人工核验" in opened["identity"]
+    assert "【模拟题" not in opened["text"]
+    assert "仅手动揭晓" not in opened["text"]
+    assert opened["content_ref"]
+    preview = await plugin.service.prepare_publish_question(
+        content_ref=opened["content_ref"],
+        target_selectors=["学习群"],
+        session_origin=event.unified_msg_origin,
+        actor_id="42",
+    )
+    assert preview["ready"] is True
+    assert preview["preview"] == opened["text"]
+    revealed = json.loads(await plugin.law_question_session(event, action="answer"))
+    assert "仅手动揭晓的参考答案" in revealed["text"]
+    assert (
+        "law_study_question"
+        == plugin_module.LawAssistant.law_study_question._fake_llm_tool
+    )
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_review_command_is_operator_only_and_reads_persisted_queue(plugin_module):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
     denied = [

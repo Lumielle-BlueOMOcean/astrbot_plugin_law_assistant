@@ -105,7 +105,7 @@ jobs:
       - name: Extract release ZIP
         run: |
           mkdir -p "$RUNNER_TEMP/unpacked"
-          unzip -q "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-0.4.0.zip" -d "$RUNNER_TEMP/unpacked"
+          unzip -q "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-0.5.0.zip" -d "$RUNNER_TEMP/unpacked"
       - name: Compile extracted plugin
         run: python -m compileall "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
       - name: Run extracted package loader smoke
@@ -120,6 +120,6 @@ jobs:
         if: matrix.version == '4.25.0'
         uses: actions/upload-artifact@v4
         with:
-          name: astrbot_plugin_law_assistant-0.4.0
-          path: ${{ runner.temp }}/release/astrbot_plugin_law_assistant-0.4.0.zip
+          name: astrbot_plugin_law_assistant-0.5.0
+          path: ${{ runner.temp }}/release/astrbot_plugin_law_assistant-0.5.0.zip
           if-no-files-found: error

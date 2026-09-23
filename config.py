@@ -29,6 +29,7 @@ DEFAULT_DEADLINE_REMINDER_DAYS = (7, 3, 1)
 DEFAULT_DAILY_TIME = "08:00"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 20
 DEFAULT_DAILY_CASE_CARD_MAX_CHARS = 1800
+DEFAULT_QUESTION_MESSAGE_MAX_CHARS = 1600
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class PluginConfig:
     daily_question_rotation_subjects: tuple[str, ...]
     daily_question_rotation_start_date: str | None
     daily_question_rotation_start_index: int
+    question_message_max_chars: int
     case_source_court_enabled: bool
     case_source_spp_enabled: bool
     law_update_enabled: bool
@@ -199,6 +201,11 @@ class PluginConfig:
             daily_question_rotation_start_date=question_rotation_start_date,
             daily_question_rotation_start_index=_normalize_index(
                 values.get("daily_question_rotation_start_index", 0)
+            ),
+            question_message_max_chars=_normalize_question_message_max_chars(
+                values.get(
+                    "question_message_max_chars", DEFAULT_QUESTION_MESSAGE_MAX_CHARS
+                )
             ),
             case_source_court_enabled=_to_bool(
                 values.get("case_source_court_enabled", True)
@@ -376,6 +383,14 @@ def _normalize_card_max_chars(value: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_DAILY_CASE_CARD_MAX_CHARS
     return max(600, min(5000, limit))
+
+
+def _normalize_question_message_max_chars(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_QUESTION_MESSAGE_MAX_CHARS
+    return max(300, min(4000, limit))
 
 
 def _to_bool(value: Any) -> bool:

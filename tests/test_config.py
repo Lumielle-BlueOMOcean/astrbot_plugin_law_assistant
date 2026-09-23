@@ -14,6 +14,7 @@ def test_config_defaults_are_safe() -> None:
     assert config.deadline_reminder_days == (7, 3, 1)
     assert config.daily_case_enabled is False
     assert config.daily_question_enabled is False
+    assert config.question_message_max_chars == 1600
     assert config.daily_case_selection_mode == "random"
     assert config.daily_question_origin == "random"
     assert config.daily_question_type is None
@@ -53,6 +54,27 @@ def test_config_uses_default_timezone_for_unknown_timezone() -> None:
     config = PluginConfig.from_mapping({"timezone": "Not/AZone"})
 
     assert config.timezone == DEFAULT_TIMEZONE
+
+
+def test_question_message_budget_has_safe_bounds_and_invalid_fallback() -> None:
+    assert (
+        PluginConfig.from_mapping(
+            {"question_message_max_chars": 1}
+        ).question_message_max_chars
+        == 300
+    )
+    assert (
+        PluginConfig.from_mapping(
+            {"question_message_max_chars": 9000}
+        ).question_message_max_chars
+        == 4000
+    )
+    assert (
+        PluginConfig.from_mapping(
+            {"question_message_max_chars": "bad"}
+        ).question_message_max_chars
+        == 1600
+    )
 
 
 def test_config_normalizes_extra_sources_and_reminder_days() -> None:

@@ -242,11 +242,23 @@ async function renderOverview() {
     const radar = data.radar || {};
     const learning = data.learning || {};
     view.append(metricGrid([
-      [t("page.overview.version", "插件版本"), plugin.version || "0.3.0", `schema v${data.schema_version ?? "—"}`],
+      [t("page.overview.version", "插件版本"), plugin.version || "0.5.0", `schema v${data.schema_version ?? "—"}`],
       [t("page.overview.currentEvents", "当前活动"), radar.current || 0, t("page.overview.currentEventsDetail", "排除历史与待复核")],
       [t("page.overview.cases", "官方案例"), learning.official_case || 0, t("page.overview.casesDetail", "可用于每日案例")],
       [t("page.overview.realQuestions", "核验真题"), learning.verified_real || 0, t("page.overview.realQuestionsDetail", "来源身份独立保存")],
       [t("page.overview.targets", "绑定群"), data.targets?.count || 0, t("page.overview.targetsDetail", "启用发布目标")],
+      [t("page.overview.questionSessions", "进行中的题目会话"), (data.question_sessions || []).length, t("page.overview.questionSessionsDetail", "按 QQ 会话独立保存")],
+    ]));
+    view.append(sectionTitle(t("page.overview.questionSessions", "进行中的题目会话"), t("page.overview.questionSessionsDescription", "仅显示进度与揭晓状态，不返回题目正文或答案。")));
+    view.append(table(data.question_sessions || [], [
+      ["target_label", t("page.overview.sessionTarget", "会话/群")],
+      ["identity_label", t("page.overview.sessionIdentity", "题目身份")],
+      ["subject", t("page.history.subject", "方向")],
+      ["question_type", t("page.overview.sessionType", "题型")],
+      ["prompt_index", t("page.overview.sessionPrompt", "小问"), (row) => node("span", `${row.prompt_index}/${row.prompt_count || 1}`)],
+      ["material_index", t("page.overview.sessionMaterials", "材料进度"), (row) => node("span", `${row.material_index}/${row.material_count}`)],
+      ["answer_revealed", t("page.overview.sessionAnswer", "答案"), (row) => node("span", row.answer_revealed ? t("page.overview.revealed", "已揭晓") : t("page.overview.hidden", "未揭晓"))],
+      ["explanation_revealed", t("page.overview.sessionExplanation", "解析"), (row) => node("span", row.explanation_revealed ? t("page.overview.revealed", "已揭晓") : t("page.overview.hidden", "未揭晓"))],
     ]));
     view.append(sectionTitle(t("page.overview.recent", "最近每日运行"), t("page.overview.recentDescription", "失败与跳过记录会保留原因，不会伪装成成功。")));
     view.append(table((data.recent?.daily || []).slice(0, 8), [

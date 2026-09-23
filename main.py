@@ -332,10 +332,33 @@ class LawAssistant(Star):
         elif subcommand == "question":
             origin, subject, question_type = _parse_question_args(parts[2:])
             text = _json_text(
-                await self.service.generate_question(
-                    subject or "",
+                await self.service.start_question_session(
+                    subject=subject or "",
                     origin=origin,
                     question_type=question_type,
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
+                )
+            )
+        elif subcommand == "study" and len(parts) > 2:
+            text = _json_text(
+                await self.service.start_library_question_session(
+                    _safe_int(parts[2]),
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
+                )
+            )
+        elif subcommand in {
+            "current",
+            "next",
+            "next-question",
+            "answer",
+            "explanation",
+            "close",
+        }:
+            text = _json_text(
+                await self.service.question_session_action(
+                    subcommand,
                     session_origin=_session_origin(event),
                     actor_id=str(event.get_sender_id()),
                 )
@@ -500,10 +523,44 @@ class LawAssistant(Star):
         if not self._authorized(event):
             return self._denial(event)
         return _json_text(
-            await self.service.generate_question(
-                subject,
+            await self.service.start_question_session(
+                subject=subject,
                 origin=origin,
                 question_type=question_type or None,
+                session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
+            )
+        )
+
+    @filter.llm_tool(name="law_study_question")
+    async def law_study_question(self, event: AstrMessageEvent, item_id: int) -> str:
+        """从已收藏的模拟题或待人工核验来源候选题开启分阶段学习；不会升级真题身份。
+
+        Args:
+            item_id(number): 资料库搜索结果中的题目条目 ID。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.start_library_question_session(
+                item_id,
+                session_origin=_session_origin(event),
+                actor_id=str(event.get_sender_id()),
+            )
+        )
+
+    @filter.llm_tool(name="law_question_session")
+    async def law_question_session(self, event: AstrMessageEvent, action: str) -> str:
+        """继续当前题目或显式揭晓答案/解析。
+
+        Args:
+            action(string): current、next、next-question、answer、explanation 或 close。
+        """
+        if not self._authorized(event):
+            return self._denial(event)
+        return _json_text(
+            await self.service.question_session_action(
+                action,
                 session_origin=_session_origin(event),
                 actor_id=str(event.get_sender_id()),
             )
@@ -609,14 +666,23 @@ class LawAssistant(Star):
 
     @filter.llm_tool(name="law_get_learning_item")
     async def law_get_learning_item(self, event: AstrMessageEvent, item_id: int) -> str:
-        """读取一条完整学习资料，包括原始来源和结构化内容。
+        """读取一条学习资料；题目会以答案隔离的互动会话形式打开。
 
         Args:
             item_id(number): 搜索结果中的学习条目 ID。
         """
         if not self._authorized(event):
             return self._denial(event)
-        return _json_text(await self.service.get_learning_item(item_id))
+        detail = await self.service.get_learning_item(item_id)
+        if detail.get("success") and isinstance(detail.get("question"), dict):
+            return _json_text(
+                await self.service.start_library_question_session(
+                    item_id,
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
+                )
+            )
+        return _json_text(detail)
 
     @filter.llm_tool(name="law_update_learning_item")
     async def law_update_learning_item(
@@ -924,6 +990,8 @@ class LawAssistant(Star):
             "用法：/law status、/law scan、/law events [current|needs_review|historical|all]、"
             "/law deadlines、"
             "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
+            "/law study <资料题目ID>、/law current、/law next、/law next-question、"
+            "/law answer、/law explanation、/law close、"
             "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
             "/law targets、/law plans、/law question-import <JSON路径>、"
             "/law review [来源ID]、/law review-get <ID>、/law review-status <ID> <状态>、"

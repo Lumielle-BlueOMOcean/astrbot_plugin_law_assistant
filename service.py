@@ -17,7 +17,6 @@ if __package__ and "." in __package__:
         radar_policy_for,
     )
     from .content import (
-        format_question_content,
         normalize_subject,
         parse_origin,
         parse_question_type,
@@ -35,6 +34,14 @@ if __package__ and "." in __package__:
     from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from .publisher import format_deadline_reminder, format_event
+    from .question_session import (
+        build_question_session_snapshot,
+        format_session_answer,
+        format_session_explanation,
+        format_session_prompt,
+        format_session_status,
+    )
+    from .question_session_repository import QuestionSessionRepository
     from .sources.base import Extractor, SourceAdapter, Validator
     from .storage import SQLiteStorage
     from .structured_ingestion import (
@@ -49,7 +56,6 @@ else:
         radar_policy_for,
     )
     from content import (
-        format_question_content,
         normalize_subject,
         parse_origin,
         parse_question_type,
@@ -64,6 +70,14 @@ else:
     from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
     from publisher import format_deadline_reminder, format_event
+    from question_session import (
+        build_question_session_snapshot,
+        format_session_answer,
+        format_session_explanation,
+        format_session_prompt,
+        format_session_status,
+    )
+    from question_session_repository import QuestionSessionRepository
     from sources.base import Extractor, SourceAdapter, Validator
     from storage import SQLiteStorage
     from structured_ingestion import (
@@ -102,6 +116,12 @@ class PendingPublication:
     owner_id: str | None = None
     event_revision: int | None = None
     event_content_hash: str | None = None
+    question_snapshot: dict[str, Any] | None = None
+    question_identity: str | None = None
+    source_kind: str | None = None
+    source_item_key: str | None = None
+    library_item_id: int | None = None
+    real_question_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,11 +235,348 @@ class LawAssistantService:
             str, tuple[int, datetime, datetime, str | None]
         ] = {}
         self._content_references: dict[str, ContentReference] = {}
+        self.question_sessions = QuestionSessionRepository(storage.connection)
         self._scheduler_wakeup: Any | None = None
 
     def set_scheduler_wakeup(self, callback: Any | None) -> None:
         """Register the host scheduler's idempotent wake-up callback."""
         self._scheduler_wakeup = callback
+
+    def open_question_session(
+        self,
+        content: dict[str, Any],
+        *,
+        session_origin: str,
+        actor_id: str,
+        target_id: int | None = None,
+        source_kind: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an immutable question snapshot and return its answer-free first page."""
+        if not content.get("available", True):
+            return {
+                "success": False,
+                "reason": str(content.get("reason") or "题目不可用"),
+            }
+        scope = str(session_origin or "").strip()
+        if not scope:
+            return {"success": False, "reason": "缺少题目会话来源，无法安全保存进度"}
+        limit = getattr(self.config, "question_message_max_chars", 1600)
+        try:
+            limit = max(300, min(4000, int(limit)))
+        except (TypeError, ValueError):
+            limit = 1600
+        snapshot = build_question_session_snapshot(content, max_chars=limit)
+        item = content.get("item") if isinstance(content.get("item"), dict) else {}
+        origin = str(content.get("origin") or "")
+        identity = str(
+            snapshot.get("identity")
+            or item.get("identity")
+            or ("verified_real_question" if origin == "real" else "mock_question")
+        )
+        library_id = item.get("id")
+        try:
+            library_id = int(library_id) if library_id is not None else None
+        except (TypeError, ValueError):
+            library_id = None
+        question_id = content.get("question_id") if origin == "real" else None
+        try:
+            question_id = int(question_id) if question_id is not None else None
+        except (TypeError, ValueError):
+            question_id = None
+        if (
+            question_id is not None
+            and self.storage.connection.execute(
+                "SELECT 1 FROM real_questions WHERE id = ?", (question_id,)
+            ).fetchone()
+            is None
+        ):
+            question_id = None
+        if (
+            library_id is not None
+            and self.storage.connection.execute(
+                "SELECT 1 FROM learning_items WHERE id = ?", (library_id,)
+            ).fetchone()
+            is None
+        ):
+            library_id = None
+        item_key = str(
+            content.get("question_id")
+            or item.get("id")
+            or snapshot.get("snapshot_hash")
+        )
+        return self._persist_question_snapshot(
+            snapshot,
+            session_origin=scope,
+            actor_id=actor_id,
+            target_id=target_id,
+            source_kind=(
+                source_kind
+                or (
+                    "library_question"
+                    if item
+                    else ("real_question" if origin == "real" else "generated_question")
+                )
+            ),
+            source_item_key=item_key,
+            question_identity=identity,
+            library_item_id=library_id,
+            real_question_id=question_id,
+        )
+
+    def _persist_question_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        session_origin: str,
+        actor_id: str,
+        target_id: int | None = None,
+        source_kind: str,
+        source_item_key: str,
+        question_identity: str,
+        library_item_id: int | None = None,
+        real_question_id: int | None = None,
+    ) -> dict[str, Any]:
+        if (
+            library_item_id is not None
+            and self.storage.connection.execute(
+                "SELECT 1 FROM learning_items WHERE id = ?", (library_item_id,)
+            ).fetchone()
+            is None
+        ):
+            library_item_id = None
+        if (
+            real_question_id is not None
+            and self.storage.connection.execute(
+                "SELECT 1 FROM real_questions WHERE id = ?", (real_question_id,)
+            ).fetchone()
+            is None
+        ):
+            real_question_id = None
+        session = self.question_sessions.create_session(
+            session_key=secrets.token_urlsafe(18),
+            scope_origin=session_origin,
+            target_id=target_id,
+            source_kind=source_kind,
+            source_item_key=source_item_key,
+            library_item_id=library_item_id,
+            real_question_id=real_question_id,
+            question_identity=question_identity,
+            snapshot=snapshot,
+            created_by=str(actor_id),
+            created_at=self._now_utc().isoformat(),
+        )
+        text = self._question_session_prompt(session)
+        return {
+            "success": True,
+            "session_id": session["id"],
+            "identity": snapshot["identity_label"],
+            "text": text,
+            "snapshot_hash": session["snapshot_hash"],
+        }
+
+    async def start_question_session(
+        self,
+        *,
+        subject: str = "",
+        origin: str = "random",
+        question_type: str | None = None,
+        session_origin: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        content = await self.generate_question(
+            subject,
+            origin=origin,
+            question_type=question_type,
+            session_origin=session_origin,
+            actor_id=actor_id,
+        )
+        if not content.get("available"):
+            return {"success": False, **content}
+        result = self.open_question_session(
+            content, session_origin=session_origin, actor_id=actor_id
+        )
+        if result.get("success") and content.get("content_ref"):
+            result["content_ref"] = content["content_ref"]
+        return result
+
+    async def start_library_question_session(
+        self, item_id: int, *, session_origin: str, actor_id: str
+    ) -> dict[str, Any]:
+        detail = await self.get_learning_item(item_id)
+        if not detail.get("success") or not isinstance(detail.get("question"), dict):
+            return {
+                "success": False,
+                "reason": detail.get("message", "该条目不是可学习题目"),
+            }
+        item = detail.get("item") or {}
+        identity = str(item.get("identity") or "")
+        if identity not in {"real_question_candidate", "mock_question"}:
+            return {
+                "success": False,
+                "reason": "仅支持人工学习来源候选题或模拟题；候选题不会升级为核验真题",
+            }
+        content = dict(detail)
+        content["subject"] = (item.get("subjects") or [""])[0]
+        content["question_type"] = detail["question"].get("question_type")
+        content["origin"] = (
+            "candidate" if identity == "real_question_candidate" else "mock"
+        )
+        content["available"] = True
+        remembered = self._remember_content(
+            "question",
+            content,
+            actor_id=actor_id,
+            session_origin=session_origin,
+        )
+        opened = self.open_question_session(
+            remembered,
+            session_origin=session_origin,
+            actor_id=actor_id,
+            source_kind="library_question",
+        )
+        if opened.get("success") and remembered.get("content_ref"):
+            opened["content_ref"] = remembered["content_ref"]
+        return opened
+
+    async def question_session_action(
+        self, action: str, *, session_origin: str, actor_id: str
+    ) -> dict[str, Any]:
+        """Apply one explicit command to the active session in exactly this chat scope."""
+        session = self.question_sessions.get_active(str(session_origin or ""))
+        if session is None:
+            return {
+                "success": False,
+                "reason": "当前会话没有进行中的题目；可用 /law question 或 /law study <ID> 开始。",
+            }
+        action = str(action).strip().lower().replace("_", "-")
+        if action == "close":
+            self.question_sessions.close(
+                session["id"], actor_id=str(actor_id), at=self._now_utc().isoformat()
+            )
+            return {
+                "success": True,
+                "session_id": session["id"],
+                "text": "已结束当前题目会话。",
+            }
+        snapshot = session["snapshot"]
+        if action == "current":
+            return {
+                "success": True,
+                "session_id": session["id"],
+                "text": format_session_status(session),
+            }
+        if action == "next":
+            materials = snapshot.get("materials", [])
+            material_index = session["current_material_index"]
+            material_page = session["current_material_page"]
+            prompt_index = session["current_prompt_index"]
+            prompt_page = session["current_prompt_page"]
+            if material_index < len(materials):
+                pages = materials[material_index].get("pages", [])
+                if material_page + 1 < len(pages):
+                    material_page += 1
+                else:
+                    material_index += 1
+                    material_page = 0
+            else:
+                prompts = snapshot.get("prompts", [])
+                pages = prompts[prompt_index].get("stem_pages", []) if prompts else []
+                if prompt_page + 1 >= len(pages):
+                    return {
+                        "success": True,
+                        "session_id": session["id"],
+                        "text": "本题内容已展示完毕，可继续讨论、使用 /law answer 查看答案，或在有下一小问时使用 /law next-question。",
+                    }
+                prompt_page += 1
+            session = (
+                self.question_sessions.advance(
+                    session["id"],
+                    actor_id=str(actor_id),
+                    at=self._now_utc().isoformat(),
+                    material_index=material_index,
+                    material_page=material_page,
+                    prompt_index=prompt_index,
+                    prompt_page=prompt_page,
+                )
+                or session
+            )
+        elif action == "next-question":
+            prompts = snapshot.get("prompts", [])
+            next_index = session["current_prompt_index"] + 1
+            if next_index >= len(prompts):
+                return {"success": False, "reason": "没有更多小问了。"}
+            session = (
+                self.question_sessions.advance(
+                    session["id"],
+                    actor_id=str(actor_id),
+                    at=self._now_utc().isoformat(),
+                    material_index=len(snapshot.get("materials", [])),
+                    material_page=0,
+                    prompt_index=next_index,
+                    prompt_page=0,
+                )
+                or session
+            )
+        elif action in {"answer", "explanation"}:
+            unread_notice = (
+                action == "answer"
+                and self._question_session_has_unread_content(session)
+            )
+            session = (
+                self.question_sessions.reveal(
+                    session["id"],
+                    action,
+                    actor_id=str(actor_id),
+                    at=self._now_utc().isoformat(),
+                    prompt_index=session["current_prompt_index"],
+                )
+                or session
+            )
+            prompt_index = session["current_prompt_index"]
+            text = (
+                format_session_answer(snapshot, prompt_index=prompt_index)
+                if action == "answer"
+                else format_session_explanation(snapshot, prompt_index=prompt_index)
+            )
+            if unread_notice:
+                text = "提示：题目材料或题干尚未全部展开。\n" + text
+            return {"success": True, "session_id": session["id"], "text": text}
+        else:
+            return {"success": False, "reason": f"不支持的题目会话操作：{action}"}
+        return {
+            "success": True,
+            "session_id": session["id"],
+            "text": self._question_session_prompt(session),
+        }
+
+    @staticmethod
+    def _question_session_prompt(session: dict[str, Any]) -> str:
+        material_index = session["current_material_index"]
+        if material_index < len(session["snapshot"].get("materials", [])):
+            return format_session_prompt(
+                session["snapshot"],
+                material_index=material_index,
+                material_page=session["current_material_page"],
+                prompt_index=session["current_prompt_index"],
+            )
+        return format_session_prompt(
+            session["snapshot"],
+            prompt_index=session["current_prompt_index"],
+            prompt_page=session["current_prompt_page"],
+        )
+
+    @staticmethod
+    def _question_session_has_unread_content(session: dict[str, Any]) -> bool:
+        snapshot = session["snapshot"]
+        materials = snapshot.get("materials", [])
+        if session["current_material_index"] < len(materials):
+            return True
+        prompts = snapshot.get("prompts", [])
+        prompt_index = session["current_prompt_index"]
+        if prompt_index >= len(prompts):
+            return False
+        pages = prompts[prompt_index].get("stem_pages", [])
+        return session["current_prompt_page"] + 1 < len(pages)
 
     async def status(self) -> dict[str, Any]:
         return {
@@ -249,11 +606,38 @@ class LawAssistantService:
             else {}
         )
         plans = self.storage.list_daily_plans()
+        targets_by_id = {
+            int(target["id"]): target
+            for target in self.storage.list_targets(enabled_only=False)
+        }
+        question_sessions = []
+        for session in self.question_sessions.list_active(limit=100):
+            snapshot = session["snapshot"]
+            target = targets_by_id.get(session["target_id"])
+            prompts = snapshot.get("prompts", [])
+            question_sessions.append(
+                {
+                    "target_label": target["label"] if target else "私聊会话",
+                    "identity_label": snapshot.get("identity_label", "题目"),
+                    "subject": snapshot.get("subject_label", "其他"),
+                    "question_type": snapshot.get("question_type_label", ""),
+                    "prompt_index": session["current_prompt_index"] + 1,
+                    "prompt_count": len(prompts),
+                    "material_index": min(
+                        session["current_material_index"],
+                        len(snapshot.get("materials", [])),
+                    ),
+                    "material_count": len(snapshot.get("materials", [])),
+                    "answer_revealed": session["answer_revealed"],
+                    "explanation_revealed": session["explanation_revealed"],
+                    "updated_at": session["updated_at"],
+                }
+            )
         status = await self.status()
         return {
             "schema_version": self.storage.schema_version,
             "plugin": {
-                "version": "0.3.0",
+                "version": "0.5.0",
                 "schema_version": self.storage.schema_version,
                 "scheduler_enabled": bool(
                     any(
@@ -275,6 +659,7 @@ class LawAssistantService:
                 "sources": await self.list_sources(),
             },
             "learning": learning,
+            "question_sessions": question_sessions,
             "targets": {
                 "count": len(self.storage.list_targets(enabled_only=True)),
                 "enabled_plans": sum(1 for item in plans if item.get("enabled")),
@@ -1307,6 +1692,20 @@ class LawAssistantService:
                 fixed_body=claimed.body,
             )
         else:
+            if (
+                claimed.content_type == "question"
+                and claimed.question_snapshot is not None
+            ):
+                outcomes = await self._publish_question_to_targets(
+                    claimed,
+                    actor_id=str(actor_id or ""),
+                )
+                count = sum(status == "sent" for status in outcomes)
+                return {
+                    "success": count > 0,
+                    "published_count": count,
+                    "failed_count": sum(status != "sent" for status in outcomes),
+                }
             count = await self._publish_fixed_to_targets(
                 claimed.body, claimed.target_ids, claimed.content_type
             )
@@ -1346,7 +1745,8 @@ class LawAssistantService:
             )
         if not content.get("available"):
             return {"ready": False, **content}
-        body = format_question_content(content)
+        snapshot = self._build_question_snapshot(content)
+        body = self._snapshot_first_prompt(snapshot)
         token = secrets.token_urlsafe(12)
         created = self._now_utc()
         self._publish_confirmations[token] = PendingPublication(
@@ -1356,6 +1756,26 @@ class LawAssistantService:
             created_at=created,
             expires_at=created + timedelta(minutes=10),
             owner_id=actor_id,
+            question_snapshot=snapshot,
+            question_identity=str(snapshot.get("identity") or ""),
+            source_kind=(
+                "library_question"
+                if isinstance(content.get("item"), dict)
+                else (
+                    "real_question"
+                    if content.get("origin") == "real"
+                    else "generated_question"
+                )
+            ),
+            source_item_key=str(
+                content.get("question_id")
+                or (content.get("item") or {}).get("id")
+                or snapshot.get("snapshot_hash")
+            ),
+            library_item_id=(content.get("item") or {}).get("id"),
+            real_question_id=(
+                content.get("question_id") if content.get("origin") == "real" else None
+            ),
         )
         return {
             "ready": True,
@@ -1370,6 +1790,63 @@ class LawAssistantService:
                 if content.get(key) is not None
             },
         }
+
+    def _build_question_snapshot(self, content: dict[str, Any]) -> dict[str, Any]:
+        limit = getattr(self.config, "question_message_max_chars", 1600)
+        try:
+            limit = max(300, min(4000, int(limit)))
+        except (TypeError, ValueError):
+            limit = 1600
+        return build_question_session_snapshot(content, max_chars=limit)
+
+    @staticmethod
+    def _snapshot_first_prompt(snapshot: dict[str, Any]) -> str:
+        if snapshot.get("materials"):
+            return format_session_prompt(snapshot, material_index=0, material_page=0)
+        return format_session_prompt(snapshot, prompt_index=0, prompt_page=0)
+
+    async def _publish_question_to_targets(
+        self, pending: PendingPublication, *, actor_id: str
+    ) -> list[str]:
+        if self.publisher is None or pending.question_snapshot is None:
+            return []
+        targets = {
+            int(target["id"]): target
+            for target in self.storage.list_targets(enabled_only=True)
+        }
+        outcomes: list[str] = []
+        for target_id in pending.target_ids:
+            target = targets.get(target_id)
+            if target is None:
+                outcomes.append("failed")
+                continue
+            try:
+                outcome = await self.publisher.publish_text(
+                    target["unified_msg_origin"], pending.body
+                )
+                status, error = _delivery_status(outcome)
+            except Exception as exc:  # noqa: BLE001 - isolate target transport failure.
+                status, error = "failed", str(exc)
+            outcomes.append(status)
+            if status == "sent":
+                self._persist_question_snapshot(
+                    pending.question_snapshot,
+                    session_origin=target["unified_msg_origin"],
+                    target_id=target_id,
+                    actor_id=actor_id,
+                    source_kind=pending.source_kind or "generated_question",
+                    source_item_key=pending.source_item_key or "unknown",
+                    question_identity=pending.question_identity or "mock_question",
+                    library_item_id=pending.library_item_id,
+                    real_question_id=pending.real_question_id,
+                )
+            else:
+                self.logger.warning(
+                    "Law Assistant failed to publish question to %s: %s",
+                    target["unified_msg_origin"],
+                    error,
+                )
+        return outcomes
 
     async def prepare_publish_case(
         self,
@@ -2187,10 +2664,15 @@ class LawAssistantService:
             )
             if claim_id is None:
                 continue
+            question_snapshot = (
+                self._build_question_snapshot(content)
+                if content_type == "daily_question"
+                else None
+            )
             formatted = (
                 _format_daily_content(content_type, content)
                 if content_type == "daily_case"
-                else format_question_content(content)
+                else self._snapshot_first_prompt(question_snapshot or {})
             )
             outcome = await self.publisher.publish_text(
                 target["unified_msg_origin"],
@@ -2202,6 +2684,39 @@ class LawAssistantService:
             )
             sent += int(status == "sent")
             if status == "sent":
+                if question_snapshot is not None:
+                    item = (
+                        content.get("item")
+                        if isinstance(content.get("item"), dict)
+                        else {}
+                    )
+                    self._persist_question_snapshot(
+                        question_snapshot,
+                        session_origin=target["unified_msg_origin"],
+                        target_id=target["id"],
+                        actor_id="scheduler",
+                        source_kind=(
+                            "library_question"
+                            if item
+                            else (
+                                "real_question"
+                                if content.get("origin") == "real"
+                                else "generated_question"
+                            )
+                        ),
+                        source_item_key=str(
+                            content.get("question_id")
+                            or item.get("id")
+                            or question_snapshot.get("snapshot_hash")
+                        ),
+                        question_identity=str(question_snapshot.get("identity") or ""),
+                        library_item_id=item.get("id"),
+                        real_question_id=(
+                            content.get("question_id")
+                            if content.get("origin") == "real"
+                            else None
+                        ),
+                    )
                 self.logger.info(
                     "Law Assistant sent %s to %s",
                     content_type,

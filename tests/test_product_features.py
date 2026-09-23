@@ -126,9 +126,15 @@ async def test_publish_preview_locks_body_and_explicit_targets(tmp_path) -> None
     )
     assert preview["ready"] is True
     body = preview["preview"]
+    assert "下列说法正确的是？" in body
+    assert "参考答案" not in body
+    assert "学习解析" not in body
     result = await service.confirm_publish(preview["token"])
     assert result["published_count"] == 1
     assert publisher.calls == [(first["unified_msg_origin"], body)]
+    active = service.question_sessions.get_active(first["unified_msg_origin"])
+    assert active is not None
+    assert "参考答案" not in publisher.calls[0][1]
     assert (await service.confirm_publish(preview["token"]))["success"] is False
 
 
@@ -155,6 +161,67 @@ async def test_publish_token_is_bound_to_preparing_operator(tmp_path) -> None:
         in (await service.confirm_publish(preview["token"], actor_id="7"))["reason"]
     )
     assert (await service.confirm_publish(preview["token"], actor_id="42"))["success"]
+
+
+@pytest.mark.asyncio
+async def test_failed_manual_question_delivery_does_not_open_target_session(tmp_path):
+    class FailedPublisher:
+        async def publish_text(self, destination: str, text: str) -> bool:
+            return False
+
+    storage = SQLiteStorage(tmp_path / "failed-question-publish.sqlite3")
+    learning = LearningService(storage, FakeLearningLLM())
+    service = LawAssistantService(
+        storage,
+        learning_service=learning,
+        publisher=FailedPublisher(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    target = await service.bind_target("aiocqhttp:group:failure", "失败测试群")
+    preview = await service.prepare_publish_question(
+        origin="mock",
+        subject="刑法",
+        question_type="single_choice",
+        target_selectors=["失败测试群"],
+        actor_id="42",
+    )
+    result = await service.confirm_publish(preview["token"], actor_id="42")
+    assert result == {"success": False, "published_count": 0, "failed_count": 1}
+    assert service.question_sessions.get_active(target["unified_msg_origin"]) is None
+
+
+@pytest.mark.asyncio
+async def test_partial_manual_question_delivery_opens_only_successful_target_sessions(
+    tmp_path,
+):
+    class OneTargetPublisher:
+        async def publish_text(self, destination: str, text: str) -> bool:
+            return destination.endswith(":success")
+
+    storage = SQLiteStorage(tmp_path / "partial-question-publish.sqlite3")
+    service = LawAssistantService(
+        storage,
+        learning_service=LearningService(storage, FakeLearningLLM()),
+        publisher=OneTargetPublisher(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    success_target = await service.bind_target("aiocqhttp:group:success", "成功群")
+    failed_target = await service.bind_target("aiocqhttp:group:failed", "失败群")
+    preview = await service.prepare_publish_question(
+        origin="mock",
+        subject="刑法",
+        question_type="single_choice",
+        target_selectors=["成功群", "失败群"],
+        actor_id="42",
+    )
+    result = await service.confirm_publish(preview["token"], actor_id="42")
+    assert result["published_count"] == 1
+    assert result["failed_count"] == 1
+    assert service.question_sessions.get_active(success_target["unified_msg_origin"])
+    assert (
+        service.question_sessions.get_active(failed_target["unified_msg_origin"])
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -226,6 +293,12 @@ async def test_daily_plans_are_independent_and_idempotent(tmp_path) -> None:
     assert second["daily_question_sent"] == 0
     assert len(storage.list_daily_contents()) == 2
     assert target["id"] == 1
+    question_message = next(text for _, text in publisher.calls if "题干：题干" in text)
+    assert "参考答案：A" not in question_message
+    assert "解析：解析" not in question_message
+    assert (
+        service.question_sessions.get_active(target["unified_msg_origin"]) is not None
+    )
 
 
 @pytest.mark.asyncio

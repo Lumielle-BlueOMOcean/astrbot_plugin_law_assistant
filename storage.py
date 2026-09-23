@@ -21,7 +21,7 @@ else:
     from date_parser import date_is_on_or_after
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -863,6 +863,86 @@ def _migrate_9_to_10(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_10_to_11(connection: sqlite3.Connection) -> None:
+    """Persist scoped interactive question sessions and their audit events."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL UNIQUE,
+            scope_origin TEXT NOT NULL,
+            target_id INTEGER REFERENCES publish_targets(id) ON DELETE SET NULL,
+            source_kind TEXT NOT NULL,
+            source_item_key TEXT NOT NULL,
+            library_item_id INTEGER REFERENCES learning_items(id) ON DELETE SET NULL,
+            real_question_id INTEGER REFERENCES real_questions(id) ON DELETE SET NULL,
+            question_identity TEXT NOT NULL,
+            question_snapshot_hash TEXT NOT NULL,
+            question_snapshot_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('open', 'closed', 'superseded')),
+            current_stage TEXT NOT NULL CHECK(
+                current_stage IN ('prompt', 'answer', 'explanation', 'complete')
+            ),
+            current_material_index INTEGER NOT NULL DEFAULT 0,
+            current_prompt_index INTEGER NOT NULL DEFAULT 0,
+            answer_revealed INTEGER NOT NULL DEFAULT 0 CHECK(answer_revealed IN (0, 1)),
+            explanation_revealed INTEGER NOT NULL DEFAULT 0
+                CHECK(explanation_revealed IN (0, 1)),
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_question_sessions_one_open_per_scope
+            ON question_sessions(scope_origin) WHERE status = 'open'
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_question_sessions_target_status
+            ON question_sessions(target_id, status)
+        """
+    )
+    _add_column_if_missing(
+        connection,
+        "question_sessions",
+        "current_material_page",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection,
+        "question_sessions",
+        "current_prompt_page",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES question_sessions(id)
+                ON DELETE CASCADE,
+            event_kind TEXT NOT NULL CHECK(event_kind IN (
+                'opened', 'continued', 'answer_revealed',
+                'explanation_revealed', 'closed', 'superseded'
+            )),
+            actor_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_question_session_events_session
+            ON question_session_events(session_id, id)
+        """
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -874,6 +954,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_7_to_8,
     8: _migrate_8_to_9,
     9: _migrate_9_to_10,
+    10: _migrate_10_to_11,
 }
 
 

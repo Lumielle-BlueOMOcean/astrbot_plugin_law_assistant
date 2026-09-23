@@ -85,7 +85,7 @@ async def test_web_api_registers_overview_and_returns_stable_json(tmp_path):
 
     assert response.status_code == 200
     assert payload["success"] is True
-    assert payload["data"]["schema_version"] == 10
+    assert payload["data"]["schema_version"] == 11
     assert "learning" in payload["data"]
     service.storage.close()
 

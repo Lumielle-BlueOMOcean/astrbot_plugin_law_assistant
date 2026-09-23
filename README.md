@@ -1,6 +1,6 @@
 # 微光·法务助手 / Lumielle Law Assistant
 
-AstrBot QQ 法律信息助手。`0.4.0` 在活动、官方案例、法规更新、学习资料库、受控文档导入、每日任务、多群定向发布和 AstrBot 4.25+ 嵌入式管理页基础上，增加 PDF + structured-material v1 的无损候选导入；以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
+AstrBot QQ 法律信息助手。`0.5.0` 在活动、官方案例、法规更新、学习资料库、受控文档导入、每日任务、多群定向发布和 AstrBot 4.25+ 嵌入式管理页基础上，增加持久化互动题目会话：先展示题干，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
 
 ## Implemented
 
@@ -28,6 +28,8 @@ AstrBot QQ 法律信息助手。`0.4.0` 在活动、官方案例、法规更新�
 - Python 3.12 单元测试、ruff、compile 和真实 AstrBot 4.22.0/4.25.0 loader smoke。
 - AstrBot 4.25+ Plugin Page：总览、资料库搜索/详情、受控 TXT/DOCX/PDF 上传的 prepare/confirm 导入、待复核状态、活动雷达扫描、每日计划预览、群目标和运行记录。
 - 结构化资料导入：Plugin Page 的“结构化资料导入”同时接收原始 PDF 和 `structured-material-v1.json`，prepare 只生成预览，confirm 后以 `real_question_candidate` / `pending_review`（案例为用户候选）写入资料库；它不会调用旧正则拆分器，也不会授予核验真题或官方案例身份。公共材料、题干/答案/解析块、小问、定位和来源关系均持久化。
+- Question Session：`/law question`、`/law study <资料题目ID>` 和 LLM Tools 会在精确 QQ 会话范围内保存题目快照；`/law current`、`/law next`、`/law next-question` 分阶段展示长材料和多小问，`/law answer` 与 `/law explanation` 分别显式揭晓。切换题目仅替换当前会话，不影响其他群/私聊。
+- 人工题目发布预览和每日一题只发送无答案题面；每个群发送成功后才开启独立题目会话，发送失败不会留下活动会话。题目快照与揭晓状态在 AstrBot 重启后保留。
 - 页面使用原生 HTML/CSS/Vanilla ES Modules 与 `window.AstrBotPluginPage` Bridge，不需要 Node、npm、CDN 或独立 HTTP server。
 
 ## Planned / deferred
@@ -75,7 +77,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 
 ### Plugin ZIP
 
-在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.4.0.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
+在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.0.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
 
 完整嵌入式 WebUI 需要 AstrBot `>=4.25`；基础插件功能兼容 `>=4.22.0,<5`。页面认证由 AstrBot Dashboard 提供，插件不建立第二套账号密码系统。
 
@@ -95,6 +97,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 - `deadline_reminder_days` / `deadline_same_day_enabled`：DDL 提醒策略。
 - `llm_provider_id`：可选；留空按当前会话或宿主默认 provider。
 - `daily_question_origin` / `daily_question_subject` / `daily_question_type`：全局每日一题默认来源、方向和题型，默认均为随机。
+- `question_message_max_chars`：互动题目每条消息的长度预算，默认 1600，限制在 300–4000；长题干和材料会按页继续展示。
 - `daily_question_type_selection_mode`、`daily_question_fixed_type`、`daily_question_rotation_types`、`daily_question_type_rotation_start_date`、`daily_question_type_rotation_start_index`：每日一题独立的题型模式；方向轮换与题型轮换分别按本地日期计算。
 - 若旧配置只有 `daily_question_type`，继续按固定题型解释；一旦明确设置新的题型模式，`random` 或 `rotation` 优先，旧固定字段不会覆盖新模式。`rotation` 必须提供有效题型列表。
 - `daily_case_selection_mode`、`daily_question_selection_mode`：`random`、`fixed` 或 `rotation`。
@@ -114,7 +117,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `10`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时数据库，安装包不覆盖现有数据库。
+当前 schema version 为 `11`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系，v10→v11 增加按 QQ 会话隔离的题目快照与揭晓事件；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时 SQLite；安装包不覆盖现有数据库。
 
 ### 结构化资料导入
 
@@ -144,6 +147,13 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 /law confirm <token>
 /law case [方向]
 /law question [real|mock|random] [方向] [题型]
+/law study <资料库题目ID>
+/law current
+/law next
+/law next-question
+/law answer
+/law explanation
+/law close
 /law import <imports目录相对路径> [case|mock_question|real_question_candidate]
 /law plans [群名]
 /law question-import <JSON路径>
@@ -163,7 +173,7 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。
+可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_study_question`、`law_question_session`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。`law_generate_question` 与题目类 `law_get_learning_item` 返回答案隔离会话；`law_question_session` 的 action 为 `current`、`next`、`next-question`、`answer`、`explanation` 或 `close`。
 
 ### 学习资料库
 
@@ -171,7 +181,13 @@ data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 
 资料身份由后端确定：普通案例为 `user_case`，未核验题目为 `real_question_candidate`，原创练习题为 `mock_question`。Tool 不能创建 `official_case` 或 `verified_real_question`，也不会因为 structured JSON 中出现 `official` 或 `verified` 就提升身份。现有 verified 真题 JSON 导入路径继续独立运行。
 
-`law_search_learning_library` 支持标题、原文、摘要、题干、学习要点和方向的普通文本查询；`law_get_learning_item` 返回完整原文与结构化条目；`law_update_learning_item` 只允许修改标题、方向、备注、案例学习要点或题目解析，不能修改创建者、来源 hash 或核验身份。四个 Tool 都要求私聊及 AstrBot Admin/operator 权限。
+`law_search_learning_library` 支持标题、原文、摘要、题干、学习要点和方向的普通文本查询；`law_get_learning_item` 对非题目返回资料详情，对题目则打开答案隔离的学习会话；`law_study_question` 可显式开始学习模拟题或 `real_question_candidate`，候选题仍标记“待人工核验”。`law_update_learning_item` 只允许修改标题、方向、备注、案例学习要点或题目解析，不能修改创建者、来源 hash 或核验身份。相关 Tools 都要求私聊及 AstrBot Admin/operator 权限。
+
+#### 互动题目会话
+
+题面、共享材料、选项和原文答题要求先展示；不会把答案或解析包含在初次 Tool 返回、手动群发布预览或每日一题消息中。使用 `/law answer` 或自然语言明确要求答案后才显示当前小问答案；`/law explanation` 单独显示来源解析。若来源没有可靠答案/解析，会明确提示不可用，不调用 LLM 猜答案。
+
+长材料按保存顺序分页：`/law next` 继续材料或当前题干的下一页；材料展示完后继续显示当前题干；`/law next-question` 进入下一独立小问。`/law current` 查看当前页，`/law close` 结束会话。新题只 supersede 相同 `unified_msg_origin` 的活动会话，不覆盖其他聊天；会话快照、页码和答案/解析揭晓事件持久化在插件 SQLite。`real_question_candidate / pending_review` 可由 operator 手动学习，但绝不进入 `origin=real` verified inventory。
 
 ### 真题导入格式
 
@@ -257,6 +273,6 @@ python scripts/build_release.py --output dist
 
 `.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；4.25.0 额外验证 Plugin Page discovery、`/api/plug/astrbot_plugin_law_assistant/...` route contract 和解压 ZIP 的页面加载；required failure 不用 `continue-on-error` 隐藏。
 
-CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.4.0.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
+CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.0.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
 
 本地的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用 deterministic fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取、Dashboard 浏览器操作和真实 LLM provider 仍需后续实机验收。

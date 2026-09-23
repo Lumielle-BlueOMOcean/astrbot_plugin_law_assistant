@@ -70,6 +70,44 @@ test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async (
   await assert.rejects(() => page.apiPost("plans/prepare"), /业务失败/);
 });
 
+test("overview renders safe active-session progress from the Bridge payload", async () => {
+  const { bridge, elements, page } = await loadPage();
+  bridge.apiGet = async () => ({
+    plugin: { version: "0.5.0" },
+    schema_version: 11,
+    radar: { current: 0 },
+    learning: {},
+    targets: { count: 1 },
+    recent: { daily: [] },
+    question_sessions: [{
+      target_label: "法硕一群",
+      identity_label: "真题",
+      subject: "刑法",
+      question_type: "案例分析题",
+      prompt_index: 2,
+      prompt_count: 3,
+      material_index: 1,
+      material_count: 2,
+      answer_revealed: false,
+      explanation_revealed: false,
+      // The overview contract must not need or render these source fields.
+      question_text: "不得显示的题干秘密",
+      answer_text: "不得显示的答案秘密",
+    }],
+  });
+  page.state.route = "overview";
+  page.state.renderGeneration = 1;
+
+  await page.renderOverview();
+
+  const rendered = textOf(elements.get("view-overview"));
+  assert.match(rendered, /法硕一群/);
+  assert.match(rendered, /真题/);
+  assert.match(rendered, /2\/3/);
+  assert.match(rendered, /1\/2/);
+  assert.doesNotMatch(rendered, /不得显示的题干秘密|不得显示的答案秘密/);
+});
+
 test("stale asynchronous overview render cannot overwrite the newest generation", async () => {
   const { bridge, elements, page } = await loadPage();
   let resolveFirst;
@@ -77,7 +115,7 @@ test("stale asynchronous overview render cannot overwrite the newest generation"
   page.state.route = "overview";
   page.state.renderGeneration = 1;
   const first = page.renderOverview();
-  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 10 });
+  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 11 });
   page.state.renderGeneration = 2;
   const second = page.renderOverview();
   await second;
