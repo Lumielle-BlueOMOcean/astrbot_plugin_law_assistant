@@ -227,6 +227,69 @@ def _paginate_message_blocks(
     raise ValueError("could not stabilize question message pagination")
 
 
+def _paginate_legacy_pages(
+    blocks: Any,
+    max_chars: int,
+    *,
+    prefix_for_page: Callable[[int, int], str],
+    suffix_for_page: Callable[[int, int], str] | None = None,
+) -> tuple[list[str], list[int]]:
+    """Keep each persisted pre-v2 page boundary while applying current limits."""
+    limit = max(1, int(max_chars))
+    source = [str(block or "") for block in blocks]
+    suffix_for_page = suffix_for_page or (lambda _page, _total: "")
+    total = max(1, sum(bool(block) for block in source))
+
+    for _ in range(24):
+        pages: list[str] = []
+        page_starts: list[int] = []
+        for block in source:
+            page_starts.append(len(pages))
+            remaining = block
+            while remaining:
+                page_number = len(pages) + 1
+                prefix = prefix_for_page(page_number, total)
+                suffix = suffix_for_page(page_number, total)
+                available = limit - len(_compose_message(prefix, "", suffix)) - 1
+                if available < 1:
+                    raise ValueError(
+                        "question_message_max_chars is too small for fixed message text"
+                    )
+                chunk = chunk_text(remaining, available)[0]
+                pages.append(_compose_message(prefix, chunk, suffix))
+                remaining = remaining[len(chunk) :]
+
+        if not pages:
+            pages.append(_compose_message(prefix_for_page(1, total), "", ""))
+        if len(pages) == total:
+            return pages, page_starts
+        total = len(pages)
+
+    raise ValueError("could not stabilize legacy question pagination")
+
+
+def display_session_page_index(
+    snapshot: dict[str, Any], section: str, item_index: int, stored_index: int
+) -> int:
+    """Resolve an old source-page cursor or an encoded display-page cursor."""
+    cursor = int(stored_index)
+    if cursor < 0:
+        return -cursor - 1
+    maps = snapshot.get("_legacy_page_maps", {})
+    section_maps = maps.get(section, []) if isinstance(maps, dict) else []
+    if item_index < len(section_maps):
+        page_starts = section_maps[item_index]
+        if page_starts:
+            return int(page_starts[min(cursor, len(page_starts) - 1)])
+    return cursor
+
+
+def encode_session_page_index(snapshot: dict[str, Any], page_index: int) -> int:
+    """Mark a continued legacy session cursor as a rendered-page index."""
+    index = max(0, int(page_index))
+    return -(index + 1) if snapshot.get("_legacy_page_maps") else index
+
+
 def _material_pages(
     snapshot: dict[str, Any],
     index: int,
@@ -252,6 +315,48 @@ def _material_pages(
         return f"{_header(snapshot)}\n材料 {index + 1}/{count}（第 {page}/{total} 页）"
 
     return _paginate_message_blocks(body, max_chars, prefix_for_page=prefix)
+
+
+def _legacy_prompt_page_blocks(
+    snapshot: dict[str, Any], index: int, prompt: dict[str, Any]
+) -> list[str]:
+    """Rebuild pre-v2 prompt pages without flattening their stored page boundaries."""
+    pages = [str(page or "") for page in prompt.get("legacy_stem_pages", [])]
+    options = [str(option) for option in prompt.get("source_options", []) if option]
+    requirements = [
+        str(value)
+        for value in snapshot.get("answer_requirements", [])
+        if str(value or "").strip()
+    ]
+    requirements.extend(
+        str(value)
+        for value in prompt.get("source_answer_requirements", [])
+        if str(value or "").strip()
+    )
+    result: list[str] = []
+    for page_index, page in enumerate(pages):
+        body: list[str] = []
+        if page_index == 0 and index == 0:
+            exam = snapshot.get("exam", {})
+            if snapshot.get("identity") == "verified_real_question":
+                for key, label in (
+                    ("source_name", "题库来源"),
+                    ("exam_name", "考试"),
+                    ("exam_year", "年份"),
+                    ("source_url", "来源链接"),
+                ):
+                    if exam.get(key):
+                        body.append(f"{label}：{exam[key]}")
+        body.append(f"题干：{page}")
+        if page_index == 0:
+            if options:
+                body.append(f"选项：{options[0]}")
+                body.extend(options[1:])
+            if requirements:
+                body.append(f"答题要求：{requirements[0]}")
+                body.extend(requirements[1:])
+        result.append("\n".join(body))
+    return result
 
 
 def _prompt_body_blocks(
@@ -323,19 +428,57 @@ def _render_snapshot(
 
     materials = snapshot.get("materials", [])
     rendered_materials = []
+    legacy_material_page_starts: list[list[int] | None] = []
     for index, material in enumerate(materials):
+        legacy_pages = material.get("legacy_pages")
+        if isinstance(legacy_pages, list):
+            title = str(material.get("title") or "")
+            blocks = [
+                "\n".join(
+                    part
+                    for part in (f"材料标题：{title}" if title else "", page)
+                    if part
+                )
+                for page in legacy_pages
+            ]
+
+            def material_prefix(
+                page: int,
+                total: int,
+                *,
+                _index: int = index,
+                _count: int = len(materials),
+            ) -> str:
+                return f"{_header(snapshot)}\n材料 {_index + 1}/{_count}（第 {page}/{total} 页）"
+
+            material_pages, page_starts = _paginate_legacy_pages(
+                blocks,
+                limit,
+                prefix_for_page=material_prefix,
+            )
+            legacy_material_page_starts.append(page_starts)
+        else:
+            material_pages = _material_pages(snapshot, index, material, limit)
+            legacy_material_page_starts.append(None)
         rendered_materials.append(
             {
                 "id": str(material.get("id") or ""),
-                "pages": _material_pages(snapshot, index, material, limit),
+                "pages": material_pages,
             }
         )
     snapshot["materials"] = rendered_materials
 
     prompts = snapshot.get("prompts", [])
     rendered_prompts = []
+    legacy_prompt_page_starts: list[list[int] | None] = []
     for index, prompt in enumerate(prompts):
-        body = _prompt_body_blocks(snapshot, index, prompt)
+        legacy_stem_pages = prompt.get("legacy_stem_pages")
+        is_legacy_pages = isinstance(legacy_stem_pages, list)
+        body = (
+            _legacy_prompt_page_blocks(snapshot, index, prompt)
+            if is_legacy_pages
+            else _prompt_body_blocks(snapshot, index, prompt)
+        )
         prompt_count = len(prompts)
 
         def prompt_prefix(
@@ -348,14 +491,25 @@ def _render_snapshot(
             progress = f"小问 {_index + 1}/{_count}｜" if _count > 1 else ""
             return f"{_header(snapshot)}\n{progress}题干续页 {page}/{total}"
 
-        stem_pages = _paginate_message_blocks(
-            body,
-            limit,
-            prefix_for_page=prompt_prefix,
-            suffix_for_page=lambda _page, _total: (
-                "答案与解析可分别使用 /law answer 和 /law explanation 查看。"
-            ),
+        prompt_suffix = lambda _page, _total: (
+            "答案与解析可分别使用 /law answer 和 /law explanation 查看。"
         )
+        if is_legacy_pages and body:
+            stem_pages, page_starts = _paginate_legacy_pages(
+                body,
+                limit,
+                prefix_for_page=prompt_prefix,
+                suffix_for_page=prompt_suffix,
+            )
+            legacy_prompt_page_starts.append(page_starts)
+        else:
+            stem_pages = _paginate_message_blocks(
+                body,
+                limit,
+                prefix_for_page=prompt_prefix,
+                suffix_for_page=prompt_suffix,
+            )
+            legacy_prompt_page_starts.append(None)
 
         answer_blocks = list(prompt.get("source_answer_blocks", []))
         if not answer_blocks:
@@ -417,6 +571,15 @@ def _render_snapshot(
         )
     snapshot["prompts"] = rendered_prompts
     snapshot.pop("shared_stem_blocks", None)
+    if any(value is not None for value in legacy_material_page_starts) or any(
+        value is not None for value in legacy_prompt_page_starts
+    ):
+        snapshot["_legacy_page_maps"] = {
+            "materials": legacy_material_page_starts,
+            "prompts": legacy_prompt_page_starts,
+        }
+    else:
+        snapshot.pop("_legacy_page_maps", None)
     return snapshot
 
 
@@ -435,7 +598,9 @@ def prepare_question_session_snapshot(
         materials.append(
             {
                 "id": material.get("id"),
+                "title": material.get("title"),
                 "blocks": list(material.get("pages", [])),
+                "legacy_pages": list(material.get("pages", [])),
             }
         )
     prompts = []
@@ -446,11 +611,14 @@ def prepare_question_session_snapshot(
             {
                 "id": prompt.get("id"),
                 "source_number": prompt.get("source_number"),
-                "stem_blocks": list(prompt.get("stem_pages", [])),
-                "options": list(prompt.get("options", [])),
-                "answer_blocks": list(prompt.get("answer_blocks", [])),
-                "explanation_blocks": list(prompt.get("explanation_blocks", [])),
-                "answer_requirements": list(prompt.get("answer_requirements", [])),
+                "source_stem_blocks": list(prompt.get("stem_pages", [])),
+                "legacy_stem_pages": list(prompt.get("stem_pages", [])),
+                "source_options": list(prompt.get("options", [])),
+                "source_answer_blocks": list(prompt.get("answer_blocks", [])),
+                "source_explanation_blocks": list(prompt.get("explanation_blocks", [])),
+                "source_answer_requirements": list(
+                    prompt.get("answer_requirements", [])
+                ),
             }
         )
     result["materials"] = materials
@@ -667,7 +835,10 @@ def format_session_prompt(
         material = materials[material_index]
         pages = material.get("pages", [])
         if pages:
-            return pages[min(max(0, material_page), len(pages) - 1)]
+            page_index = display_session_page_index(
+                snapshot, "materials", material_index, material_page
+            )
+            return pages[min(max(0, page_index), len(pages) - 1)]
         return _compose_message(_header(snapshot), "材料暂无可展示内容。", "")
     prompt_list = snapshot.get("prompts", [])
     if not prompt_list:
@@ -677,7 +848,10 @@ def format_session_prompt(
     pages = prompt.get("stem_pages", [])
     if not pages:
         return _compose_message(_header(snapshot), "当前题目没有可展示的题干。", "")
-    return pages[min(max(0, prompt_page), len(pages) - 1)]
+    page_index = display_session_page_index(
+        snapshot, "prompts", prompt_index, prompt_page
+    )
+    return pages[min(max(0, page_index), len(pages) - 1)]
 
 
 def format_session_status(session: dict[str, Any]) -> str:
@@ -709,9 +883,15 @@ def format_session_status(session: dict[str, Any]) -> str:
     lines.append(f"材料进度：{material_index}/{material_count}")
     if material_index < material_count:
         pages = snapshot["materials"][material_index].get("pages", [])
+        page_index = display_session_page_index(
+            snapshot,
+            "materials",
+            material_index,
+            session.get("current_material_page", 0),
+        )
         lines.append(
             f"当前阅读：材料 {material_index + 1}/{material_count}，"
-            f"第 {session.get('current_material_page', 0) + 1}/{max(1, len(pages))} 页"
+            f"第 {page_index + 1}/{max(1, len(pages))} 页"
         )
     if prompt_count:
         lines.append(f"小问：{prompt_index + 1}/{prompt_count}")
@@ -726,9 +906,12 @@ def format_session_status(session: dict[str, Any]) -> str:
             page_field = "explanation_pages"
             stage_label = "解析页"
         pages = prompt.get(page_field, [])
-        lines.append(
-            f"{stage_label}：{session.get('current_prompt_page', 0) + 1}/{max(1, len(pages))}"
-        )
+        page_index = session.get("current_prompt_page", 0)
+        if stage not in {"answer", "explanation"}:
+            page_index = display_session_page_index(
+                snapshot, "prompts", prompt_index, page_index
+            )
+        lines.append(f"{stage_label}：{page_index + 1}/{max(1, len(pages))}")
     lines.append(
         "答案："
         f"{'已揭晓' if session.get('current_prompt_answer_revealed') else '未揭晓'}"

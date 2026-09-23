@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from question_session import (
     format_session_answer,
     format_session_explanation,
     format_session_prompt,
+    prepare_question_session_snapshot,
 )
 from question_session_repository import QuestionSessionRepository
 from service import LawAssistantService
@@ -687,4 +689,210 @@ async def test_current_reveal_state_is_per_subquestion_and_survives_reopen(tmp_p
     assert [event["metadata"]["prompt_index"] for event in explanation_events] == [0, 1]
     assert first_reveal["text"] == repeated_reveal["text"]
     assert first_explanation["text"] == repeated_explanation["text"]
+    reopened.close()
+
+
+def _legacy_d45_snapshot() -> dict[str, object]:
+    """Synthetic fixture matching the snapshot written by the d45ace builder."""
+    oversized_stem_page = "旧版小问一题干第1页。" + ("甲" * 1550)
+    snapshot: dict[str, object] = {
+        "identity": "real_question_candidate",
+        "identity_label": "来源资料候选题 · 待人工核验",
+        "subject": "criminal_law",
+        "subject_label": "刑法",
+        "question_type": "case_analysis",
+        "question_type_label": "案例分析题",
+        "materials": [
+            {
+                "id": "legacy-material-1",
+                "title": "旧版公共材料标题",
+                "pages": ["旧版公共材料第1页。", "旧版公共材料第2页。"],
+            }
+        ],
+        "prompts": [
+            {
+                "id": "legacy-subquestion-1",
+                "source_number": "1",
+                "stem_pages": [oversized_stem_page, "旧版小问一题干第2页。"],
+                "options": [],
+                "answer_blocks": ["旧版小问一答案。"],
+                "explanation_blocks": ["旧版小问一解析。"],
+            },
+            {
+                "id": "legacy-subquestion-2",
+                "source_number": "2",
+                "stem_pages": ["旧版小问二题干。"],
+                "options": [],
+                "answer_blocks": ["旧版小问二答案。"],
+                "explanation_blocks": ["旧版小问二解析。"],
+            },
+        ],
+        "answer_requirements": ["作答要求：结合公共材料分析。"],
+        "exam": {
+            "source_name": "合成旧版题库",
+            "exam_name": "合成考试",
+            "exam_year": "2022",
+            "paper": "主观题卷",
+            "question_number": "第1题",
+            "source_url": "https://example.test/legacy",
+            "answer_source": "third_party",
+        },
+    }
+    encoded = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    snapshot["snapshot_hash"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return snapshot
+
+
+@pytest.mark.asyncio
+async def test_d45_snapshot_reopens_without_rewriting_and_keeps_session_content(
+    tmp_path,
+):
+    db_path = tmp_path / "legacy-d45-session.sqlite3"
+    scope = "aiocqhttp:FriendMessage:42"
+    legacy_snapshot = _legacy_d45_snapshot()
+    original = SQLiteStorage(db_path)
+    legacy_repository = QuestionSessionRepository(original.connection)
+    created = legacy_repository.create_session(
+        session_key="legacy-session",
+        scope_origin=scope,
+        target_id=None,
+        source_kind="library_candidate",
+        source_item_key="legacy-item",
+        library_item_id=None,
+        real_question_id=None,
+        question_identity="real_question_candidate",
+        snapshot=legacy_snapshot,
+        created_by="42",
+        created_at="2026-09-23T00:00:00+00:00",
+    )
+    legacy_repository.reveal(
+        created["id"],
+        "explanation",
+        actor_id="42",
+        at="2026-09-23T00:01:00+00:00",
+        prompt_index=0,
+    )
+    legacy_repository.advance(
+        created["id"],
+        actor_id="42",
+        at="2026-09-23T00:02:00+00:00",
+        material_index=0,
+        material_page=1,
+        prompt_index=0,
+        prompt_page=0,
+    )
+    original_hash = created["snapshot_hash"]
+    original.close()
+
+    reopened = SQLiteStorage(db_path)
+    service = LawAssistantService(reopened)
+    active = service.question_sessions.get_active(scope)
+    assert active is not None
+    assert active["snapshot_hash"] == original_hash
+    assert active["snapshot"] == legacy_snapshot
+    display_snapshot = prepare_question_session_snapshot(active["snapshot"])
+    material_messages = "\n".join(display_snapshot["materials"][0]["pages"])
+    assert material_messages.count("旧版公共材料第1页。") == 1
+    assert material_messages.count("旧版公共材料第2页。") == 1
+    legacy_prompt_pages = display_snapshot["prompts"][0]["stem_pages"]
+    assert all(len(page) <= 1600 for page in legacy_prompt_pages)
+    assert sum(page.count("甲") for page in legacy_prompt_pages) == 1550
+    assert sum(page.count("旧版小问一题干第1页。") for page in legacy_prompt_pages) == 1
+    assert sum(page.count("旧版小问一题干第2页。") for page in legacy_prompt_pages) == 1
+    assert (
+        sum(
+            page.count("旧版小问一答案。")
+            for page in display_snapshot["prompts"][0]["answer_pages"]
+        )
+        == 1
+    )
+    assert (
+        sum(
+            page.count("旧版小问一解析。")
+            for page in display_snapshot["prompts"][0]["explanation_pages"]
+        )
+        == 1
+    )
+    material = format_session_prompt(active["snapshot"], material_index=0)
+    assert "旧版公共材料标题" in material
+    assert material.count("旧版公共材料第1页。") == 1
+    resumed_material_page = format_session_prompt(
+        active["snapshot"], material_index=0, material_page=1
+    )
+    assert "旧版公共材料第2页。" in resumed_material_page
+    assert "旧版公共材料第1页。" not in resumed_material_page
+
+    restored_status = await service.question_session_action(
+        "current", session_origin=scope, actor_id="42"
+    )
+    assert "材料 1/1" in restored_status["text"]
+    assert "第 2/2 页" in restored_status["text"]
+    assert "答案：未揭晓" in restored_status["text"]
+    assert "解析：已揭晓" in restored_status["text"]
+
+    first_prompt = await service.question_session_action(
+        "next", session_origin=scope, actor_id="42"
+    )
+    assert "旧版小问一题干第1页。" in first_prompt["text"]
+    assert "旧版小问一答案。" not in first_prompt["text"]
+    assert "旧版小问一解析。" not in first_prompt["text"]
+    assert len(first_prompt["text"]) <= 1600
+
+    second_prompt_page = await service.question_session_action(
+        "next", session_origin=scope, actor_id="42"
+    )
+    assert "甲" in second_prompt_page["text"]
+    assert "旧版小问一题干第2页。" not in second_prompt_page["text"]
+    assert (
+        "答案：未揭晓"
+        in (
+            await service.question_session_action(
+                "current", session_origin=scope, actor_id="42"
+            )
+        )["text"]
+    )
+    reopened.close()
+
+    reopened = SQLiteStorage(db_path)
+    service = LawAssistantService(reopened)
+    restored_page_status = await service.question_session_action(
+        "current", session_origin=scope, actor_id="42"
+    )
+    assert "题干页：2/3" in restored_page_status["text"]
+    third_prompt_page = await service.question_session_action(
+        "next", session_origin=scope, actor_id="42"
+    )
+    assert "旧版小问一题干第2页。" in third_prompt_page["text"]
+    assert "作答要求：结合公共材料分析。" not in third_prompt_page["text"]
+
+    first_answer = await service.question_session_action(
+        "answer", session_origin=scope, actor_id="42"
+    )
+    assert "旧版小问一答案。" in first_answer["text"]
+    assert "旧版小问一解析。" not in first_answer["text"]
+
+    next_question = await service.question_session_action(
+        "next-question", session_origin=scope, actor_id="42"
+    )
+    assert "旧版小问二题干。" in next_question["text"]
+    assert "旧版小问一答案。" not in next_question["text"]
+    assert "旧版小问二答案。" not in next_question["text"]
+    next_status = await service.question_session_action(
+        "current", session_origin=scope, actor_id="42"
+    )
+    assert "小问：2/2" in next_status["text"]
+    assert "答案：未揭晓" in next_status["text"]
+    assert "解析：未揭晓" in next_status["text"]
+
+    persisted = service.question_sessions.get(created["id"])
+    assert persisted is not None
+    assert persisted["snapshot_hash"] == original_hash
+    assert persisted["snapshot"] == legacy_snapshot
+    assert [
+        (event["event_kind"], event["metadata"].get("prompt_index"))
+        for event in service.question_sessions.list_events(created["id"])
+        if event["event_kind"] in {"answer_revealed", "explanation_revealed"}
+    ] == [("explanation_revealed", 0), ("answer_revealed", 0)]
     reopened.close()

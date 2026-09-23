@@ -36,6 +36,8 @@ if __package__ and "." in __package__:
     from .publisher import format_deadline_reminder, format_event
     from .question_session import (
         build_question_session_snapshot,
+        display_session_page_index,
+        encode_session_page_index,
         format_session_answer,
         format_session_explanation,
         format_session_prompt,
@@ -73,6 +75,8 @@ else:
     from publisher import format_deadline_reminder, format_event
     from question_session import (
         build_question_session_snapshot,
+        display_session_page_index,
+        encode_session_page_index,
         format_session_answer,
         format_session_explanation,
         format_session_prompt,
@@ -486,21 +490,29 @@ class LawAssistantService:
             prompt_page = session["current_prompt_page"]
             if material_index < len(materials):
                 pages = materials[material_index].get("pages", [])
-                if material_page + 1 < len(pages):
-                    material_page += 1
+                display_page = display_session_page_index(
+                    snapshot, "materials", material_index, material_page
+                )
+                if display_page + 1 < len(pages):
+                    material_page = encode_session_page_index(
+                        snapshot, display_page + 1
+                    )
                 else:
                     material_index += 1
                     material_page = 0
             else:
                 prompts = snapshot.get("prompts", [])
                 pages = prompts[prompt_index].get("stem_pages", []) if prompts else []
-                if prompt_page + 1 >= len(pages):
+                display_page = display_session_page_index(
+                    snapshot, "prompts", prompt_index, prompt_page
+                )
+                if display_page + 1 >= len(pages):
                     return {
                         "success": True,
                         "session_id": session["id"],
                         "text": "本题内容已展示完毕，可继续讨论、使用 /law answer 查看答案，或在有下一小问时使用 /law next-question。",
                     }
-                prompt_page += 1
+                prompt_page = encode_session_page_index(snapshot, display_page + 1)
             session = (
                 self.question_sessions.advance(
                     session["id"],
@@ -652,7 +664,13 @@ class LawAssistantService:
         if prompt_index >= len(prompts):
             return False
         pages = prompts[prompt_index].get("stem_pages", [])
-        return session["current_prompt_page"] + 1 < len(pages)
+        display_page = display_session_page_index(
+            snapshot,
+            "prompts",
+            prompt_index,
+            session["current_prompt_page"],
+        )
+        return display_page + 1 < len(pages)
 
     async def status(self) -> dict[str, Any]:
         return {
