@@ -348,6 +348,7 @@ async function renderLibraryDetail(container, itemId, parentGeneration = state.r
   catch (error) { if (isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) setFlash(error.message, true); return; }
   if (!isCurrentRequest(requestKey, requestId, parentGeneration, parentRoute)) return;
   const item = data.item || {};
+  const isQuestion = item.item_type === "question";
   const panel = node("article", undefined, "detail-panel");
   panel.append(sectionTitle(`${t("page.library.detail", "资料详情")} #${item.id}`, item.title));
   panel.append(keyValueRows({ 身份: item.identity, 核验: item.verification_status, 方向: (item.subjects || []).map(subjectLabel), 创建者: item.created_by, 更新时间: item.updated_at }));
@@ -371,10 +372,20 @@ async function renderLibraryDetail(container, itemId, parentGeneration = state.r
   const edit = node("div", undefined, "form-grid");
   const title = textInput(item.title);
   const subjects = textInput((item.subjects || []).join(","));
-  const note = textInput(item.metadata?.note || "");
-  edit.append(labeled("标题", title), labeled("方向（可用规范名称或中文）", subjects), labeled("备注", note));
+  let note;
+  edit.append(labeled("标题", title), labeled("方向（可用规范名称或中文）", subjects));
+  if (!isQuestion) {
+    note = textInput(item.metadata?.note || "");
+    edit.append(labeled("备注", note));
+  }
   edit.append(button(t("page.actions.save", "保存"), async () => {
-    try { await apiPost("library/update", { item_id: item.id, changes: { title: title.value, subjects: subjects.value, note: note.value } }); setFlash(t("page.messages.saved", "已保存")); await renderLibraryDetail(container, item.id); }
+    try {
+      const changes = { title: title.value, subjects: subjects.value };
+      if (!isQuestion) changes.note = note.value;
+      await apiPost("library/update", { item_id: item.id, changes });
+      setFlash(t("page.messages.saved", "已保存"));
+      await renderLibraryDetail(container, item.id);
+    }
     catch (error) { setFlash(error.message, true); }
   }, "primary"));
   panel.append(sectionTitle(t("page.library.editAllowed", "允许修改的字段"), "身份、核验状态、创建者与来源哈希不可从页面修改。"), edit);

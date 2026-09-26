@@ -27,6 +27,23 @@ function textOf(value) {
   return `${value.textContent || ""}${(value.children || []).map(textOf).join("")}`;
 }
 
+function findElement(root, predicate) {
+  if (predicate(root)) return root;
+  for (const child of root.children || []) {
+    const found = findElement(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function labeledInput(root, label) {
+  const field = findElement(
+    root,
+    (element) => element.tagName === "LABEL" && element.children?.[0]?.textContent === label,
+  );
+  return field?.children?.[1] || null;
+}
+
 async function loadPage() {
   const elements = new Map();
   for (const id of ["flash", "navigation", "context-badge", "view-overview", "view-library", "view-plans", "view-targets", "view-history"]) {
@@ -170,6 +187,90 @@ test("question detail never renders answer, explanation, raw evidence, or metada
   ]) {
     assert.doesNotMatch(rendered, new RegExp(secret));
   }
+});
+
+test("saving a safe question detail never submits a note field", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async () => ({
+    success: true,
+    item: {
+      id: 73,
+      item_type: "question",
+      identity: "mock_question",
+      title: "安全题目",
+      subjects: ["criminal_law"],
+      verification_status: "not_applicable",
+      created_by: "42",
+      updated_at: "2026-09-27T00:00:00Z",
+    },
+    question: { question_type: "single_choice", stem: "安全题干", options: [] },
+    sources: [],
+    source_links: [],
+  });
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    return { success: true };
+  };
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+
+  await page.renderLibraryDetail(elements.get("view-library"), 73);
+  labeledInput(elements.get("view-library"), "标题").value = "更新后的题目";
+  labeledInput(elements.get("view-library"), "方向（可用规范名称或中文）").value = "民法";
+  const save = findElement(
+    elements.get("view-library"),
+    (element) => element.tagName === "BUTTON" && element.textContent === "保存",
+  );
+  await save.listeners.click();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].endpoint, "library/update");
+  assert.equal(posts[0].body.item_id, 73);
+  assert.equal(posts[0].body.changes.title, "更新后的题目");
+  assert.equal(posts[0].body.changes.subjects, "民法");
+  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["subjects", "title"]);
+  assert.equal(labeledInput(elements.get("view-library"), "备注"), null);
+});
+
+test("saving a non-question detail continues to submit its edited note", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async () => ({
+    success: true,
+    item: {
+      id: 81,
+      item_type: "note",
+      identity: "user_note",
+      title: "学习笔记",
+      subjects: ["civil_law"],
+      metadata: { note: "已有备注" },
+      verification_status: "not_applicable",
+      created_by: "42",
+      updated_at: "2026-09-27T00:00:00Z",
+    },
+    sources: [],
+    source_links: [],
+  });
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    return { success: true };
+  };
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+
+  await page.renderLibraryDetail(elements.get("view-library"), 81);
+  labeledInput(elements.get("view-library"), "备注").value = "修改后的备注";
+  const save = findElement(
+    elements.get("view-library"),
+    (element) => element.tagName === "BUTTON" && element.textContent === "保存",
+  );
+  await save.listeners.click();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].endpoint, "library/update");
+  assert.equal(posts[0].body.changes.note, "修改后的备注");
+  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["note", "subjects", "title"]);
 });
 
 test("answer-safe question review renders only its allowlisted preview and structure", async () => {
