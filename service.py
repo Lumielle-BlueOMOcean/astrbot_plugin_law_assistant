@@ -190,6 +190,28 @@ def _delivery_status(outcome: Any) -> tuple[str, str | None]:
     return status, getattr(outcome, "error", None)
 
 
+_DAILY_HISTORY_SAFE_FIELDS = (
+    "id",
+    "content_date",
+    "target_id",
+    "content_type",
+    "status",
+    "attempted_at",
+    "finished_at",
+    "error_summary",
+    "source_kind",
+    "source_item_key",
+    "resolved_subject",
+    "resolved_question_type",
+    "resolved_origin",
+)
+
+
+def _daily_history_safe_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Expose bounded daily-run metadata without stored content bodies."""
+    return {key: record[key] for key in _DAILY_HISTORY_SAFE_FIELDS if key in record}
+
+
 def _case_needs_reprocessing(document: SourceDocument) -> bool:
     metadata = document.metadata
     return (
@@ -408,7 +430,7 @@ class LawAssistantService:
     async def start_library_question_session(
         self, item_id: int, *, session_origin: str, actor_id: str
     ) -> dict[str, Any]:
-        detail = await self.get_learning_item(item_id)
+        detail = await self.get_learning_item_for_session(item_id)
         if not detail.get("success") or not isinstance(detail.get("question"), dict):
             return {
                 "success": False,
@@ -699,6 +721,7 @@ class LawAssistantService:
             if self.library_service is not None
             else {}
         )
+        learning["verified_real"] = self.storage.count_real_questions()
         plans = self.storage.list_daily_plans()
         targets_by_id = {
             int(target["id"]): target
@@ -761,7 +784,10 @@ class LawAssistantService:
                 "enabled_plans": sum(1 for item in plans if item.get("enabled")),
             },
             "recent": {
-                "daily": self.storage.list_daily_contents(limit=10),
+                "daily": [
+                    _daily_history_safe_record(record)
+                    for record in self.storage.list_daily_contents(limit=10)
+                ],
                 "source_runs": self.storage.list_source_runs(limit=10),
             },
         }
@@ -787,7 +813,10 @@ class LawAssistantService:
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 200))
         if kind == "daily":
-            return self.storage.list_daily_contents(limit=safe_limit)
+            return [
+                _daily_history_safe_record(record)
+                for record in self.storage.list_daily_contents(limit=safe_limit)
+            ]
         if kind == "publications":
             return self.storage.list_publications(limit=safe_limit)
         if kind == "reminders":
@@ -2534,6 +2563,16 @@ class LawAssistantService:
                 "message": "学习资料库服务不可用",
             }
         return await self.library_service.get_learning_item(item_id)
+
+    async def get_learning_item_for_session(self, item_id: int) -> dict[str, Any]:
+        """Internal full-detail path used only when preparing a gated session."""
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.get_learning_item_for_session(item_id)
 
     async def update_learning_item(
         self, item_id: int, changes: dict[str, Any]

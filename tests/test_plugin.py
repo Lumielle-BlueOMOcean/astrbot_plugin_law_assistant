@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakes import FakeEvent
+from tests.fakes import FakeEvent, RecordingPublisher
 
 
 def install_fake_astrbot(monkeypatch, data_dir: Path) -> None:
@@ -512,6 +512,8 @@ async def test_study_tool_keeps_candidate_identity_pending_and_answer_gated(
     assert "待人工核验" in opened["identity"]
     assert "【模拟题" not in opened["text"]
     assert "仅手动揭晓" not in opened["text"]
+    assert "仅手动揭晓的参考答案" not in json.dumps(opened, ensure_ascii=False)
+    assert "仅手动揭晓的解析" not in json.dumps(opened, ensure_ascii=False)
     assert opened["content_ref"]
     preview = await plugin.service.prepare_publish_question(
         content_ref=opened["content_ref"],
@@ -523,9 +525,132 @@ async def test_study_tool_keeps_candidate_identity_pending_and_answer_gated(
     assert preview["preview"] == opened["text"]
     revealed = json.loads(await plugin.law_question_session(event, action="answer"))
     assert "仅手动揭晓的参考答案" in revealed["text"]
+    updated = json.loads(
+        await plugin.law_update_learning_item(
+            event,
+            archived["item_id"],
+            explanation="SECRET_UPDATED_EXPLANATION",
+        )
+    )
+    assert updated["success"] is True
+    assert "SECRET_UPDATED_EXPLANATION" not in json.dumps(updated, ensure_ascii=False)
     assert (
         "law_study_question"
         == plugin_module.LawAssistant.law_study_question._fake_llm_tool
+    )
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_published_group_question_session_is_reachable_only_in_exact_scope(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    group_a = "aiocqhttp:GroupMessage:group-a"
+    group_b = "aiocqhttp:GroupMessage:group-b"
+    private = "aiocqhttp:FriendMessage:7"
+    publisher = RecordingPublisher()
+    plugin.service.publisher = publisher
+
+    async def fixed_question(*args, **kwargs):
+        return {
+            "available": True,
+            "origin": "mock",
+            "subject": "criminal_law",
+            "question_type": "single_choice",
+            "content": {
+                "question": "GROUP_A_PUBLIC_STEM",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "GROUP_A_ANSWER_SECRET",
+                "explanation": "GROUP_A_EXPLANATION_SECRET",
+            },
+        }
+
+    plugin.service.generate_question = fixed_question
+    target = await plugin.service.bind_target(group_a, "法硕一群")
+    preview = await plugin.service.prepare_publish_question(
+        origin="mock",
+        subject="刑法",
+        question_type="single_choice",
+        target_selectors=["法硕一群"],
+        actor_id="42",
+    )
+    assert preview["ready"] is True
+    assert "GROUP_A_ANSWER_SECRET" not in preview["preview"]
+    assert (await plugin.service.confirm_publish(preview["token"], actor_id="42"))[
+        "published_count"
+    ] == 1
+    assert publisher.calls == [(group_a, preview["preview"])]
+    assert plugin.service.question_sessions.get_active(group_a) is not None
+    assert plugin.service.question_sessions.get_active(group_b) is None
+
+    async def command(text, *, origin, sender="7", admin=False, is_private=False):
+        return await anext(
+            plugin.law(
+                FakeEvent(
+                    private=is_private,
+                    admin=admin,
+                    sender_id=sender,
+                    message=text,
+                    unified_msg_origin=origin,
+                )
+            )
+        )
+
+    group_current = await command("/law current", origin=group_a)
+    assert "当前题目" in group_current
+    group_prompt = await command("/law next", origin=group_a)
+    assert "本题内容已展示完毕" in group_prompt
+
+    tool_event = FakeEvent(
+        private=False,
+        sender_id="7",
+        unified_msg_origin=group_a,
+    )
+    for action, expected_secret in (
+        ("current", "当前题目"),
+        ("next", "本题内容已展示完毕"),
+        ("answer", "GROUP_A_ANSWER_SECRET"),
+        ("explanation", "GROUP_A_EXPLANATION_SECRET"),
+    ):
+        result = await plugin.law_question_session(tool_event, action=action)
+        assert expected_secret in result
+
+    group_answer = await command("/law answer", origin=group_a)
+    assert "GROUP_A_ANSWER_SECRET" in group_answer
+    assert "GROUP_A_EXPLANATION_SECRET" not in group_answer
+    group_explanation = await command("/law explanation", origin=group_a)
+    assert "GROUP_A_EXPLANATION_SECRET" in group_explanation
+
+    for origin, is_private in ((group_b, False), (private, True)):
+        for action in ("current", "answer", "explanation"):
+            event = FakeEvent(
+                private=is_private,
+                sender_id="7",
+                unified_msg_origin=origin,
+            )
+            command_result = await command(
+                f"/law {action}", origin=origin, is_private=is_private
+            )
+            tool_result = await plugin.law_question_session(event, action=action)
+            for result in (command_result, tool_result):
+                assert "GROUP_A_ANSWER_SECRET" not in result
+                assert "GROUP_A_EXPLANATION_SECRET" not in result
+                if origin == group_b:
+                    assert "没有进行中的题目" in result
+
+    for text in ("/law status", "/law question", "/law study 1", "/law close"):
+        denied = await command(text, origin=group_a)
+        assert "operator 权限" in denied or "私聊" in denied
+        assert "GROUP_A_ANSWER_SECRET" not in denied
+    denied_close_tool = await plugin.law_question_session(tool_event, action="close")
+    assert "operator 权限" in denied_close_tool
+
+    closed = await command("/law close", origin=group_a, sender="42", admin=True)
+    assert "已结束当前题目会话" in closed
+    assert (
+        plugin.service.question_sessions.get_active(target["unified_msg_origin"])
+        is None
     )
     await plugin.terminate()
 

@@ -1186,7 +1186,20 @@ class LibraryRepository:
         if query:
             term = f"%{query}%"
             clauses.append(
-                "(i.title LIKE ? OR i.source_summary LIKE ? OR "
+                "((i.item_type = 'question' AND ("
+                "i.title LIKE ? OR q.stem LIKE ? OR q.options_json LIKE ? OR "
+                "EXISTS (SELECT 1 FROM structured_blocks AS qsb "
+                "WHERE qsb.item_id = i.id AND qsb.section IN "
+                "('stem', 'options', 'answer_requirement', 'subquestion_stem', "
+                "'subquestion_answer_requirement') AND qsb.text LIKE ?) OR "
+                "EXISTS (SELECT 1 FROM structured_material_relations AS qsmr "
+                "JOIN structured_item_bindings AS qsib "
+                "ON qsib.id = qsmr.binding_id "
+                "JOIN structured_blocks AS qsmb "
+                "ON qsmb.material_id = qsmr.material_id "
+                "WHERE qsib.item_id = i.id AND qsmb.text LIKE ?))) OR "
+                "(i.item_type <> 'question' AND ("
+                "i.title LIKE ? OR i.source_summary LIKE ? OR "
                 "(COALESCE(s.source_kind, '') NOT IN "
                 "('structured_original', 'structured_json') AND s.raw_text LIKE ?) "
                 "OR c.case_summary LIKE ? OR c.practice_notes_json LIKE ? "
@@ -1196,9 +1209,9 @@ class LibraryRepository:
                 "OR EXISTS (SELECT 1 FROM structured_material_relations AS smr "
                 "JOIN structured_item_bindings AS sib ON sib.id = smr.binding_id "
                 "JOIN structured_blocks AS smb ON smb.material_id = smr.material_id "
-                "WHERE sib.item_id = i.id AND smb.text LIKE ?))"
+                "WHERE sib.item_id = i.id AND smb.text LIKE ?))))"
             )
-            params.extend([term] * 10)
+            params.extend([term] * 15)
         limit_clause = ""
         if limit is not None:
             safe_limit = max(1, min(int(limit), 5000))
@@ -1218,6 +1231,30 @@ class LibraryRepository:
             params,
         ).fetchall()
         return [_item_from_row(row) for row in rows]
+
+    def safe_question_summary(self, item_id: int | None) -> str:
+        """Return answer-free question text for search results, never legacy summary."""
+        if item_id is None:
+            return ""
+        row = self.connection.execute(
+            "SELECT stem FROM learning_questions WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        parts = [str(row["stem"] or "").strip()] if row else []
+        block_rows = self.connection.execute(
+            """
+            SELECT text FROM structured_blocks
+            WHERE item_id = ? AND section IN ('stem', 'subquestion_stem')
+            ORDER BY CASE section WHEN 'stem' THEN 0 ELSE 1 END, order_index, id
+            """,
+            (item_id,),
+        ).fetchall()
+        seen = {part for part in parts if part}
+        for block in block_rows:
+            text = str(block["text"] or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                parts.append(text)
+        return "\n".join(part for part in parts if part).strip()[:300]
 
     def count_items(
         self, *, item_type: str = "", identity: str = "", active_only: bool = True

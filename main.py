@@ -215,6 +215,27 @@ class LawAssistant(Star):
             return True
         return str(event.get_sender_id()).strip() in self.plugin_config.operator_ids
 
+    def _can_use_question_session_action(
+        self, event: AstrMessageEvent, action: str
+    ) -> bool:
+        """Apply the shared command/Tool policy for exact-scope session actions."""
+        normalized = str(action or "").strip().lower().replace("_", "-")
+        if (
+            normalized
+            in {
+                "current",
+                "next",
+                "next-question",
+                "answer",
+                "next-answer",
+                "explanation",
+                "next-explanation",
+            }
+            and not event.is_private_chat()
+        ):
+            return True
+        return self._authorized(event, allow_group=normalized == "close")
+
     @staticmethod
     def _denial(event: AstrMessageEvent, *, allow_group: bool = False) -> str:
         if not event.is_private_chat() and not allow_group:
@@ -233,8 +254,26 @@ class LawAssistant(Star):
             return
         subcommand = parts[1].lower() if len(parts) > 1 else "help"
         allow_group = subcommand in {"bind", "bind-umo", "unbind", "rename"}
-        if not self._authorized(event, allow_group=allow_group):
-            yield event.plain_result(self._denial(event, allow_group=allow_group))
+        session_actions = {
+            "current",
+            "next",
+            "next-answer",
+            "next-explanation",
+            "next-question",
+            "answer",
+            "explanation",
+            "close",
+        }
+        if subcommand in session_actions:
+            authorized = self._can_use_question_session_action(event, subcommand)
+            denial_allows_group = subcommand == "close"
+        else:
+            authorized = self._authorized(event, allow_group=allow_group)
+            denial_allows_group = allow_group
+        if not authorized:
+            yield event.plain_result(
+                self._denial(event, allow_group=denial_allows_group)
+            )
             return
 
         if subcommand == "status":
@@ -558,8 +597,10 @@ class LawAssistant(Star):
         Args:
             action(string): current、next、next-question、answer、explanation、next-answer、next-explanation 或 close。
         """
-        if not self._authorized(event):
-            return self._denial(event)
+        if not self._can_use_question_session_action(event, action):
+            return self._denial(
+                event, allow_group=str(action).strip().lower() == "close"
+            )
         return _json_text(
             await self.service.question_session_action(
                 action,

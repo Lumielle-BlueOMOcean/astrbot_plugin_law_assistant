@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -309,4 +310,152 @@ async def test_web_api_rejects_invalid_library_update(tmp_path):
     assert response.status_code == 400
     assert payload["success"] is False
     assert payload["error"] == "invalid_update_field"
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_library_question_detail_and_update_are_answer_safe(tmp_path):
+    service = _service(tmp_path)
+    archived = await service.library_service.archive_learning_material(
+        raw_text="SECRET_RAW_SOURCE SECRET_ANSWER SECRET_EXPLANATION",
+        material_type="mock_question",
+        title="Web 安全合成题",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "short_answer",
+                "stem": "SAFE_WEB_STEM",
+                "options": [],
+                "answer": "SECRET_ANSWER",
+                "explanation": "SECRET_EXPLANATION",
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        detail_response = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/library/item",
+            query_string={"id": archived["item_id"]},
+        )
+        detail_payload = await detail_response.get_json()
+        update_response = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/library/update",
+            json={
+                "item_id": archived["item_id"],
+                "changes": {"explanation": "SECRET_UPDATE_RESPONSE"},
+            },
+        )
+    update_payload = await update_response.get_json()
+
+    review_id = service.library_service.repository.record_review_item(
+        source_id=archived["source_id"],
+        candidate_key="web-review-secret",
+        material_type="real_question_candidate",
+        locator="PDF第1页",
+        raw_fragment="WEB_REVIEW_RAW SECRET_WEB_REVIEW_ANSWER",
+        proposed_structure={
+            "stem": "WEB_REVIEW_SAFE_STEM",
+            "answer": "SECRET_WEB_REVIEW_ANSWER",
+        },
+        review_reason="复核合成题",
+        now=datetime.now(timezone.utc),
+    )
+    async with app.test_client() as client:
+        review_list_response = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/reviews"
+        )
+        review_list_payload = await review_list_response.get_json()
+        review_detail_response = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/review",
+            query_string={"id": review_id},
+        )
+        review_detail_payload = await review_detail_response.get_json()
+
+    for payload in (detail_payload, update_payload):
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for secret in (
+            "SECRET_ANSWER",
+            "SECRET_EXPLANATION",
+            "SECRET_RAW_SOURCE",
+            "SECRET_UPDATE_RESPONSE",
+        ):
+            assert secret not in serialized
+    assert detail_payload["data"]["question"]["stem"] == "SAFE_WEB_STEM"
+    assert update_payload["data"]["success"] is True
+    internal = await service.library_service.get_learning_item_for_session(
+        archived["item_id"]
+    )
+    assert internal["question"]["explanation"] == "SECRET_UPDATE_RESPONSE"
+    for payload in (review_list_payload, review_detail_payload):
+        serialized = json.dumps(payload, ensure_ascii=False)
+        assert "SECRET_WEB_REVIEW_ANSWER" not in serialized
+        assert "WEB_REVIEW_RAW" not in serialized
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_uses_verified_inventory_and_safe_daily_history(tmp_path):
+    service = _service(tmp_path)
+    service.storage.import_real_questions(
+        [
+            {
+                "source_name": "synthetic verified fixture",
+                "exam_name": "synthetic exam",
+                "exam_year": "2024",
+                "question_number": f"Q{index}",
+                "source_locator": f"synthetic page {index}",
+                "subject": "criminal_law",
+                "question_type": "single_choice",
+                "stem": f"synthetic stem {index}",
+                "options": ["A", "B"],
+                "answer": "A",
+                "answer_source": "official",
+                "verification_status": "verified",
+            }
+            for index in range(1, 3)
+        ]
+    )
+    await service.library_service.archive_learning_material(
+        raw_text="pending candidate fixture",
+        material_type="real_question_candidate",
+        title="待核验候选题",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "single_choice",
+                "stem": "candidate stem",
+                "answer": "A",
+            }
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+    target = await service.bind_target("aiocqhttp:group:history", "历史测试群")
+    service.storage.claim_daily_content(
+        content_date="2026-09-27",
+        target_id=target["id"],
+        content_type="daily_question",
+        body={"question": "visible question", "answer": "SECRET_DAILY_ANSWER"},
+        source_kind="library_mock",
+        source_item_key="fixture-1",
+        resolved_subject="criminal_law",
+        resolved_question_type="single_choice",
+        resolved_origin="mock",
+    )
+
+    overview = await service.dashboard_overview()
+    history = await service.dashboard_history("daily")
+    for rows in (overview["recent"]["daily"], history):
+        serialized = json.dumps(rows, ensure_ascii=False)
+        assert "SECRET_DAILY_ANSWER" not in serialized
+        assert all("body" not in row and "body_json" not in row for row in rows)
+    assert overview["learning"]["verified_real"] == 2
+    assert overview["learning"]["real_question_candidate"] == 1
+    assert "SECRET_DAILY_ANSWER" in json.dumps(
+        service.storage.list_daily_contents(), ensure_ascii=False
+    )
     service.storage.close()

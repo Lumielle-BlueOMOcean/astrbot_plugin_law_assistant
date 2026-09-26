@@ -352,15 +352,20 @@ async function renderLibraryDetail(container, itemId, parentGeneration = state.r
   panel.append(sectionTitle(`${t("page.library.detail", "资料详情")} #${item.id}`, item.title));
   panel.append(keyValueRows({ 身份: item.identity, 核验: item.verification_status, 方向: (item.subjects || []).map(subjectLabel), 创建者: item.created_by, 更新时间: item.updated_at }));
   if (data.case) panel.append(detailBlock("案例结构化整理", keyValueRows({ 案号: data.case.case_number, 权威机关: data.case.authority, 案情: data.case.case_summary, 争议焦点: data.case.issues, 裁判或检察要旨: data.case.reasoning, 结果: data.case.result, 学习要点: data.case.practice_notes })));
-  if (data.question) panel.append(detailBlock("题目结构化整理", keyValueRows({ 题型: questionTypeLabel(data.question.question_type), 题干: data.question.stem, 选项: data.question.options, 答案: data.question.answer, 解析: data.question.explanation, 考试: data.question.exam_name, 年份: data.question.exam_year, 试卷: data.question.paper, 题号: data.question.question_number, 答案来源: data.question.answer_source })));
-  if (item.metadata?.body) panel.append(detailBlock("笔记正文", item.metadata.body));
-  if (item.metadata?.note) panel.append(detailBlock("人工备注", item.metadata.note));
+  if (data.question) {
+    panel.append(detailBlock("题目结构化整理", keyValueRows({ 题型: questionTypeLabel(data.question.question_type), 题干: data.question.stem, 选项: data.question.options, 考试: data.question.exam_name, 年份: data.question.exam_year, 试卷: data.question.paper, 题号: data.question.question_number, 答案来源: data.question.answer_source })));
+    panel.append(node("p", "题目答案与解析通过 Question Session 显式揭晓，资料页默认不提前展示。", "muted"));
+  }
+  if (item.item_type !== "question" && item.metadata?.body) panel.append(detailBlock("笔记正文", item.metadata.body));
+  if (item.item_type !== "question" && item.metadata?.note) panel.append(detailBlock("人工备注", item.metadata.note));
   const evidence = node("div");
   (data.sources || []).forEach((source) => {
     const sourceCard = node("div", undefined, "source-card");
-    sourceCard.append(keyValueRows({ 来源标题: source.title, 来源哈希: source.content_hash, 原文件: source.original_filename, 创建者: source.created_by }));
+    const sourceLink = (data.source_links || []).find((link) => link.source_id === source.id);
+    sourceCard.append(keyValueRows({ 来源标题: source.title, 来源哈希: source.content_hash, 原文件: source.original_filename, MIME: source.mime_type, 定位: sourceLink?.locator, 关联: sourceLink?.relationship }));
     if (source.source_url) sourceCard.append(safeLink(source.source_url));
-    sourceCard.append(node("pre", source.raw_text, "evidence")); evidence.append(sourceCard);
+    if (item.item_type !== "question" && source.raw_text) sourceCard.append(node("pre", source.raw_text, "evidence"));
+    evidence.append(sourceCard);
   });
   panel.append(detailBlock("原始 evidence", evidence));
   const edit = node("div", undefined, "form-grid");
@@ -486,7 +491,12 @@ async function renderReviewDetail(container, reviewId, parentGeneration = state.
     const panel = node("article", undefined, "detail-panel");
     panel.append(sectionTitle(`Review #${item.id}`, item.review_reason));
     panel.append(keyValueRows({ 资料类型: item.material_type, 定位: item.locator, 来源ID: item.source_id, 状态: item.status, 更新时间: item.updated_at }));
-    panel.append(detailBlock("原始片段", item.raw_fragment), detailBlock("建议结构", item.proposed_structure));
+    if (item.answer_safe) {
+      panel.append(detailBlock("题目安全预览", item.safe_preview));
+      panel.append(node("p", "答案与解析通过 Question Session 显式揭晓，复核页默认不提前展示。", "muted"));
+    } else {
+      panel.append(detailBlock("原始片段", item.raw_fragment), detailBlock("建议结构", item.proposed_structure));
+    }
     if (item.status === "pending") panel.append(button("标记 resolved", () => updateReview(item.id, "resolved"), "primary"), button("标记 superseded", () => updateReview(item.id, "superseded")));
     container.append(panel);
     async function updateReview(id, nextStatus) { try { await apiPost("review/status", { review_id: id, status: nextStatus }); setFlash("复核状态已更新"); await renderLibrary(); } catch (error) { setFlash(error.message, true); } }
@@ -738,6 +748,8 @@ if (globalThis.__LAW_ASSISTANT_TEST__) {
     navigate,
     renderOverview,
     renderMaterials,
+    renderLibraryDetail,
+    renderReviewDetail,
     renderImports,
     renderStructuredImportPreview,
     renderPlans,

@@ -108,6 +108,95 @@ test("overview renders safe active-session progress from the Bridge payload", as
   assert.doesNotMatch(rendered, /不得显示的题干秘密|不得显示的答案秘密/);
 });
 
+test("question detail never renders answer, explanation, raw evidence, or metadata secrets", async () => {
+  const { bridge, elements, page } = await loadPage();
+  bridge.apiGet = async () => ({
+    success: true,
+    item: {
+      id: 73,
+      item_type: "question",
+      identity: "mock_question",
+      title: "安全边界合成题",
+      subjects: ["criminal_law"],
+      verification_status: "not_applicable",
+      created_by: "42",
+      updated_at: "2026-09-27T00:00:00Z",
+      metadata: {
+        body: "SECRET_METADATA_BODY",
+        note: "SECRET_METADATA_NOTE",
+        structured: { answer: "SECRET_NESTED_ANSWER" },
+      },
+    },
+    question: {
+      question_identity: "mock_question",
+      question_type: "single_choice",
+      stem: "SAFE_PAGE_STEM",
+      options: ["SAFE_OPTION_A", "SAFE_OPTION_B"],
+      answer: "SECRET_ANSWER",
+      explanation: "SECRET_EXPLANATION",
+      answer_source: "synthetic answer provenance",
+    },
+    sources: [{
+      title: "Synthetic source title",
+      source_url: "https://example.test/source",
+      content_hash: "safe-source-hash",
+      original_filename: "fixture.txt",
+      raw_text: "SECRET_RAW_SOURCE",
+      metadata: { raw_text: "SECRET_SOURCE_METADATA" },
+    }],
+    structured: { payload: { answer: "SECRET_STRUCTURED_PAYLOAD" } },
+    subquestions: [{ answer: "SECRET_SUBQUESTION_ANSWER" }],
+  });
+
+  await page.renderLibraryDetail(elements.get("view-library"), 73);
+
+  const rendered = textOf(elements.get("view-library"));
+  assert.match(rendered, /SAFE_PAGE_STEM/);
+  assert.match(rendered, /SAFE_OPTION_A/);
+  assert.match(rendered, /Synthetic source title/);
+  assert.match(rendered, /safe-source-hash/);
+  assert.match(rendered, /synthetic answer provenance/);
+  assert.match(rendered, /答案与解析通过 Question Session 显式揭晓/);
+  for (const secret of [
+    "SECRET_ANSWER",
+    "SECRET_EXPLANATION",
+    "SECRET_RAW_SOURCE",
+    "SECRET_METADATA_BODY",
+    "SECRET_METADATA_NOTE",
+    "SECRET_NESTED_ANSWER",
+    "SECRET_SOURCE_METADATA",
+    "SECRET_STRUCTURED_PAYLOAD",
+    "SECRET_SUBQUESTION_ANSWER",
+  ]) {
+    assert.doesNotMatch(rendered, new RegExp(secret));
+  }
+});
+
+test("answer-safe question review renders only its allowlisted preview and structure", async () => {
+  const { bridge, elements, page } = await loadPage();
+  bridge.apiGet = async () => ({
+    item: {
+      id: 91,
+      material_type: "real_question_candidate",
+      review_reason: "需要确认题目边界",
+      answer_safe: true,
+      safe_preview: "REVIEW_SAFE_STEM",
+      safe_structure: { stem: "REVIEW_SAFE_STEM", answer: "SECRET_SAFE_STRUCTURE_ANSWER" },
+      raw_fragment: "SECRET_REVIEW_RAW",
+      proposed_structure: { answer: "SECRET_REVIEW_ANSWER" },
+    },
+  });
+
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+  await page.renderReviewDetail(elements.get("view-library"), 91);
+
+  const rendered = textOf(elements.get("view-library"));
+  assert.match(rendered, /REVIEW_SAFE_STEM/);
+  assert.match(rendered, /答案与解析通过 Question Session 显式揭晓/);
+  assert.doesNotMatch(rendered, /SECRET_SAFE_STRUCTURE_ANSWER|SECRET_REVIEW_RAW|SECRET_REVIEW_ANSWER/);
+});
+
 test("stale asynchronous overview render cannot overwrite the newest generation", async () => {
   const { bridge, elements, page } = await loadPage();
   let resolveFirst;

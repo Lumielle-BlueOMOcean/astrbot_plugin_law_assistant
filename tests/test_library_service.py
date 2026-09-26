@@ -80,7 +80,9 @@ async def test_archive_cannot_escalate_verification_identity(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mock_question_is_searchable_and_complete_after_archive(tmp_path):
+async def test_mock_question_external_detail_is_safe_and_session_view_is_complete(
+    tmp_path,
+):
     storage, service = _service(tmp_path)
 
     archived = await service.archive_learning_material(
@@ -109,8 +111,169 @@ async def test_mock_question_is_searchable_and_complete_after_archive(tmp_path):
     detail = await service.get_learning_item(archived["item_id"])
     assert detail["question"]["stem"].startswith("未经许可")
     assert detail["question"]["options"] == ["A. 民事责任", "B. 一定没有责任"]
-    assert detail["question"]["answer"] == ["A"]
-    assert detail["question"]["explanation"] == "根据题干事实判断。"
+    assert "answer" not in detail["question"]
+    assert "explanation" not in detail["question"]
+    internal = await service.get_learning_item_for_session(archived["item_id"])
+    assert internal["question"]["answer"] == ["A"]
+    assert internal["question"]["explanation"] == "根据题干事实判断。"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_question_search_detail_and_update_do_not_expose_hidden_evidence(
+    tmp_path,
+):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text=("SECRET_RAW_SOURCE contains SECRET_ANSWER and SECRET_EXPLANATION"),
+        material_type="mock_question",
+        title="安全边界合成题",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "single_choice",
+                "stem": "SECRET_STEM 可公开展示的题干",
+                "options": ["A. 选项甲", "B. 选项乙"],
+                "answer": "SECRET_ANSWER",
+                "explanation": "SECRET_EXPLANATION",
+                "questions": [{"answer": "SECRET_NESTED_METADATA"}],
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+
+    search = await service.search_learning_library(query="SECRET_STEM")
+    assert search["count"] == 1
+    assert "SECRET_STEM" in search["items"][0]["summary"]
+    bundle = service.repository.get(archived["item_id"])
+    assert bundle.item.source_summary == "SECRET_STEM 可公开展示的题干"
+    storage.connection.execute(
+        "UPDATE learning_items SET source_summary = ? WHERE id = ?",
+        ("SECRET_LEGACY_SUMMARY", archived["item_id"]),
+    )
+    storage.connection.commit()
+    search_payload = json.dumps(search, ensure_ascii=False)
+    detail = await service.get_learning_item(archived["item_id"])
+    detail_payload = json.dumps(detail, ensure_ascii=False)
+    for secret in (
+        "SECRET_ANSWER",
+        "SECRET_EXPLANATION",
+        "SECRET_RAW_SOURCE",
+        "SECRET_NESTED_METADATA",
+        "SECRET_LEGACY_SUMMARY",
+    ):
+        assert secret not in search_payload
+        assert secret not in detail_payload
+        assert (await service.search_learning_library(query=secret))["items"] == []
+
+    assert "answer" not in detail["question"]
+    assert "explanation" not in detail["question"]
+    assert "metadata" not in detail["item"]
+    assert "structured" not in detail
+    assert "raw_text" not in detail["source"]
+
+    updated = await service.update_learning_item(
+        archived["item_id"], {"explanation": "SECRET_EXPLANATION_2"}
+    )
+    assert updated["success"] is True
+    assert "SECRET_EXPLANATION_2" not in json.dumps(updated, ensure_ascii=False)
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_question_blocks_are_excluded_from_safe_reads_and_search(
+    tmp_path,
+):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text="结构化题目来源原文",
+        material_type="real_question_candidate",
+        title="结构化合成题",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "short_answer",
+                "stem": "结构化公开题干",
+                "answer": {"value": "SOURCE_SECRET_ANSWER"},
+                "explanation": "SOURCE_SECRET_EXPLANATION",
+            },
+            ensure_ascii=False,
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+    connection = storage.connection
+    now = datetime.now(timezone.utc).isoformat()
+    source_id = archived["source_id"]
+    cursor = connection.execute(
+        """
+        INSERT INTO structured_imports(
+            original_source_id, structured_source_id, schema_version,
+            original_file_sha256, structured_json_sha256,
+            structured_payload_sha256, preparation_method, payload_json,
+            created_by, created_at
+        ) VALUES (?, ?, '1.0', 'pdf-hash', 'json-hash', 'payload-hash',
+                  'external_model_assisted', '{}', '42', ?)
+        """,
+        (source_id, source_id, now),
+    )
+    import_id = int(cursor.lastrowid)
+    cursor = connection.execute(
+        """
+        INSERT INTO structured_item_bindings(
+            import_id, item_id, external_id, source_number, item_kind,
+            structure_version, review_status, payload_json, metadata_json
+        ) VALUES (?, ?, 'question-safe', '题一', 'question', '1.0',
+                  'pending_review', ?, '{}')
+        """,
+        (
+            import_id,
+            archived["item_id"],
+            json.dumps(
+                {
+                    "answer": {"value": "PAYLOAD_SECRET_ANSWER"},
+                    "explanation_blocks": [{"text": "PAYLOAD_SECRET_EXPLANATION"}],
+                },
+            ),
+        ),
+    )
+    for index, (section, text) in enumerate(
+        (
+            ("stem", "STRUCTURED_PUBLIC_STEM"),
+            ("answer", "BLOCK_SECRET_ANSWER"),
+            ("explanation", "BLOCK_SECRET_EXPLANATION"),
+        ),
+        1,
+    ):
+        connection.execute(
+            """
+            INSERT INTO structured_blocks(
+                import_id, item_id, material_id, subquestion_id, section,
+                external_id, order_index, kind, text, locator, provenance,
+                metadata_json
+            ) VALUES (?, ?, NULL, NULL, ?, ?, ?, 'paragraph', ?, 'PDF第1页',
+                      'source_text', '{}')
+            """,
+            (import_id, archived["item_id"], section, f"block-{index}", index, text),
+        )
+    connection.commit()
+
+    detail = await service.get_learning_item(archived["item_id"])
+    safe_payload = json.dumps(detail, ensure_ascii=False)
+    for secret in (
+        "PAYLOAD_SECRET_ANSWER",
+        "PAYLOAD_SECRET_EXPLANATION",
+        "BLOCK_SECRET_ANSWER",
+        "BLOCK_SECRET_EXPLANATION",
+    ):
+        assert secret not in safe_payload
+        assert (await service.search_learning_library(query=secret))["items"] == []
+    assert "STRUCTURED_PUBLIC_STEM" not in safe_payload
+    search = await service.search_learning_library(query="STRUCTURED_PUBLIC_STEM")
+    assert search["count"] == 1
+    assert "STRUCTURED_PUBLIC_STEM" in search["items"][0]["summary"]
     storage.close()
 
 
@@ -453,7 +616,9 @@ async def test_review_candidates_persist_across_restart_and_are_idempotent(tmp_p
     listed = await reopened_service.list_review_items(source_id=first["source_id"])
     assert listed["count"] == 1
     assert listed["items"][0]["id"] == review_id
-    assert listed["items"][0]["raw_fragment"] == "答案区原文 1 A 2 ?"
+    assert "raw_fragment" not in listed["items"][0]
+    persisted_review = reopened_service.repository.get_review_item(review_id)
+    assert persisted_review.raw_fragment == "答案区原文 1 A 2 ?"
     assert listed["items"][0]["locator"] == "第1页/答案区"
     assert listed["items"][0]["review_reason"] == "答案题号无法确认"
 
@@ -471,6 +636,82 @@ async def test_review_candidates_persist_across_restart_and_are_idempotent(tmp_p
         "success"
     ]
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_question_review_external_view_is_allowlisted_and_preserves_storage(
+    tmp_path,
+):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text="review source evidence",
+        material_type="real_question_candidate",
+        title="复核题源",
+        subjects="刑法",
+        structured_json=json.dumps(
+            {
+                "question_type": "case_analysis",
+                "stem": "REVIEW_SAFE_STEM",
+            }
+        ),
+        created_by="42",
+        session_origin="private:42",
+    )
+    review_id = service.repository.record_review_item(
+        source_id=archived["source_id"],
+        candidate_key="review-secret-fixture",
+        material_type="real_question_candidate",
+        locator="PDF第1页",
+        raw_fragment=(
+            "REVIEW_RAW_SOURCE SECRET_REVIEW_ANSWER SECRET_REVIEW_EXPLANATION"
+        ),
+        proposed_structure={
+            "question_type": "case_analysis",
+            "stem": "REVIEW_SAFE_STEM",
+            "stem_blocks": [
+                {"id": "stem-1", "text": "REVIEW_SAFE_BLOCK", "locator": "PDF第1页"}
+            ],
+            "answer": {"value": "SECRET_REVIEW_ANSWER"},
+            "explanation_blocks": [{"text": "SECRET_REVIEW_EXPLANATION"}],
+            "metadata": {"answer": "SECRET_NESTED_REVIEW_ANSWER"},
+            "subquestions": [
+                {
+                    "source_number": "（1）",
+                    "stem": "REVIEW_SAFE_SUBQUESTION",
+                    "answer": {"value": "SECRET_SUBQUESTION_ANSWER"},
+                    "explanation": "SECRET_SUBQUESTION_EXPLANATION",
+                }
+            ],
+        },
+        review_reason="需要确认题目边界",
+        now=datetime.now(timezone.utc),
+    )
+
+    listed = await service.list_review_items()
+    detail = await service.get_review_item(review_id)
+    for payload in (listed, detail):
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for secret in (
+            "REVIEW_RAW_SOURCE",
+            "SECRET_REVIEW_ANSWER",
+            "SECRET_REVIEW_EXPLANATION",
+            "SECRET_NESTED_REVIEW_ANSWER",
+            "SECRET_SUBQUESTION_ANSWER",
+            "SECRET_SUBQUESTION_EXPLANATION",
+        ):
+            assert secret not in serialized
+    item = detail["item"]
+    assert item["answer_safe"] is True
+    assert "REVIEW_SAFE_STEM" in item["safe_preview"]
+    assert "REVIEW_SAFE_SUBQUESTION" in json.dumps(
+        item["safe_structure"], ensure_ascii=False
+    )
+    assert "raw_fragment" not in item
+    assert "proposed_structure" not in item
+    persisted = service.repository.get_review_item(review_id)
+    assert "SECRET_REVIEW_ANSWER" in persisted.raw_fragment
+    assert persisted.proposed_structure["answer"]["value"] == "SECRET_REVIEW_ANSWER"
+    storage.close()
 
 
 @pytest.mark.asyncio

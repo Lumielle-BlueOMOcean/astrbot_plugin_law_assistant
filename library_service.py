@@ -255,7 +255,7 @@ class LibraryService:
                 question_number=_as_text(structured.get("question_number")),
                 answer_source=_as_text(structured.get("answer_source")),
             )
-            source_summary = question_detail.explanation or stem[:300]
+            source_summary = stem[:300]
         else:
             body = _as_text(structured.get("body")) or raw_text.strip()
             source_summary = body[:300]
@@ -630,7 +630,31 @@ class LibraryService:
                     )
                     if subject
                 )
-                item_text = all_item_text(item)
+                if item_kind == "question":
+                    safe_question_parts: list[str] = []
+                    for field in ("stem", "question"):
+                        text = _as_text(item.get(field))
+                        if text:
+                            safe_question_parts.append(text)
+                    for block in item.get("stem_blocks") or []:
+                        if isinstance(block, dict) and _as_text(block.get("text")):
+                            safe_question_parts.append(_as_text(block.get("text")))
+                    for subquestion in item.get("subquestions") or []:
+                        if not isinstance(subquestion, dict):
+                            continue
+                        text = _as_text(subquestion.get("stem"))
+                        if text:
+                            safe_question_parts.append(text)
+                        for block in subquestion.get("stem_blocks") or []:
+                            if isinstance(block, dict) and _as_text(block.get("text")):
+                                safe_question_parts.append(_as_text(block.get("text")))
+                    item_text = "\n".join(dict.fromkeys(safe_question_parts))
+                    if not item_text:
+                        item_text = str(
+                            item.get("title") or item.get("source_number") or ""
+                        )
+                else:
+                    item_text = all_item_text(item)
                 learning_item = LearningItem(
                     item_type="question" if item_kind == "question" else "case",
                     identity=identity,
@@ -917,9 +941,6 @@ class LibraryService:
         return {
             "official_case": self.repository.count_items(identity="official_case"),
             "persistent_mock": self.repository.count_items(identity="mock_question"),
-            "verified_real": self.repository.count_items(
-                identity="verified_real_question"
-            ),
             "real_question_candidate": self.repository.count_items(
                 identity="real_question_candidate"
             ),
@@ -927,6 +948,23 @@ class LibraryService:
         }
 
     async def get_learning_item(self, item_id: int) -> dict[str, Any]:
+        try:
+            normalized_id = int(item_id)
+        except (TypeError, ValueError):
+            return _error("invalid_item_id", "item_id 必须是整数")
+        bundle = self.repository.get(normalized_id)
+        if bundle is None:
+            return _error("not_found", f"未找到学习条目：{normalized_id}")
+        result = {"success": True}
+        result.update(
+            self._safe_question_bundle_dict(bundle)
+            if bundle.item.item_type == "question"
+            else self._bundle_dict(bundle)
+        )
+        return result
+
+    async def get_learning_item_for_session(self, item_id: int) -> dict[str, Any]:
+        """Return the full internal bundle used only to build a gated session."""
         try:
             normalized_id = int(item_id)
         except (TypeError, ValueError):
@@ -989,39 +1027,200 @@ class LibraryService:
         if updated is None:
             return _error("not_found", f"未找到学习条目：{item_id}")
         result = {"success": True, "message": "学习条目已更新"}
-        result.update(self._bundle_dict(updated))
+        result.update(
+            self._safe_question_bundle_dict(updated)
+            if updated.item.item_type == "question"
+            else self._bundle_dict(updated)
+        )
         return result
 
-    @staticmethod
-    def _item_summary(item: LearningItem) -> dict[str, Any]:
+    def _item_summary(self, item: LearningItem) -> dict[str, Any]:
+        summary = item.source_summary
+        if item.item_type == "question":
+            summary = self.repository.safe_question_summary(item.id) or item.title
         return {
             "id": item.id,
             "item_type": item.item_type,
             "identity": item.identity,
             "title": item.title,
             "subjects": list(item.subjects),
-            "summary": item.source_summary,
+            "summary": summary[:300],
             "verification_status": item.verification_status,
             "created_by": item.created_by,
+            "created_at": item.created_at.isoformat(),
             "updated_at": item.updated_at.isoformat(),
             "active": item.active,
         }
 
     @staticmethod
     def _review_dict(item: Any) -> dict[str, Any]:
-        return {
+        result = {
             "id": item.id,
             "source_id": item.source_id,
             "candidate_key": item.candidate_key,
             "material_type": item.material_type,
             "locator": item.locator,
-            "raw_fragment": item.raw_fragment,
-            "proposed_structure": item.proposed_structure,
             "review_reason": item.review_reason,
             "status": item.status,
             "created_at": item.created_at.isoformat(),
             "updated_at": item.updated_at.isoformat(),
         }
+        if str(item.material_type or "").strip().lower() in {
+            "question",
+            "mock_question",
+            "real_question_candidate",
+        }:
+            safe_structure = LibraryService._safe_question_review_structure(
+                item.proposed_structure
+            )
+            preview_parts: list[str] = []
+            if safe_structure.get("stem"):
+                preview_parts.append(safe_structure["stem"])
+            preview_parts.extend(
+                block["text"] for block in safe_structure.get("stem_blocks", [])
+            )
+            preview_parts.extend(safe_structure.get("options", []))
+            for subquestion in safe_structure.get("subquestions", []):
+                if subquestion.get("stem"):
+                    preview_parts.append(subquestion["stem"])
+                preview_parts.extend(
+                    block["text"] for block in subquestion.get("stem_blocks", [])
+                )
+            result.update(
+                {
+                    "answer_safe": True,
+                    "safe_preview": "\n".join(preview_parts)[:3000]
+                    or "题目原始片段在答案安全视图中隐藏。",
+                    "safe_structure": safe_structure,
+                }
+            )
+            return result
+        result.update(
+            {
+                "raw_fragment": item.raw_fragment,
+                "proposed_structure": item.proposed_structure,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _safe_question_review_structure(value: Any) -> dict[str, Any]:
+        """Whitelist question review fields; never copy raw source or answer data."""
+        if not isinstance(value, dict):
+            return {}
+
+        def safe_blocks(raw: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw, list):
+                return []
+            result = []
+            for block in raw:
+                if not isinstance(block, dict) or not _as_text(block.get("text")):
+                    continue
+                result.append(
+                    {
+                        key: block[key]
+                        for key in (
+                            "id",
+                            "order",
+                            "kind",
+                            "text",
+                            "locator",
+                            "provenance",
+                        )
+                        if key in block
+                    }
+                )
+            return result
+
+        def safe_requirements(raw: Any) -> list[dict[str, Any]]:
+            return safe_blocks(raw)
+
+        safe: dict[str, Any] = {}
+        for key in (
+            "question_type",
+            "exam_name",
+            "exam_year",
+            "paper",
+            "question_number",
+            "answer_source",
+            "source_number",
+        ):
+            if isinstance(value.get(key), (str, int, float)):
+                safe[key] = value[key]
+        subjects = value.get("subjects")
+        if isinstance(subjects, list):
+            safe["subjects"] = [
+                str(subject)
+                for subject in subjects
+                if isinstance(subject, (str, int, float))
+            ]
+        elif isinstance(subjects, str):
+            safe["subjects"] = subjects
+        stem = value.get("stem", value.get("question"))
+        if isinstance(stem, str) and stem:
+            safe["stem"] = stem
+        safe["stem_blocks"] = safe_blocks(value.get("stem_blocks"))
+        safe["answer_requirements"] = safe_requirements(
+            value.get("answer_requirements")
+        )
+        options = value.get("options")
+        if isinstance(options, list):
+            safe_options = []
+            for option in options:
+                if isinstance(option, str):
+                    safe_options.append(option)
+                elif isinstance(option, dict):
+                    option_text = {
+                        key: option[key]
+                        for key in ("key", "text", "locator")
+                        if isinstance(option.get(key), (str, int, float))
+                    }
+                    if option_text:
+                        safe_options.append(option_text)
+            safe["options"] = safe_options
+        locators = value.get("locators")
+        if isinstance(locators, list):
+            safe["locators"] = [
+                str(locator)
+                for locator in locators
+                if isinstance(locator, (str, int, float))
+            ]
+        materials = value.get("material_refs")
+        if isinstance(materials, list):
+            safe["material_refs"] = [
+                str(material)
+                for material in materials
+                if isinstance(material, (str, int, float))
+            ]
+        subquestions = value.get("subquestions")
+        if isinstance(subquestions, list):
+            safe_subquestions = []
+            for subquestion in subquestions:
+                if not isinstance(subquestion, dict):
+                    continue
+                safe_subquestion: dict[str, Any] = {}
+                for key in ("id", "source_number"):
+                    if isinstance(subquestion.get(key), (str, int, float)):
+                        safe_subquestion[key] = subquestion[key]
+                sub_stem = subquestion.get("stem", subquestion.get("question"))
+                if isinstance(sub_stem, str) and sub_stem:
+                    safe_subquestion["stem"] = sub_stem
+                safe_subquestion["stem_blocks"] = safe_blocks(
+                    subquestion.get("stem_blocks")
+                )
+                safe_subquestion["answer_requirements"] = safe_requirements(
+                    subquestion.get("answer_requirements")
+                )
+                sub_locators = subquestion.get("locators")
+                if isinstance(sub_locators, list):
+                    safe_subquestion["locators"] = [
+                        str(locator)
+                        for locator in sub_locators
+                        if isinstance(locator, (str, int, float))
+                    ]
+                safe_subquestions.append(safe_subquestion)
+            safe["subquestions"] = safe_subquestions
+        return safe
 
     @classmethod
     def _bundle_dict(cls, bundle: Any) -> dict[str, Any]:
@@ -1099,6 +1298,64 @@ class LibraryService:
             result["stem_blocks"] = list(bundle.stem_blocks)
             result["subquestions"] = list(bundle.subquestions)
             result["explanation_blocks"] = list(bundle.explanation_blocks)
+        return result
+
+    @staticmethod
+    def _safe_question_bundle_dict(bundle: Any) -> dict[str, Any]:
+        """Serialize a question using an allowlist that cannot carry hidden text."""
+        item = bundle.item
+        sources = [
+            {
+                "id": source.id,
+                "source_kind": source.source_kind,
+                "title": source.title,
+                "source_url": source.source_url,
+                "content_hash": source.content_hash,
+                "original_filename": source.original_filename,
+                "mime_type": source.mime_type,
+                "created_at": source.created_at.isoformat(),
+            }
+            for source in bundle.sources
+        ]
+        result: dict[str, Any] = {
+            "item": {
+                "id": item.id,
+                "item_type": item.item_type,
+                "identity": item.identity,
+                "title": item.title,
+                "subjects": list(item.subjects),
+                "verification_status": item.verification_status,
+                "created_by": item.created_by,
+                "created_at": item.created_at.isoformat(),
+                "updated_at": item.updated_at.isoformat(),
+                "active": item.active,
+            },
+            "sources": sources,
+            "source": sources[0] if sources else None,
+            "source_links": [
+                {
+                    "source_id": link.source.id,
+                    "source_url": link.source.source_url,
+                    "locator": link.locator,
+                    "relationship": link.relationship,
+                }
+                for link in bundle.source_links
+            ],
+            "question": None,
+        }
+        if bundle.question is not None:
+            question = bundle.question
+            result["question"] = {
+                "question_identity": question.question_identity,
+                "question_type": question.question_type,
+                "stem": question.stem,
+                "options": list(question.options),
+                "exam_name": question.exam_name,
+                "exam_year": question.exam_year,
+                "paper": question.paper,
+                "question_number": question.question_number,
+                "answer_source": question.answer_source,
+            }
         return result
 
 
