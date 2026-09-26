@@ -103,6 +103,7 @@ async def test_provider_real_question_filter_is_exact(tmp_path):
                 "stem": "刑法题",
                 "options": ["A", "B"],
                 "answer": "A",
+                "answer_source": "official",
                 "verification_status": "verified",
             },
             {
@@ -116,6 +117,7 @@ async def test_provider_real_question_filter_is_exact(tmp_path):
                 "stem": "民法题",
                 "options": ["A", "B"],
                 "answer": ["A"],
+                "answer_source": "third_party",
                 "verification_status": "verified",
             },
         ]
@@ -130,6 +132,7 @@ async def test_provider_real_question_filter_is_exact(tmp_path):
     assert selected["subject"] == "criminal_law"
     assert selected["question_type"] == "single_choice"
     assert selected["question_id"] is not None
+    assert selected["answer_source"] == "official"
     storage.close()
 
 
@@ -143,7 +146,7 @@ async def test_provider_reuses_persistent_mock_and_excludes_candidates(tmp_path)
         subjects="知识产权",
         structured_json=json.dumps(
             {
-                "question_type": "多选",
+                "question_type": "不定项选择题",
                 "stem": "模拟题题干",
                 "options": ["A", "B"],
                 "answer": ["A"],
@@ -173,7 +176,9 @@ async def test_provider_reuses_persistent_mock_and_excludes_candidates(tmp_path)
     )
 
     selected = await provider.select_question(
-        origin="mock", subject="intellectual_property", question_type="multiple_choice"
+        origin="mock",
+        subject="intellectual_property",
+        question_type="indefinite_choice",
     )
 
     assert selected["available"] is True
@@ -203,6 +208,58 @@ async def test_provider_generates_valid_mock_once_then_reuses_it(tmp_path):
     assert (await library.search_learning_library(material_type="mock_question"))[
         "count"
     ] == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_generates_indefinite_choice_mock(tmp_path):
+    llm = ValidLLM()
+    storage, _, provider = _services(tmp_path, llm)
+
+    result = await provider.select_question(
+        origin="mock",
+        subject="intellectual_property",
+        question_type="indefinite_choice",
+    )
+
+    assert result["available"] is True
+    assert result["origin"] == "mock"
+    assert result["question_type"] == "indefinite_choice"
+    assert llm.calls == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_selects_indefinite_choice_from_verified_real_inventory(
+    tmp_path,
+):
+    storage, _, provider = _services(tmp_path)
+    storage.import_real_questions(
+        [
+            {
+                "source_name": "合成已核验题库",
+                "exam_name": "合成考试",
+                "exam_year": "2023",
+                "source_locator": "合成第1题",
+                "subject": "刑法",
+                "question_type": "indefinite_choice",
+                "stem": "哪些合成选项成立？",
+                "options": ["A. 甲", "B. 乙", "C. 丙"],
+                "answer": ["A", "C"],
+                "answer_source": "official",
+                "verification_status": "verified",
+            }
+        ]
+    )
+
+    result = await provider.select_question(
+        origin="real", subject="criminal_law", question_type="indefinite_choice"
+    )
+
+    assert result["available"] is True
+    assert result["origin"] == "real"
+    assert result["question_type"] == "indefinite_choice"
+    assert result["answer_source"] == "official"
     storage.close()
 
 
@@ -354,6 +411,7 @@ async def test_provider_keeps_case_and_question_identities_independent(tmp_path)
                 "stem": "刑法真题",
                 "options": ["A", "B"],
                 "answer": "A",
+                "answer_source": "official",
                 "verification_status": "verified",
             }
         ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ _SUBJECT_ALIASES: dict[str, str] = {
 QUESTION_TYPE_LABELS: dict[str, str] = {
     "single_choice": "单项选择题",
     "multiple_choice": "多项选择题",
+    "indefinite_choice": "不定项选择题",
     "true_false": "判断题",
     "short_answer": "简答题",
     "case_analysis": "案例分析题",
@@ -63,6 +65,11 @@ _QUESTION_TYPE_ALIASES: dict[str, str] = {
     "多选题": "multiple_choice",
     "multiple": "multiple_choice",
     "multiple_choice": "multiple_choice",
+    "不定项": "indefinite_choice",
+    "不定项选择": "indefinite_choice",
+    "不定项选择题": "indefinite_choice",
+    "indefinite": "indefinite_choice",
+    "indefinite_choice": "indefinite_choice",
     "判断": "true_false",
     "判断题": "true_false",
     "true_false": "true_false",
@@ -77,6 +84,14 @@ _QUESTION_TYPE_ALIASES: dict[str, str] = {
 
 QUESTION_ORIGINS = {"real", "mock", "random"}
 SELECTION_MODES = {"random", "fixed", "rotation"}
+ANSWER_SOURCES = {
+    "not_provided",
+    "official",
+    "third_party",
+    "user_verified",
+    "unverified",
+}
+_ANSWER_SOURCES_WITH_CONTENT = ANSWER_SOURCES - {"not_provided"}
 
 
 def normalize_subject(value: Any) -> str | None:
@@ -243,12 +258,44 @@ class RealQuestion:
         if verification_status not in {"verified", "official", "user_verified"}:
             raise ValueError("real question verification_status is not verified")
         options = raw.get("options", [])
-        if question_type in {"single_choice", "multiple_choice"} and not isinstance(
-            options, (list, tuple, dict)
-        ):
+        if question_type in {
+            "single_choice",
+            "multiple_choice",
+            "indefinite_choice",
+        } and not isinstance(options, (list, tuple, dict)):
             raise ValueError("choice question options must be a list or object")
-        if question_type in {"single_choice", "multiple_choice"} and len(options) < 2:
+        is_choice = question_type in {
+            "single_choice",
+            "multiple_choice",
+            "indefinite_choice",
+        }
+        if is_choice and len(options) < 2:
             raise ValueError("choice question requires at least two options")
+        answer = raw.get("answer")
+        answer_source = str(raw.get("answer_source") or "").strip().lower()
+        if answer is None:
+            if not answer_source:
+                answer_source = "not_provided"
+            if answer_source != "not_provided":
+                raise ValueError(
+                    "answer_source must be not_provided when answer is missing"
+                )
+        elif answer_source not in _ANSWER_SOURCES_WITH_CONTENT:
+            raise ValueError(
+                "answer_source is required for a provided answer and must be "
+                "official, third_party, user_verified, or unverified"
+            )
+        if is_choice and answer is not None:
+            answer_keys = _answer_keys(answer)
+            option_keys = _option_keys(options)
+            if not answer_keys:
+                raise ValueError("choice question answer must contain option keys")
+            if not answer_keys.issubset(option_keys):
+                raise ValueError(
+                    "choice question answer contains an unknown option key"
+                )
+            if question_type == "single_choice" and len(answer_keys) != 1:
+                raise ValueError("single_choice question must have exactly one answer")
         item = cls(
             source_name=source_name,
             exam_name=exam_name,
@@ -256,9 +303,9 @@ class RealQuestion:
             question_type=question_type,
             stem=stem,
             options=options,
-            answer=raw.get("answer"),
+            answer=answer,
             explanation=str(raw.get("explanation") or "").strip(),
-            answer_source=str(raw.get("answer_source") or "not_provided").strip(),
+            answer_source=answer_source,
             verification_status=verification_status,
             source_url=source_url,
             source_locator=source_locator,
@@ -278,6 +325,9 @@ class RealQuestion:
             "source_url": item.source_url,
             "source_locator": item.source_locator,
             "question_number": item.question_number,
+            "exam_year": item.exam_year,
+            "exam_date": item.exam_date,
+            "paper": item.paper,
             "answer": item.answer,
             "explanation": item.explanation,
             "answer_source": item.answer_source,
@@ -310,6 +360,43 @@ class RealQuestion:
         }
 
 
+def real_question_identity_key(question: RealQuestion | Mapping[str, Any]) -> str:
+    """Return the versioned, answer-independent identity for a real question."""
+    values = question.to_mapping() if isinstance(question, RealQuestion) else question
+    identity: dict[str, str] = {
+        field: str(values.get(field) or "").strip()
+        for field in (
+            "source_name",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+            "source_locator",
+        )
+    }
+    if not identity["question_number"] and not identity["source_locator"]:
+        options = values.get("options")
+        if options is None and values.get("options_json") is not None:
+            try:
+                options = json.loads(str(values["options_json"]))
+            except (TypeError, ValueError):
+                options = None
+        body = {
+            field: values.get(field)
+            for field in ("subject", "question_type", "stem", "source_url")
+            if values.get(field) not in (None, "")
+        }
+        if options is not None:
+            body["options"] = options
+        identity["content_hash"] = (
+            _content_hash(body)
+            if body
+            else str(values.get("content_hash") or "").strip()
+        )
+    return f"rq:v2:{_content_hash(identity)}"
+
+
 def load_real_questions(path: str | Path) -> list[RealQuestion]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     records = payload.get("questions", []) if isinstance(payload, dict) else payload
@@ -328,7 +415,7 @@ def validate_generated_question(content: Any, question_type: str | None) -> bool
         return False
     if not str(content.get("explanation") or "").strip():
         return False
-    if question_type in {"single_choice", "multiple_choice"}:
+    if question_type in {"single_choice", "multiple_choice", "indefinite_choice"}:
         options = content.get("options")
         if not isinstance(options, (list, dict)) or len(options) < 2:
             return False
@@ -337,8 +424,6 @@ def validate_generated_question(content: Any, question_type: str | None) -> bool
         if not answer_keys or not answer_keys.issubset(valid_keys):
             return False
         if question_type == "single_choice" and len(answer_keys) != 1:
-            return False
-        if question_type == "multiple_choice" and not answer_keys:
             return False
     if question_type == "true_false":
         if isinstance(answer, bool):
@@ -456,6 +541,7 @@ def _content_hash(value: dict[str, Any]) -> str:
 
 
 __all__ = [
+    "ANSWER_SOURCES",
     "QUESTION_TYPE_LABELS",
     "SUBJECT_LABELS",
     "QuestionRequest",
@@ -466,6 +552,7 @@ __all__ = [
     "normalize_question_type",
     "normalize_selection_mode",
     "normalize_subject",
+    "real_question_identity_key",
     "subject_filter",
     "subject_matches",
     "validate_generated_question",

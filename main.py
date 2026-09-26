@@ -520,7 +520,7 @@ class LawAssistant(Star):
         Args:
             subject(string): 可选方向，如刑法、民商法、知识产权。
             origin(string): real、mock 或 random，默认 random。
-            question_type(string): 单选、多选、判断、简答或案例分析；留空随机。
+            question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空随机。
         """
         if not self._authorized(event):
             return self._denial(event)
@@ -773,7 +773,7 @@ class LawAssistant(Star):
         Args:
             origin(string): real、mock 或 random。
             subject(string): 方向，可用中文名称。
-            question_type(string): 题型；留空随机。
+            question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空随机。
             target(string): 群名、目标 ID，或用逗号分隔的多个群；留空时仅有一个群才自动选择。
             content_ref(string): law_generate_question 返回的短期内容引用；提供时复用刚才的原题。
         """
@@ -849,7 +849,7 @@ class LawAssistant(Star):
             rotation_start_date(string): YYYY-MM-DD。
             rotation_start_index(number): 起始位置；负数保持原值。
             question_origin(string): real、mock 或 random。
-            question_type(string): 题型；留空保持原值。
+            question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空保持原值。
         """
         if not self._authorized(event):
             return self._denial(event)

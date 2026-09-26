@@ -580,7 +580,15 @@ class _Validator:
                 item_id=item_id,
             )
             return False
-        if question_type in {"single_choice", "multiple_choice"} and len(values) < 2:
+        if (
+            question_type
+            in {
+                "single_choice",
+                "multiple_choice",
+                "indefinite_choice",
+            }
+            and len(values) < 2
+        ):
             self.add(
                 "question.options_missing",
                 f"{path}.options",
@@ -717,7 +725,7 @@ class _Validator:
             )
         ):
             return False
-        if question_type in {"single_choice", "multiple_choice"}:
+        if question_type in {"single_choice", "multiple_choice", "indefinite_choice"}:
             keys = _answer_keys(answer)
             option_keys = set(question.get("_option_keys", []))
             if not keys:

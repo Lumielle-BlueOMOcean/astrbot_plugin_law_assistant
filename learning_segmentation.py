@@ -242,7 +242,15 @@ def _segment_questions(
         review_reason = ""
         if not stem:
             review_reason = "题干为空"
-        elif question_type in {"single_choice", "multiple_choice"} and len(options) < 2:
+        elif (
+            question_type
+            in {
+                "single_choice",
+                "multiple_choice",
+                "indefinite_choice",
+            }
+            and len(options) < 2
+        ):
             review_reason = "选择题选项不足"
         elif (
             answer_section_start is not None or inline_answer_section
@@ -287,6 +295,8 @@ def _question_number(text: str) -> str:
 
 def _question_type(block: list[tuple[str, str]]) -> str:
     text = " ".join(line for line, _ in block[:2])
+    if "不定项" in text:
+        return "indefinite_choice"
     if "多选" in text or "多项选择" in text:
         return "multiple_choice"
     if "判断" in text:

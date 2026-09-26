@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import zipfile
 
 import pytest
@@ -185,6 +187,22 @@ def test_question_split_marks_unmatched_independent_answer_as_review(tmp_path):
     assert result.candidates[1]["structured"]["answer"] is None
 
 
+def test_question_split_recognizes_indefinite_choice_without_generic_ren_alias(
+    tmp_path,
+):
+    path = tmp_path / "不定项合成题.txt"
+    path.write_text(
+        "第1题 不定项选择题\n哪些说法成立？\nA. 甲\nB. 乙\n答案：A\n",
+        encoding="utf-8",
+    )
+
+    result = segment_document(
+        extract_document(path), content_kind="real_question_candidate"
+    )
+
+    assert result.candidates[0]["structured"]["question_type"] == "indefinite_choice"
+
+
 def test_official_three_case_article_excludes_intro_and_keeps_independent_items(
     tmp_path,
 ):
@@ -315,4 +333,65 @@ async def test_import_parse_failure_keeps_original_and_reports_error(tmp_path):
     assert result["success"] is False
     assert result["source_id"] is not None
     assert any(data_dir.joinpath("assets").iterdir())
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_distinct_binaries_with_identical_extracted_text_keep_distinct_sources(
+    tmp_path,
+):
+    data_dir = tmp_path / "plugin-data"
+    import_dir = data_dir / "imports"
+    import_dir.mkdir(parents=True)
+    text = "刑法合成学习资料\n第二行正文。"
+    first_path = import_dir / "第一份.txt"
+    second_path = import_dir / "第二份.txt"
+    first_path.write_bytes(text.encode("utf-8"))
+    second_path.write_bytes(text.encode("gb18030"))
+    assert first_path.read_bytes() != second_path.read_bytes()
+
+    storage = SQLiteStorage(data_dir / "law.sqlite3")
+    library = LibraryService(LibraryRepository(storage.connection))
+    importer = DocumentIngestionService(data_dir, library)
+
+    first = await importer.import_document(
+        "第一份.txt", created_by="42", session_origin="private:42"
+    )
+    second = await importer.import_document(
+        "第二份.txt", created_by="42", session_origin="private:42"
+    )
+    repeated = await importer.import_document(
+        "第一份.txt", created_by="42", session_origin="private:42"
+    )
+
+    assert first["success"] is True and second["success"] is True
+    assert first["source_id"] != second["source_id"]
+    assert repeated["source_id"] == first["source_id"]
+    assert first["file_hash"] != second["file_hash"]
+    assert first["extracted_text_hash"] == second["extracted_text_hash"]
+    sources = {
+        row["id"]: row
+        for row in storage.connection.execute(
+            "SELECT * FROM library_sources WHERE id IN (?, ?)",
+            (first["source_id"], second["source_id"]),
+        )
+    }
+    assert len(sources) == 2
+    for result in (first, second):
+        source = sources[result["source_id"]]
+        assert source["content_hash"] == result["file_hash"]
+        assert source["storage_path"] == result["storage_path"]
+        assert source["original_filename"] in {"第一份.txt", "第二份.txt"}
+        assert source["metadata_json"]
+        metadata = json.loads(source["metadata_json"])
+        assert metadata["file_hash"] == result["file_hash"]
+        assert metadata["extracted_text_hash"] == result["extracted_text_hash"]
+        asset = data_dir / source["storage_path"]
+        assert hashlib.sha256(asset.read_bytes()).hexdigest() == metadata["file_hash"]
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM library_sources WHERE created_by = '42'"
+        ).fetchone()[0]
+        == 2
+    )
     storage.close()

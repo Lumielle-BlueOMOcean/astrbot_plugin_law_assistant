@@ -16,6 +16,7 @@ const SUBJECTS = [
 const QUESTION_TYPES = [
   ["single_choice", "单项选择题"],
   ["multiple_choice", "多项选择题"],
+  ["indefinite_choice", "不定项选择题"],
   ["true_false", "判断题"],
   ["short_answer", "简答题"],
   ["case_analysis", "案例分析题"],

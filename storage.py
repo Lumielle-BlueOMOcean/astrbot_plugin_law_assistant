@@ -11,17 +11,17 @@ from pathlib import Path
 from typing import Any
 
 if __package__ and "." in __package__:
-    from .content import RealQuestion, subject_filter
+    from .content import RealQuestion, real_question_identity_key, subject_filter
     from .daily_plans import DailyPlan
     from .date_parser import date_is_on_or_after
     from .models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 else:
-    from content import RealQuestion, subject_filter
+    from content import RealQuestion, real_question_identity_key, subject_filter
     from daily_plans import DailyPlan
     from date_parser import date_is_on_or_after
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -943,6 +943,49 @@ def _migrate_10_to_11(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_11_to_12(connection: sqlite3.Connection) -> None:
+    """Rebuild real-question identities and clarify legacy answer provenance."""
+    if not _table_exists(connection, "real_questions"):
+        return
+    rows = connection.execute("SELECT * FROM real_questions ORDER BY id").fetchall()
+    computed: list[tuple[sqlite3.Row, str]] = []
+    seen: dict[str, int] = {}
+    for row in rows:
+        identity = real_question_identity_key(dict(row))
+        previous_id = seen.get(identity)
+        if previous_id is not None:
+            raise RuntimeError(
+                "real-question identity v2 collision for rows "
+                f"{previous_id} and {int(row['id'])}; migration was rolled back"
+            )
+        seen[identity] = int(row["id"])
+        computed.append((row, identity))
+
+    existing_keys = {str(row["identity_key"]) for row in rows}
+    temporary_prefix = "__real_question_identity_v12_tmp__"
+    while any(key.startswith(temporary_prefix) for key in existing_keys) or any(
+        identity.startswith(temporary_prefix) for _, identity in computed
+    ):
+        temporary_prefix += "_"
+
+    for row, _ in computed:
+        connection.execute(
+            "UPDATE real_questions SET identity_key = ? WHERE id = ?",
+            (f"{temporary_prefix}{int(row['id'])}", int(row["id"])),
+        )
+
+    for row, identity in computed:
+        answer_source = str(row["answer_source"] or "").strip()
+        if row["answer_json"] is None:
+            answer_source = "not_provided"
+        elif answer_source in {"", "not_provided"}:
+            answer_source = "unverified"
+        connection.execute(
+            "UPDATE real_questions SET identity_key = ?, answer_source = ? WHERE id = ?",
+            (identity, answer_source, int(row["id"])),
+        )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -955,6 +998,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_8_to_9,
     9: _migrate_9_to_10,
     10: _migrate_10_to_11,
+    11: _migrate_11_to_12,
 }
 
 
@@ -1582,19 +1626,11 @@ class SQLiteStorage:
         try:
             for raw in records:
                 question = (
-                    raw
+                    RealQuestion.from_mapping(raw.to_mapping())
                     if isinstance(raw, RealQuestion)
                     else RealQuestion.from_mapping(raw)
                 )
-                identity = "|".join(
-                    (
-                        question.source_name,
-                        question.exam_name,
-                        question.source_locator
-                        or question.question_number
-                        or question.content_hash,
-                    )
-                )
+                identity = real_question_identity_key(question)
                 self._connection.execute(
                     """
                 INSERT INTO real_questions(

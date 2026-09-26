@@ -133,7 +133,10 @@ def _answer_label(snapshot: dict[str, Any]) -> str:
         source_label = {
             "official": "官方答案来源标注",
             "third_party": "第三方参考答案来源标注",
-        }.get(answer_source, "题库所存答案")
+            "user_verified": "人工核验答案来源",
+            "unverified": "答案来源待核验",
+            "not_provided": "未提供可靠答案",
+        }.get(answer_source, "答案来源待核验")
         return f"真题参考答案 · {source_label}"
     return "模拟题参考答案"
 

@@ -56,6 +56,44 @@ def _create_v1_database(db_path) -> None:
         )
 
 
+def _insert_v11_real_question(
+    connection,
+    *,
+    question_id,
+    identity_key,
+    exam_year="2023",
+    paper="A卷",
+    question_number="第1题",
+    source_locator="第一部分第1题",
+    answer_json='"A"',
+    answer_source="not_provided",
+):
+    connection.execute(
+        """
+        INSERT INTO real_questions(
+            id, identity_key, source_name, exam_name, exam_year, exam_date,
+            paper, question_number, source_url, source_locator, subject,
+            question_type, stem, options_json, answer_json, explanation,
+            answer_source, verification_status, content_hash, metadata_json,
+            created_at, updated_at
+        ) VALUES (?, ?, '合成题库', '合成考试', ?, '', ?, ?, '', ?,
+            'criminal_law', 'single_choice', '合成题干', '["A", "B"]', ?,
+            '合成解析', ?, 'verified', ?, '{}', 'created', 'updated')
+        """,
+        (
+            question_id,
+            identity_key,
+            exam_year,
+            paper,
+            question_number,
+            source_locator,
+            answer_json,
+            answer_source,
+            f"legacy-content-{question_id}",
+        ),
+    )
+
+
 def test_storage_initializes_version_one_and_persists_events(tmp_path) -> None:
     db_path = tmp_path / "runtime.sqlite3"
     event = make_event()
@@ -74,6 +112,180 @@ def test_storage_initializes_version_one_and_persists_events(tmp_path) -> None:
     reopened.close()
 
 
+def test_real_question_identity_v2_separates_year_and_paper_and_updates_answer(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "real-identity-v2.sqlite3")
+    base = {
+        "source_name": "合成题库",
+        "exam_name": "合成考试",
+        "exam_year": "2023",
+        "exam_date": "2023-09-01",
+        "paper": "A卷",
+        "question_number": "第1题",
+        "source_locator": "第一部分第1题",
+        "source_url": "https://example.test/question",
+        "subject": "刑法",
+        "question_type": "单选",
+        "stem": "相同定位的合成题干",
+        "options": ["A. 甲", "B. 乙"],
+        "answer": "A",
+        "answer_source": "official",
+        "verification_status": "verified",
+    }
+    records = [
+        base,
+        {**base, "exam_year": "2022"},
+        {**base, "paper": "B卷"},
+    ]
+
+    assert storage.import_real_questions(records) == 3
+    questions = storage.list_real_questions(limit=None)
+    assert len(questions) == 3
+    by_exam = {(question.exam_year, question.paper): question for question in questions}
+    original_id = by_exam[("2023", "A卷")].id
+    revised = {
+        **base,
+        "answer": "B",
+        "answer_source": "third_party",
+        "explanation": "修订后的合成解析",
+    }
+
+    assert storage.import_real_questions([revised]) == 1
+    updated = storage.list_real_questions(limit=None)
+    assert len(updated) == 3
+    updated_original = next(
+        question for question in updated if question.id == original_id
+    )
+    assert updated_original.answer == "B"
+    assert updated_original.explanation == "修订后的合成解析"
+    assert updated_original.answer_source == "third_party"
+    storage.close()
+
+
+def test_real_question_without_locator_updates_same_row_when_answer_changes(tmp_path):
+    storage = SQLiteStorage(tmp_path / "real-question-content-fallback.sqlite3")
+    base = {
+        "source_name": "合成题库",
+        "exam_name": "合成考试",
+        "exam_year": "2023",
+        "source_url": "https://example.test/without-locator",
+        "subject": "刑法",
+        "question_type": "单选",
+        "stem": "无题号定位的合成题干",
+        "options": ["A. 甲", "B. 乙"],
+        "answer": "A",
+        "answer_source": "official",
+        "verification_status": "verified",
+    }
+
+    assert storage.import_real_questions([base]) == 1
+    first = storage.list_real_questions(limit=None)[0]
+    assert (
+        storage.import_real_questions(
+            [{**base, "answer": "B", "explanation": "修订后的解析"}]
+        )
+        == 1
+    )
+    rows = storage.list_real_questions(limit=None)
+
+    assert len(rows) == 1
+    assert rows[0].id == first.id
+    assert rows[0].answer == "B"
+    assert rows[0].explanation == "修订后的解析"
+    storage.close()
+
+
+def test_v11_to_v12_migration_preserves_real_question_ids_and_session_references(
+    tmp_path,
+):
+    db_path = tmp_path / "v11-real-questions.sqlite3"
+    storage = SQLiteStorage(db_path)
+    storage.close()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("UPDATE schema_meta SET value = '11' WHERE key = 'version'")
+        _insert_v11_real_question(
+            connection,
+            question_id=101,
+            identity_key="legacy-2023",
+            exam_year="2023",
+            answer_json='"A"',
+            answer_source="not_provided",
+        )
+        _insert_v11_real_question(
+            connection,
+            question_id=102,
+            identity_key="legacy-2022",
+            exam_year="2022",
+            answer_json=None,
+            answer_source="official",
+        )
+        connection.execute(
+            """
+            INSERT INTO question_sessions(
+                session_key, scope_origin, source_kind, source_item_key,
+                real_question_id, question_identity, question_snapshot_hash,
+                question_snapshot_json, status, current_stage, created_by,
+                created_at, updated_at
+            ) VALUES ('session-101', 'private:42', 'real_question', '101', 101,
+                'verified_real_question', 'snapshot-hash', '{}', 'open', 'prompt',
+                '42', 'created', 'updated')
+            """
+        )
+        connection.commit()
+
+    migrated = SQLiteStorage(db_path)
+
+    assert migrated.schema_version == SCHEMA_VERSION == 12
+    rows = migrated.connection.execute(
+        "SELECT id, identity_key, exam_year, answer_json, answer_source "
+        "FROM real_questions ORDER BY id"
+    ).fetchall()
+    assert [row["id"] for row in rows] == [101, 102]
+    assert rows[0]["identity_key"].startswith("rq:v2:")
+    assert rows[1]["identity_key"].startswith("rq:v2:")
+    assert rows[0]["identity_key"] != rows[1]["identity_key"]
+    assert rows[0]["answer_source"] == "unverified"
+    assert rows[1]["answer_source"] == "not_provided"
+    assert (
+        migrated.connection.execute(
+            "SELECT real_question_id FROM question_sessions WHERE session_key = 'session-101'"
+        ).fetchone()[0]
+        == 101
+    )
+    assert migrated.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    migrated.close()
+
+
+def test_v11_to_v12_identity_collision_rolls_back_without_merging_rows(tmp_path):
+    db_path = tmp_path / "v11-identity-collision.sqlite3"
+    storage = SQLiteStorage(db_path)
+    storage.close()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE schema_meta SET value = '11' WHERE key = 'version'")
+        _insert_v11_real_question(connection, question_id=201, identity_key="legacy-a")
+        _insert_v11_real_question(connection, question_id=202, identity_key="legacy-b")
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="identity v2 collision.*201.*202"):
+        SQLiteStorage(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        version = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'"
+        ).fetchone()[0]
+        rows = connection.execute(
+            "SELECT id, identity_key, answer_source FROM real_questions ORDER BY id"
+        ).fetchall()
+    assert version == "11"
+    assert rows == [
+        (201, "legacy-a", "not_provided"),
+        (202, "legacy-b", "not_provided"),
+    ]
+
+
 def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> None:
     db_path = tmp_path / "version-zero.sqlite3"
     with sqlite3.connect(db_path) as connection:
@@ -86,7 +298,7 @@ def test_storage_migrates_version_zero_database_to_current_schema(tmp_path) -> N
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert storage.count_events() == 0
     storage.close()
 
@@ -105,7 +317,7 @@ def test_fresh_database_has_v11_question_session_tables(tmp_path) -> None:
         for row in storage.connection.execute("PRAGMA table_info(question_sessions)")
     }
 
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert {"question_sessions", "question_session_events"} <= tables
     assert {
         "scope_origin",
@@ -146,7 +358,7 @@ def test_schema_v9_migrates_through_v11_and_preserves_rows(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
-    assert migrated.schema_version == 11
+    assert migrated.schema_version == 12
     assert migrated.get_event(event_id).title == "迁移前活动"
     assert {
         "structured_imports",
@@ -204,7 +416,7 @@ def test_storage_rejects_schema_version_newer_than_supported_without_downgrade(
 
     with pytest.raises(
         RuntimeError,
-        match=r"schema version 99 is newer than supported version 11",
+        match=r"schema version 99 is newer than supported version 12",
     ):
         SQLiteStorage(db_path)
 
@@ -311,7 +523,7 @@ def test_schema_v9_adds_daily_axes_and_stable_content_identity(tmp_path) -> None
         for row in storage.connection.execute("PRAGMA table_info(daily_contents)")
     }
 
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert {
         "question_type_selection_mode",
         "fixed_question_type",
@@ -398,7 +610,7 @@ def test_storage_migrates_existing_version_one_data_without_loss(tmp_path) -> No
     storage = SQLiteStorage(db_path)
     loaded = storage.get_event(1)
 
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert loaded is not None and loaded.title == "Persisted v1 event"
     storage.close()
 
@@ -443,7 +655,7 @@ def test_storage_migrates_v2_reminders_to_logical_identity_without_losing_histor
     storage = SQLiteStorage(db_path)
 
     reminder = storage.list_reminders()[0]
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert reminder["date_kind"] == "submission_deadline"
     assert reminder["status"] == "sent"
     assert "event_date_id" not in reminder
@@ -503,6 +715,7 @@ def test_storage_imports_and_retrieves_verified_real_questions(tmp_path) -> None
 
     assert len(questions) == 1
     assert questions[0].exam_name == "法硕测试卷"
+    assert questions[0].answer_source == "official"
     assert storage.real_question_inventory()["count"] == 1
     storage.close()
 
@@ -538,7 +751,7 @@ def test_storage_persists_independent_daily_plans_and_target_override(tmp_path) 
         reopened.get_daily_plan(target["id"], "daily_question").question_origin
         == "real"
     )
-    assert reopened.schema_version == 11
+    assert reopened.schema_version == 12
     reopened.close()
 
 
@@ -579,7 +792,7 @@ def test_storage_runs_the_v3_to_v8_migration_path(tmp_path) -> None:
         connection.commit()
 
     migrated = SQLiteStorage(db_path)
-    assert migrated.schema_version == SCHEMA_VERSION == 11
+    assert migrated.schema_version == SCHEMA_VERSION == 12
     assert migrated.real_question_inventory()["count"] == 0
     assert migrated.list_daily_plans() == []
     migrated.close()
@@ -600,7 +813,7 @@ def test_schema_v10_to_v11_preserves_existing_events_targets_and_plans(tmp_path)
         connection.commit()
 
     upgraded = SQLiteStorage(db_path)
-    assert upgraded.schema_version == 11
+    assert upgraded.schema_version == 12
     assert upgraded.get_event(event_id).title == "v10 活动"
     assert upgraded.get_target(target["id"])["label"] == "v10 群"
     assert upgraded.get_daily_plan(target["id"], "daily_question").enabled is True
@@ -714,7 +927,7 @@ def test_storage_migrates_v6_sources_without_losing_item_links(tmp_path) -> None
 
     storage = SQLiteStorage(db_path)
 
-    assert storage.schema_version == SCHEMA_VERSION == 11
+    assert storage.schema_version == SCHEMA_VERSION == 12
     assert [
         tuple(row)
         for row in storage.connection.execute(

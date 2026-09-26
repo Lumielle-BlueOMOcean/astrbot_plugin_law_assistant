@@ -44,6 +44,34 @@ def _real_question() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    ("answer_source", "label"),
+    [
+        ("official", "官方答案来源标注"),
+        ("third_party", "第三方参考答案来源标注"),
+        ("user_verified", "人工核验答案来源"),
+        ("unverified", "答案来源待核验"),
+        ("not_provided", "未提供可靠答案"),
+    ],
+)
+def test_verified_real_question_session_retains_answer_provenance_label(
+    answer_source, label
+):
+    result = _real_question()
+    result["answer_source"] = answer_source
+    if answer_source == "not_provided":
+        result["content"]["answer"] = None
+
+    snapshot = build_question_session_snapshot(result)
+    answer_page = format_session_answer(snapshot)
+
+    assert snapshot["exam"]["answer_source"] == answer_source
+    assert label in answer_page
+    if answer_source == "not_provided":
+        assert "未提供可核验参考答案" in answer_page
+        assert "【答案秘密】" not in answer_page
+
+
 def _structured_candidate() -> dict[str, object]:
     return {
         "item": {

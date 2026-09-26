@@ -207,6 +207,7 @@ def test_json_text_is_parsed_and_unknown_schema_is_fatal():
     [
         ("single_choice", {"keys": ["A"], "provenance": "source_text"}, None),
         ("multiple_choice", {"keys": ["A", "B"], "provenance": "source_text"}, None),
+        ("indefinite_choice", {"keys": ["A"], "provenance": "source_text"}, None),
         ("true_false", {"value": True, "provenance": "source_text"}, []),
         ("short_answer", None, []),
         (
@@ -232,6 +233,42 @@ def test_supported_question_types_keep_answer_shapes(question_type, answer, opti
 
     assert result.fatal is False
     assert result.usable_questions == 1
+
+
+@pytest.mark.parametrize("answer_keys", [["A"], ["A", "C"]])
+def test_structured_indefinite_choice_accepts_one_or_multiple_answer_keys(answer_keys):
+    payload = _valid_document()
+    payload["questions"] = [
+        _question(
+            question_type="indefinite_choice",
+            answer={"keys": answer_keys, "provenance": "source_text"},
+            options=[
+                {"key": key, "text": f"选项{key}", "locator": "第1页"}
+                for key in ("A", "B", "C", "D")
+            ],
+        )
+    ]
+
+    result = validate_structured_material(payload)
+
+    assert result.fatal is False
+    assert result.usable_questions == 1
+    assert result.questions[0]["question_type"] == "indefinite_choice"
+
+
+def test_structured_indefinite_choice_rejects_unknown_answer_key():
+    payload = _valid_document()
+    payload["questions"] = [
+        _question(
+            question_type="indefinite_choice",
+            answer={"keys": ["Z"], "provenance": "source_text"},
+        )
+    ]
+
+    result = validate_structured_material(payload)
+
+    assert result.usable_questions == 0
+    assert "question.answer_key_unknown" in _issue_codes(result)
 
 
 def test_shared_material_can_have_three_independent_subquestions():

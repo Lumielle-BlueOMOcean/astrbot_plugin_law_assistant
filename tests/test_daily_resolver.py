@@ -70,6 +70,36 @@ def test_question_type_fixed_and_old_question_type_remains_compatible():
     assert resolved["origin"] == "mock"
 
 
+def test_indefinite_choice_flows_through_fixed_and_rotation_daily_plans():
+    fixed_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_type_selection_mode": "fixed",
+            "fixed_question_type": "不定项选择题",
+        },
+    )
+    fixed = resolve_daily_constraints(
+        fixed_plan, date(2026, 9, 27), target_id=1, content_type="daily_question"
+    )
+    rotation_plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_type_selection_mode": "rotation",
+            "rotation_question_types": ["indefinite_choice", "single_choice"],
+            "question_type_rotation_start_date": "2026-09-27",
+        },
+    )
+    rotating = resolve_daily_constraints(
+        rotation_plan,
+        date(2026, 9, 27),
+        target_id=1,
+        content_type="daily_question",
+    )
+
+    assert fixed["question_type"] == "indefinite_choice"
+    assert rotating["question_type"] == "indefinite_choice"
+
+
 def test_pre_start_rotation_is_not_resolved_and_preview_does_not_generate_content():
     plan = DailyPlan.from_mapping(
         "daily_question",

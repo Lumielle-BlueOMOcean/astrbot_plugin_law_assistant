@@ -112,6 +112,14 @@ async def test_plugin_import_lifecycle_and_entrypoint_registration(plugin_module
     )
 
 
+def test_question_command_parser_accepts_indefinite_choice_alias(plugin_module):
+    assert plugin_module._parse_question_args(["real", "刑法", "不定项选择"]) == (
+        "real",
+        "刑法",
+        "indefinite_choice",
+    )
+
+
 @pytest.mark.asyncio
 async def test_command_requires_private_admin_or_operator_and_delegates(plugin_module):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})

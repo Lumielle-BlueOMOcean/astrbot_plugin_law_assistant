@@ -257,7 +257,7 @@ class DocumentIngestionService:
             title=document.original_filename,
             raw_text=document.text,
             source_url="",
-            content_hash=document.extracted_text_hash,
+            content_hash=document.file_hash,
             created_at=self.clock(),
             created_by=str(created_by),
             session_origin=str(session_origin),

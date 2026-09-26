@@ -154,6 +154,7 @@ def _question_prompt(subject: str, question_type: str, evidence: str = "") -> st
     structure = {
         "single_choice": "options 至少两个且 answer 只能是一个正确选项",
         "multiple_choice": "options 至少两个且 answer 必须包含一个或多个正确选项",
+        "indefinite_choice": "options 至少两个且 answer 必须包含一个或多个正确选项",
         "true_false": "answer 必须明确为正确或错误",
         "short_answer": "answer 必须是参考答案和要点",
         "case_analysis": "必须提供 questions 或 issues，以及 answer 和 explanation",

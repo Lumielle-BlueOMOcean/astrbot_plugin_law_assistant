@@ -147,7 +147,7 @@ async def test_inventory_filters_beyond_old_query_windows(tmp_path):
             "stem": f"真题 {index}",
             "options": ["A", "B"],
             "answer": "A",
-            "answer_source": "官方答案",
+            "answer_source": "official",
             "verification_status": "verified",
         }
         for index in range(1001)

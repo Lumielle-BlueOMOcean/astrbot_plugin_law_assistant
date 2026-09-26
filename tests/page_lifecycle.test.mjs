@@ -74,7 +74,7 @@ test("overview renders safe active-session progress from the Bridge payload", as
   const { bridge, elements, page } = await loadPage();
   bridge.apiGet = async () => ({
     plugin: { version: "0.5.0" },
-    schema_version: 11,
+    schema_version: 12,
     radar: { current: 0 },
     learning: {},
     targets: { count: 1 },
@@ -115,7 +115,7 @@ test("stale asynchronous overview render cannot overwrite the newest generation"
   page.state.route = "overview";
   page.state.renderGeneration = 1;
   const first = page.renderOverview();
-  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 11 });
+  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 12 });
   page.state.renderGeneration = 2;
   const second = page.renderOverview();
   await second;

@@ -44,6 +44,12 @@ def test_plugin_page_exposes_all_0_3d_management_entrypoints():
     assert "window.confirm" not in javascript
 
 
+def test_daily_question_type_selector_includes_indefinite_choice():
+    javascript = (PAGE_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert '["indefinite_choice", "不定项选择题"]' in javascript
+
+
 def _resolve(messages, locale, key, fallback):
     for candidate in (locale, "zh-CN", "en-US"):
         current = messages.get(candidate)
