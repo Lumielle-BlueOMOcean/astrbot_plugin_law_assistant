@@ -12,6 +12,7 @@ from werkzeug.datastructures import FileStorage
 
 from daily_plans import DailyPlan
 from document_ingestion import DocumentIngestionService
+from library_models import LibrarySource
 from library_repository import LibraryRepository
 from library_service import LibraryService
 from service import LawAssistantService
@@ -87,6 +88,7 @@ async def test_web_api_registers_overview_and_returns_stable_json(tmp_path):
     assert response.status_code == 200
     assert payload["success"] is True
     assert payload["data"]["schema_version"] == 12
+    assert payload["data"]["plugin"]["version"] == "0.5.2"
     assert "learning" in payload["data"]
     service.storage.close()
 
@@ -394,6 +396,80 @@ async def test_web_library_question_detail_and_update_are_answer_safe(tmp_path):
         serialized = json.dumps(payload, ensure_ascii=False)
         assert "SECRET_WEB_REVIEW_ANSWER" not in serialized
         assert "WEB_REVIEW_RAW" not in serialized
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_review_list_and_detail_project_structured_options_safely(tmp_path):
+    service = _service(tmp_path)
+    source_id = service.library_service.record_source(
+        LibrarySource(
+            source_kind="user_text",
+            title="synthetic objective source",
+            raw_text="synthetic objective source",
+            source_url="",
+            content_hash="synthetic-objective-review-source",
+            created_at=datetime.now(timezone.utc),
+            created_by="42",
+            session_origin="private:42",
+        )
+    )
+    review_id = service.library_service.repository.record_review_item(
+        source_id=source_id,
+        candidate_key="synthetic-api-dict-options",
+        material_type="real_question_candidate",
+        locator="PDF第1页",
+        raw_fragment="SECRET_API_REVIEW_RAW",
+        proposed_structure={
+            "question_type": "single_choice",
+            "stem": "API_SAFE_REVIEW_STEM",
+            "options": [
+                {"key": "A", "text": "API_SAFE_ALPHA", "locator": "PDF第1页"},
+                {"key": "B", "text": "API_SAFE_BETA", "locator": "PDF第1页"},
+            ],
+            "answer": {"keys": ["B"]},
+            "explanation_blocks": [{"text": "SECRET_API_EXPLANATION"}],
+        },
+        review_reason="合成 API 选择题复核",
+        now=datetime.now(timezone.utc),
+    )
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        list_response = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/reviews"
+        )
+        list_payload = await list_response.get_json()
+        detail_response = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/review",
+            query_string={"id": review_id},
+        )
+        detail_payload = await detail_response.get_json()
+
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    assert list_payload["success"] is True
+    assert detail_payload["success"] is True
+    listed_item = list_payload["data"]["items"][0]
+    detail_item = detail_payload["data"]["item"]
+    expected_preview = "API_SAFE_REVIEW_STEM\nA. API_SAFE_ALPHA\nB. API_SAFE_BETA"
+    assert listed_item["safe_preview"] == expected_preview
+    assert detail_item["safe_preview"] == expected_preview
+    assert detail_item["safe_structure"]["options"] == [
+        {"key": "A", "text": "API_SAFE_ALPHA", "locator": "PDF第1页"},
+        {"key": "B", "text": "API_SAFE_BETA", "locator": "PDF第1页"},
+    ]
+    serialized = json.dumps(
+        {"list": list_payload, "detail": detail_payload}, ensure_ascii=False
+    )
+    for secret in (
+        "SECRET_API_REVIEW_RAW",
+        "SECRET_API_EXPLANATION",
+        '"keys": ["B"]',
+    ):
+        assert secret not in serialized
+    assert "answer" not in detail_item["safe_structure"]
+    assert "explanation_blocks" not in detail_item["safe_structure"]
     service.storage.close()
 
 

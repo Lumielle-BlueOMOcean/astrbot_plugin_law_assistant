@@ -1,6 +1,6 @@
 # 微光·法务助手 / Lumielle Law Assistant
 
-AstrBot QQ 法律信息助手。当前版本 `0.5.1` 修复结构化选择题答案以 `keys` 等字段保存时无法在 Question Session 中显式揭晓的问题，并兼容旧版已入库数据，无需重新导入。互动题目仍先展示题面，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
+AstrBot QQ 法律信息助手。当前版本 `0.5.2` 修复结构化客观题进入待复核队列时，选项 DTO 导致 safe preview 序列化异常的问题。互动题目仍先展示题面，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
 
 ## Implemented
 
@@ -77,7 +77,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 
 ### Plugin ZIP
 
-在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.1.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
+在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.2.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
 
 完整嵌入式 WebUI 需要 AstrBot `>=4.25`；基础插件功能兼容 `>=4.22.0,<5`。页面认证由 AstrBot Dashboard 提供，插件不建立第二套账号密码系统。
 
@@ -254,7 +254,13 @@ data/plugin_data/astrbot_plugin_law_assistant/imports/
 
 版本使用 Semantic Versioning 三段式 `MAJOR.MINOR.PATCH`：PATCH 用于向后兼容的 bug fix，MINOR 用于向后兼容的新功能，MAJOR 用于 breaking change。任何版本号更新都必须在同一轮同步更新本节。
 
-### 0.5.1 — Unreleased
+### 0.5.2 — Unreleased
+
+- 修复结构化客观题进入待复核队列时，safe preview 对 option dict 直接 `join` 导致 `TypeError` 的问题。
+- 待复核 safe preview 现在仅把选项白名单中的 key/text 确定性投影为文本，同时保留 `safe_structure.options` 的结构化 DTO。
+- 不改变答案安全边界；复核页仍不会暴露答案、解析或原始隐藏 evidence。
+
+### 0.5.1
 
 - 修复结构化资料中的选择题答案以 `answer.keys`、`correct_keys` 等合法结构保存时，Question Session 显式揭晓仍误报“未提供答案”的问题。
 - 兼容旧版本已持久化的结构化选择题答案，无需重新导入资料或迁移数据库。
@@ -293,6 +299,6 @@ python scripts/build_release.py --output dist
 
 `.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；4.25.0 额外验证 Plugin Page discovery、`/api/plug/astrbot_plugin_law_assistant/...` route contract 和解压 ZIP 的页面加载；required failure 不用 `continue-on-error` 隐藏。
 
-CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.1.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
+CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.2.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
 
 本地的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用 deterministic fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取、Dashboard 浏览器操作和真实 LLM provider 仍需后续实机验收。

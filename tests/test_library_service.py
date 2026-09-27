@@ -715,6 +715,128 @@ async def test_question_review_external_view_is_allowlisted_and_preserves_storag
 
 
 @pytest.mark.asyncio
+async def test_structured_choice_review_projects_dict_options_without_leaking_answers(
+    tmp_path,
+):
+    storage, service = _service(tmp_path)
+    source_id = service.record_source(_batch_source())
+    proposed_structure = {
+        "question_type": "single_choice",
+        "stem": "SAFE_REVIEW_STEM",
+        "options": [
+            {"key": "A", "text": "SAFE_OPTION_ALPHA", "locator": "PDF第1页"},
+            {"key": "B", "text": "SAFE_OPTION_BETA", "locator": "PDF第1页"},
+        ],
+        "answer": {"keys": ["B"], "provenance": "source_text"},
+        "explanation_blocks": [{"text": "SECRET_REVIEW_EXPLANATION"}],
+    }
+    review_id = service.repository.record_review_item(
+        source_id=source_id,
+        candidate_key="synthetic-objective-dict-options",
+        material_type="real_question_candidate",
+        locator="PDF第1页",
+        raw_fragment="SECRET_REVIEW_RAW",
+        proposed_structure=proposed_structure,
+        review_reason="合成选择题复核",
+        now=datetime.now(timezone.utc),
+    )
+
+    listed = await service.list_review_items()
+    detail = await service.get_review_item(review_id)
+
+    assert listed["success"] is True
+    assert detail["success"] is True
+    item = detail["item"]
+    assert item["answer_safe"] is True
+    assert item["safe_preview"] == (
+        "SAFE_REVIEW_STEM\nA. SAFE_OPTION_ALPHA\nB. SAFE_OPTION_BETA"
+    )
+    assert item["safe_structure"]["options"] == proposed_structure["options"]
+    serialized = json.dumps({"listed": listed, "detail": detail}, ensure_ascii=False)
+    for secret in (
+        "SECRET_REVIEW_RAW",
+        '"keys": ["B"]',
+        "SECRET_REVIEW_EXPLANATION",
+        '"answer"',
+        '"explanation_blocks"',
+    ):
+        assert secret not in serialized
+    assert "answer" not in item["safe_structure"]
+    assert "explanation_blocks" not in item["safe_structure"]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_review_preview_projects_mixed_option_shapes_as_strings_only(tmp_path):
+    storage, service = _service(tmp_path)
+    source_id = service.record_source(_batch_source())
+    options = [
+        "A. STRING_OPTION",
+        {"key": "B", "text": "DICT_OPTION", "answer": "HIDDEN"},
+        {"key": "C"},
+        {"text": "TEXT_ONLY"},
+        {},
+        None,
+        7,
+    ]
+    review_id = service.repository.record_review_item(
+        source_id=source_id,
+        candidate_key="synthetic-mixed-options",
+        material_type="real_question_candidate",
+        locator="PDF第2页",
+        raw_fragment="HIDDEN_RAW",
+        proposed_structure={"stem": "MIXED_STEM", "options": options},
+        review_reason="混合选项格式",
+        now=datetime.now(timezone.utc),
+    )
+
+    detail = await service.get_review_item(review_id)
+    item = detail["item"]
+
+    assert item["safe_preview"] == (
+        "MIXED_STEM\nA. STRING_OPTION\nB. DICT_OPTION\nC\nTEXT_ONLY"
+    )
+    assert all(isinstance(part, str) for part in item["safe_preview"].splitlines())
+    assert "{}" not in item["safe_preview"]
+    assert "None" not in item["safe_preview"]
+    assert "HIDDEN" not in json.dumps(item, ensure_ascii=False)
+    assert item["safe_structure"]["options"] == [
+        "A. STRING_OPTION",
+        {"key": "B", "text": "DICT_OPTION"},
+        {"key": "C"},
+        {"text": "TEXT_ONLY"},
+    ]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_subjective_review_with_empty_options_keeps_safe_preview(tmp_path):
+    storage, service = _service(tmp_path)
+    source_id = service.record_source(_batch_source())
+    review_id = service.repository.record_review_item(
+        source_id=source_id,
+        candidate_key="synthetic-empty-options",
+        material_type="real_question_candidate",
+        locator="PDF第3页",
+        raw_fragment="HIDDEN_RAW",
+        proposed_structure={
+            "question_type": "short_answer",
+            "stem": "SUBJECTIVE_SAFE_STEM",
+            "options": [],
+        },
+        review_reason="简答题复核",
+        now=datetime.now(timezone.utc),
+    )
+
+    detail = await service.get_review_item(review_id)
+
+    assert detail["success"] is True
+    assert detail["item"]["safe_preview"] == "SUBJECTIVE_SAFE_STEM"
+    assert detail["item"]["safe_structure"]["options"] == []
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_only_trusted_official_archive_can_create_official_case(tmp_path):
     storage, service = _service(tmp_path)
     source = _batch_source()

@@ -756,7 +756,7 @@ class LawAssistantService:
         return {
             "schema_version": self.storage.schema_version,
             "plugin": {
-                "version": "0.5.1",
+                "version": "0.5.2",
                 "schema_version": self.storage.schema_version,
                 "scheduler_enabled": bool(
                     any(

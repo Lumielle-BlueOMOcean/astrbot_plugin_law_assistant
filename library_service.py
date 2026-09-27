@@ -1079,7 +1079,11 @@ class LibraryService:
             preview_parts.extend(
                 block["text"] for block in safe_structure.get("stem_blocks", [])
             )
-            preview_parts.extend(safe_structure.get("options", []))
+            preview_parts.extend(
+                preview_text
+                for option in safe_structure.get("options", [])
+                if (preview_text := LibraryService._review_option_preview_text(option))
+            )
             for subquestion in safe_structure.get("subquestions", []):
                 if subquestion.get("stem"):
                     preview_parts.append(subquestion["stem"])
@@ -1102,6 +1106,22 @@ class LibraryService:
             }
         )
         return result
+
+    @staticmethod
+    def _review_option_preview_text(option: Any) -> str:
+        """Project safe option fields into a human-readable preview string."""
+        if isinstance(option, str):
+            return option.strip()
+        if not isinstance(option, dict):
+            return ""
+
+        key = option.get("key")
+        text = option.get("text")
+        key_text = str(key).strip() if isinstance(key, (str, int, float)) else ""
+        option_text = str(text).strip() if isinstance(text, (str, int, float)) else ""
+        if key_text and option_text:
+            return f"{key_text}. {option_text}"
+        return key_text or option_text
 
     @staticmethod
     def _safe_question_review_structure(value: Any) -> dict[str, Any]:

@@ -90,7 +90,7 @@ test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async (
 test("overview renders safe active-session progress from the Bridge payload", async () => {
   const { bridge, elements, page } = await loadPage();
   bridge.apiGet = async () => ({
-    plugin: { version: "0.5.1" },
+    plugin: { version: "0.5.2" },
     schema_version: 12,
     radar: { current: 0 },
     learning: {},
@@ -281,10 +281,19 @@ test("answer-safe question review renders only its allowlisted preview and struc
       material_type: "real_question_candidate",
       review_reason: "需要确认题目边界",
       answer_safe: true,
-      safe_preview: "REVIEW_SAFE_STEM",
-      safe_structure: { stem: "REVIEW_SAFE_STEM", answer: "SECRET_SAFE_STRUCTURE_ANSWER" },
+      safe_preview: "REVIEW_SAFE_STEM\nA. REVIEW_SAFE_OPTION_A\nB. REVIEW_SAFE_OPTION_B",
+      safe_structure: {
+        stem: "REVIEW_SAFE_STEM",
+        options: [
+          { key: "A", text: "REVIEW_SAFE_OPTION_A", locator: "PDF第1页" },
+          { key: "B", text: "REVIEW_SAFE_OPTION_B", locator: "PDF第1页" },
+        ],
+      },
       raw_fragment: "SECRET_REVIEW_RAW",
-      proposed_structure: { answer: "SECRET_REVIEW_ANSWER" },
+      proposed_structure: {
+        answer: { keys: ["SECRET_REVIEW_ANSWER"] },
+        explanation_blocks: [{ text: "SECRET_REVIEW_EXPLANATION" }],
+      },
     },
   });
 
@@ -294,8 +303,10 @@ test("answer-safe question review renders only its allowlisted preview and struc
 
   const rendered = textOf(elements.get("view-library"));
   assert.match(rendered, /REVIEW_SAFE_STEM/);
+  assert.match(rendered, /A\. REVIEW_SAFE_OPTION_A/);
+  assert.match(rendered, /B\. REVIEW_SAFE_OPTION_B/);
   assert.match(rendered, /答案与解析通过 Question Session 显式揭晓/);
-  assert.doesNotMatch(rendered, /SECRET_SAFE_STRUCTURE_ANSWER|SECRET_REVIEW_RAW|SECRET_REVIEW_ANSWER/);
+  assert.doesNotMatch(rendered, /SECRET_REVIEW_RAW|SECRET_REVIEW_ANSWER|SECRET_REVIEW_EXPLANATION/);
 });
 
 test("stale asynchronous overview render cannot overwrite the newest generation", async () => {

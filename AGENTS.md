@@ -28,6 +28,7 @@ The intended division is ChatGPT Sol for analysis, architecture, debugging reaso
 - Network operations must be async; do not use `requests`.
 - Every new behavior needs a meaningful deterministic test. Tests must not require real QQ, real LLM providers, real websites, or production databases.
 - Before commit run format, lint, tests, compile, `git diff --check`, and the two real AstrBot compatibility smokes.
+- Every semantic-version update must include a matching README Changelog entry in the same change.
 - Keep module boundaries clear; do not let `main.py` or `service.py` grow without a concrete responsibility.
 - Source adapters must preserve official URL, fetched evidence and content hash; one source failure is isolated and recorded in `source_runs`.
 - Unconfirmed LLM dates cannot drive deadline lists, reminders or publication previews. LLM-generated learning content must be marked as study material, not legal advice.
