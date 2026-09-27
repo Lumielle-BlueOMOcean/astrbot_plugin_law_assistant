@@ -1,304 +1,567 @@
 # 微光·法务助手 / Lumielle Law Assistant
 
-AstrBot QQ 法律信息助手。当前版本 `0.5.2` 修复结构化客观题进入待复核队列时，选项 DTO 导致 safe preview 序列化异常的问题。互动题目仍先展示题面，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
+面向 AstrBot QQ 会话的法律学习与信息助手。它把可追溯的来源材料、确定性业务规则和明确的权限/确认边界放在首位；LLM 可协助理解请求、整理材料或生成原创练习，但不决定来源身份、真伪、答案核验、截止日期或发布状态。本插件不提供法律意见，学习内容不能替代律师、官方公告或现行法律文本。
 
-## Implemented
+| 项目 | 当前值 |
+| --- | --- |
+| 插件版本 | 0.5.2 |
+| 数据库 schema | 12 |
+| 仓库 | [Lumielle-BlueOMOcean/astrbot_plugin_law_assistant](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant) |
+| AstrBot | >=4.22.0,<5；嵌入式 Plugin Page 需 >=4.25.0 |
+| Python | >=3.12（以目标 AstrBot 实际环境为准） |
 
-- AstrBot 插件生命周期、`aiocqhttp` 支持、私聊 `/law` 命令和 LLM Tools。
-- 法律硕士活动来源：China-JM 通知列表，以及可配置的同主机通知列表页；活动雷达按确认日期和历史信号动态区分 `current`、`needs_review`、`historical`，不会把刚发现的旧通知当成当前活动。
-- HTML/PDF 异步抓取、编码处理、公告正文提取和规则优先的活动识别。
-- 报名/投稿截止、初赛、复赛、决赛等多节点时间线；原文 evidence 和确认状态随事件保存。
-- SQLite schema migration、来源文档、事件 revision、确定性 upsert 和首次发现时间保留。
-- 最高人民法院/最高人民检察院案例列表接口与案例学习内容接口（需要可用 LLM provider 才生成解读）。
-- 跨来源活动保留独立来源记录，并以强证据 canonical key 关联；自动活动发布只接受 operator 预授权来源、当前状态和已确认截止日期。
-- 真题 JSON 导入、核验状态、考试定位、答案来源和方向/题型检索；仓库不内置未经授权的商业题库。
-- 真题、模拟题和官方案例使用独立身份标注；模拟题不会被标为官方真题，缺少答案证据时不会由 LLM 冒充官方答案。
-- 学习资料库基础：私聊中明确要求收藏的文本资料会保存原文、确定性 hash、归属人和结构化学习条目；支持 `user_case`、`real_question_candidate`、持久化 `mock_question` 和 `note`。
-- 每日内容统一经过 `LearningContentProvider`：优先从 active 官方案例、verified 真题和持久化模拟题库存选择；库存没有匹配模拟题时，才校验并保存新的 AI 原创模拟题。
-- 学习资料库支持 Agent Tool 搜索、读取和有限人工更新；同一原文可以复用 Source，但不同整理结果、方向和备注不会互相覆盖。
-- 受控目录资料导入：管理员可导入 UTF-8/常见中文编码 TXT、标准 DOCX 和文本型 PDF；原件保存在插件数据目录，提取文本保留页码/段落/行号定位，题目和案例按可确定边界拆成独立条目并返回待复核统计。
-- 最高法/最高检受信来源的合集文章会通过独立官方案例入口按原文案例标题拆分；每日一案优先使用独立 `official_case`，并通过统一学习卡片长度预算阻止过长内容发送。
-- 题目来源/方向/题型的统一选择规则，支持 `real`、`mock`、`random` 和单选、多选、判断、简答、案例分析。
-- 案例和题目各自独立的每日任务计划：随机、固定或按日期轮换；支持全局默认、群级覆盖、学校四方向预设和未来安排预览。
-- 已绑定多个群的名称/别名解析、明确目标的赛事/题目/案例发布预览和一次性确认 token。
-- 可选法律法规更新列表接口。
-- 已绑定目标的 DDL 提醒；新事件自动发布可由 operator 预授权开启。
-- 发布操作默认 `prepare → preview → explicit confirm → execute`，按事件 revision、目标和发布类型幂等。
-- 自动 scheduler 默认关闭；计划在运行中经确认启用后会唤醒同一个 scheduler，不需要手动 reload；reload/terminate 会取消任务。
-- Python 3.12 单元测试、ruff、compile 和真实 AstrBot 4.22.0/4.25.0 loader smoke。
-- AstrBot 4.25+ Plugin Page：总览、资料库搜索/详情、受控 TXT/DOCX/PDF 上传的 prepare/confirm 导入、待复核状态、活动雷达扫描、每日计划预览、群目标和运行记录。
-- 结构化资料导入：Plugin Page 的“结构化资料导入”同时接收原始 PDF 和 `structured-material-v1.json`，prepare 只生成预览，confirm 后以 `real_question_candidate` / `pending_review`（案例为用户候选）写入资料库；它不会调用旧正则拆分器，也不会授予核验真题或官方案例身份。公共材料、题干/答案/解析块、小问、定位和来源关系均持久化。
-- Question Session：`/law question`、`/law study <资料题目ID>` 和 LLM Tools 会在精确 QQ 会话范围内保存题目快照；`/law current`、`/law next`、`/law next-question` 分阶段展示长材料和多小问，`/law answer` 与 `/law explanation` 分别显式揭晓。切换题目仅替换当前会话，不影响其他群/私聊。
-- 人工题目发布预览和每日一题只发送无答案题面；每个群发送成功后才开启独立题目会话，发送失败不会留下活动会话。题目快照与揭晓状态在 AstrBot 重启后保留。
-- 页面使用原生 HTML/CSS/Vanilla ES Modules 与 `window.AstrBotPluginPage` Bridge，不需要 Node、npm、CDN 或独立 HTTP server。
+## 当前实现与验收边界
 
-## Planned / deferred
+当前代码包括活动雷达、官方案例/法规来源适配、DDL、SQLite 学习库、核验真题 JSON 导入、原创模拟题、受控文档导入、结构化资料候选导入、持久化分阶段 Question Session、多群目标与确认式发布、独立每日计划以及 AstrBot 4.25+ Plugin Page。
 
-- 更广泛的法律硕士赛事来源和跨来源实体解析。
-- 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG 和 dashboard。
-- 更广泛的题库内容和需要用户授权的真实题目数据；本仓库当前不声称拥有完整真题库。
-- 直接接收 QQ 文件附件、旧版 DOC、扫描 PDF/OCR，以及 `real_question_candidate` 到 `verified_real_question` 的专用人工审核流。
-- 扫描源之外的真实题库和真实案例数量取决于运行时导入/抓取结果；仓库不内置未经授权的题库内容。
-- 复杂 LLM 法律通知抽取、完整法规数据库、向量/RAG、特殊 OneBot 消息和 Nexus runtime integration。
+0.5.2 对应的一次隔离式真实客观题资料验收，使用了全新输出目录与空数据库，重新执行文件哈希校验、validator、prepare/confirm 以及导入后检查；报告统计为 445 道题、11 份共享材料、2,781 个结构块，覆盖 198 道单选、203 道多选和 44 道不定项；Q231、Q309 仍保留为未提供/未核验答案，不由模型补写。该验收只说明当次输入与隔离数据库的结果，不代表本仓库内置题库，也不构成真实 QQ、Windows 主机、真实 LLM provider 或官网持续可用性的证明。
 
-## Architecture
+插件支持不等于已提供真实题库或每个方向都有案例。真题库存由操作者依法取得并导入的数据决定；真实案例库存取决于来源扫描结果和已核验分类。仓库不携带真实题库正文。
 
-```text
-Private command ─┐
-LLM Tools ────────┼──> LawAssistantService ──> Source / Extraction ──> SQLite
-Scheduler ────────┘                 └──────> Publisher
-Future Nexus integration (optional) ────────┘
-```
+## 功能概览
 
-四入口共享同一个 `LawAssistantService`；学习资料库通过该 facade 进入独立的 `LibraryService`/`LibraryRepository`。服务与 `AstrMessageEvent` 解耦；Nexus 是可选集成，Law Assistant 独立运行，不读取 Nexus SQLite，也不依赖 Nexus 内部实现。
+- 法律硕士活动扫描、状态筛选、活动详情与多节点时间线；保存来源文档、URL、内容 hash、日期证据和 source run。单个来源失败会隔离记录。
+- 官方案例来源与可选法规更新来源；官方合集会拆分为独立案例条目。已保存官方案例由确定性格式器生成学习卡片；案例缺少匹配方向时严格跳过。
+- DDL 提醒按配置时区的本地日历日计算；新活动自动发布默认关闭，只有满足来源策略、当前状态和已确认截止日期且由管理员预先配置时才运行。
+- 真题、模拟题、候选题、用户案例和官方案例使用不同身份。real_question_candidate 不会自动成为 verified 真题，模拟题不冒充真题；没有可靠答案时不会由 LLM 伪造官方答案。
+- 资料库支持明确请求后的文本归档、来源关联、检索、受限更新；导入支持 TXT、Markdown、DOCX 与可抽取文本的 PDF，不支持旧式 DOC 或扫描件 OCR。
+- Structured Material v1 的 PDF+JSON hash-bound prepare/confirm 导入，保留共享材料、题干、答题要求、小问、答案/解析块、定位和 provenance；导入只产生待复核候选身份。
+- 持久化 Question Session：先显示无答案题面，再由用户分别请求答案与解析；支持长材料/答案分页、多小问、精确 QQ 会话隔离及重启恢复。
+- 活动、题目、案例的人工群发布采用固定正文和目标的 prepare → preview → explicit confirm → send；计划修改也先预览再确认。
+- 每日案例和每日一题是两个独立任务，支持全局默认、目标群覆盖、随机/固定/日期轮换方向；每日题目还单独支持真题/模拟题/随机来源及题型选择/轮换。
+- AstrBot 4.25+ 内嵌 Plugin Page 提供 Overview、Library、Radar、Plans、Targets、History；通过 AstrBot Page Bridge 调用插件 API，不启动独立 Web 服务。
 
-LLM interprets evidence; deterministic code owns truth：来源 URL、原文 hash、日期 evidence、题目来源与核验状态、权限、是否已发布和去重均由代码/持久化状态决定。
+### 尚未实现或不应据此假设已具备
 
-## Compatibility
+- QQ 文件消息直接接收、扫描 PDF/OCR、旧版 Word .doc。
+- real_question_candidate 到 verified_real_question 的专用身份审批/升级工作流。
+- RAG、向量数据库、通用 agent 系统、独立后台服务、Nexus runtime 集成。
+- 覆盖全国的赛事/案例/法规来源、自动化法律研究或完整商业真题库。
+- 特殊 OneBot/QQ 管理能力、独立 dashboard 服务。
 
-目标范围为 `>=4.22.0,<5`，Python `>=3.12`。Windows 会通过 `requirements.txt` 安装 `tzdata`，为 `zoneinfo` 提供 `Asia/Shanghai` 等 IANA 时区数据。CI 使用官方源码 exact commit 验证：
+## 架构与可信边界
 
-- AstrBot v4.22.0 — `81c7b0f7150485beb6124a7ec524a8d8534e7f6e`
-- AstrBot v4.25.0 — `02291a3217c92faa0c577bf9d89076949c40954c`
+    Private command ─┐
+    LLM Tools ────────┼──> LawAssistantService ──> Sources / Extraction / Learning ──> SQLite
+    Scheduler ────────┤                         └──> Publisher
+    Plugin Page ──────┘
+    Future Nexus integration (optional) ───────────> exposed service contract
 
-## Installation
+命令、Tools、Scheduler 和 Plugin Page 共用 LawAssistantService；数据访问由 Storage/Repository 边界负责。插件独立运行，不读取其他插件的 SQLite。Nexus 集成是可选的，目前没有 runtime 依赖。
 
-### WebUI URL install
+LLM interprets evidence; deterministic code owns truth。URL、原文 hash、题目来源、答案来源、权限、幂等键、确认 token 和发布状态由代码及持久化记录决定。LLM 可以帮助理解请求、生成明确标注的模拟题或整理有证据的案例学习卡片，但不能补造官方身份、案情、考试年份、参考答案或未证实日期。
 
-AstrBot WebUI → Plugins → Install from URL：
+## 兼容性、依赖与 LLM
 
-`https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant`
+- 支持范围：AstrBot >=4.22.0,<5，Python >=3.12。
+- CI 使用 AstrBot 官方精确源码 commit：v4.22.0 81c7b0f7150485beb6124a7ec524a8d8534e7f6e，v4.25.0 02291a3217c92faa0c577bf9d89076949c40954c。后者另验证 Page discovery 和 API route contract。
+- AstrBot 4.22–4.24 可使用基础命令、LLM Tools、服务与 Scheduler；内嵌 Plugin Page 要求 AstrBot 4.25+。
+- Python 标准库 SQLite 用于运行时存储；requirements.txt 列出实际运行所需的异步 HTTP、HTML/PDF 解析依赖，并在 Windows 条件安装 tzdata 以提供 zoneinfo IANA 时区数据。安装时以当前文件为准。
+- 资料检索、已存真题/模拟题选择、答案安全 Session 和已存官方案例卡片不需要插件内部 LLM。自然语言控制需要 AstrBot 对话模型能进行 Tool Calling。生成新模拟题及需要模型辅助的内容整理需要可用 provider；llm_provider_id 留空时插件尝试当前会话或宿主默认 provider。provider 不可用时返回不可用，不伪装生成成功。
+
+## 安装、升级与卸载
+
+### AstrBot 插件管理器 / 仓库 URL
+
+在目标 AstrBot 的插件管理界面使用其“从 URL 安装/添加仓库”一类功能，输入：
+
+    https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant
+
+不同 AstrBot 版本的菜单名称可能不同；若当前版本没有 URL 安装入口，使用下方 Git 安装方式。不要把 Plugin Page 与插件安装器混为一谈。
 
 ### Git clone
 
-```bash
-git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.git data/plugins/astrbot_plugin_law_assistant
-```
+在 AstrBot 安装根目录执行（如已有目录，先按部署流程备份/更新，不要覆盖插件运行数据）：
 
-### Plugin ZIP
+    git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.git data/plugins/astrbot_plugin_law_assistant
 
-在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.2.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
+### CI ZIP
 
-完整嵌入式 WebUI 需要 AstrBot `>=4.25`；基础插件功能兼容 `>=4.22.0,<5`。页面认证由 AstrBot Dashboard 提供，插件不建立第二套账号密码系统。
+GitHub Actions 的成功 release-package job 会产生 astrbot_plugin_law_assistant-0.5.2 artifact，其中 ZIP 文件名为 astrbot_plugin_law_assistant-0.5.2.zip。在支持 ZIP 插件安装的管理器中使用该包；若目标版不提供此能力，解压到：
 
-## Configuration
+    {AstrBot 数据目录}/plugins/astrbot_plugin_law_assistant/
 
-配置集中由 `config.py` 解析，完整字段见 `_conf_schema.json`。
+确保 metadata.yaml 直接位于插件目录根部，而不是重复嵌套一层目录。ZIP 只含插件代码/静态资源，不含现有配置或运行数据库。
 
-- `operator_ids`：可私聊执行管理操作的 QQ 用户 ID；AstrBot Admin 同样有效。
-- `timezone`：默认 `Asia/Shanghai`。
-- `auto_scan_enabled`：默认 `false`；开启后 scheduler 扫描活动、案例/法规来源和提醒。
-- `daily_case_enabled` / `daily_question_enabled`：独立开启每日案例或每日题 scheduler；不要求同时开启活动扫描。
-- `extra_event_source_urls`：可选活动通知列表页。
-- `case_source_court_enabled` / `case_source_spp_enabled`：官方案例来源开关。
-- `law_update_enabled`：法规更新来源开关，默认关闭。
-- `auto_publish_events`：默认关闭；只有管理员明确配置后才自动发布。
-- `radar_source_policies`：按来源分别控制 `discover_enabled` 与 `auto_publish_enabled`；停用发现不会抓取或删除已有历史活动。
-- `deadline_reminder_days` / `deadline_same_day_enabled`：DDL 提醒策略。
-- `llm_provider_id`：可选；留空按当前会话或宿主默认 provider。
-- `daily_question_origin` / `daily_question_subject` / `daily_question_type`：全局每日一题默认来源、方向和题型，默认均为随机。
-- `question_message_max_chars`：互动题目每条消息的长度预算，默认 1600，限制在 300–4000；长题干和材料会按页继续展示。
-- `daily_question_type_selection_mode`、`daily_question_fixed_type`、`daily_question_rotation_types`、`daily_question_type_rotation_start_date`、`daily_question_type_rotation_start_index`：每日一题独立的题型模式；方向轮换与题型轮换分别按本地日期计算。
-- 若旧配置只有 `daily_question_type`，继续按固定题型解释；一旦明确设置新的题型模式，`random` 或 `rotation` 优先，旧固定字段不会覆盖新模式。`rotation` 必须提供有效题型列表。
-- `daily_case_selection_mode`、`daily_question_selection_mode`：`random`、`fixed` 或 `rotation`。
-- `*_rotation_subjects`、`*_rotation_start_date`、`*_rotation_start_index`：案例和题目各自独立的有序轮换列表及起点。
+### 升级
 
-选择 `rotation` 并留空起始日期时，首次启用会按配置时区当天建立持久化锚点；之后重启不会重新计算，案例和题目分别保存。明确填写的新起始日期及已确认的群级/全局计划优先。
+1. 停止或按 AstrBot 正常插件更新流程卸载当前代码前，备份运行时 SQLite、AstrBot 配置和 imports/、assets/ 用户文件。
+2. 备份位置应在插件数据目录之外，并确认备份可读取。
+3. 更新插件文件，不要用安装包覆盖或删除 data/plugin_data/astrbot_plugin_law_assistant/。
+4. 启动/重新加载插件，检查 /law status；SQLite 会按顺序执行兼容迁移，当前 schema 为 v12。
+5. 若数据库迁移或启动失败，停止反复重载，保留日志和原备份以便恢复。
 
-内置学校四方向预设的顺序是：知识产权 → 民商法 → 司法实务 → 经济法。预设不是默认行为，需在配置或确认计划变更时主动应用。
+卸载插件代码不会自动意味着可以安全删除 data/plugin_data/astrbot_plugin_law_assistant/。该目录包含数据库、用户导入原件、资料及会话，只有确认不再需要并单独备份后才由管理员手动清理。
 
-群级计划保存于运行时 SQLite：群级有明确值时只覆盖对应群、对应内容类型；未覆盖的内容类型继续继承全局默认。计划变更必须先预览，再使用确认 token 保存。
+## 快速开始
 
-每日案例和每日一题的 scheduler 会分别按目标群读取成功发送历史，只排除该群、该内容类型中已经成功发送的 `(source_kind, source_item_key)`；失败或跳过记录不会消耗库存，不同来源即使整数 ID 相同也不会互相排除。手动查询和“刚才这条内容”的发布引用不受该历史过滤影响。
+1. 在 AstrBot 安装插件，设置 operator_ids（QQ 用户 ID 列表）；AstrBot Admin 也具管理权限。
+2. 重启或重新加载插件，私聊机器人执行 /law status。
+3. 管理员在目标群执行 /law bind 法硕一群，为多个群分别绑定。不要把群名当作 UMO；私聊绑定必须显式提供 /law bind-umo {真实 unified_msg_origin} [群别名]。
+4. 私聊试用 /law events current、/law deadlines、/law question random。
+5. 人工发布时先准备预览，再检查群名、目标和正文，最后确认 token；不要在生产群做未审查的发送测试。
+6. 默认自动扫描、活动发布、每日案例和每日一题均关闭。先准备可信来源/内容、确认群绑定及授权策略，再按需启用。
 
-运行时数据库只写入：
+## 权限与会话范围
 
-```text
-data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
-```
+- 管理查询、扫描、题目/案例选择、资料库访问/修改、计划管理和群发布 Tool 要求私聊，并校验 AstrBot Admin 或配置的 operator_ids。
+- 群聊中的 /law bind、bind-umo、unbind、rename 仅供 Admin/operator 管理当前群/绑定目标。
+- Question Session 的 current、next、next-question、answer、next-answer、explanation、next-explanation 可由该精确 QQ 会话中的参与者使用；它们只能操作此会话的快照。close 仍要求管理员/operator。
+- 多个群目标时，“发到群里”不会默认扩展到所有群；须明确选目标。未绑定或有歧义的名字不会猜测成 UMO。
+- 其他管理 Tool 不因由 LLM 发起而绕过权限检查。
 
-当前 schema version 为 `12`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系，v10→v11 增加按 QQ 会话隔离的题目快照与揭晓事件，v11→v12 增加真题身份 v2 和历史 `answer_source` 规范化；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时 SQLite；安装包不覆盖现有数据库。
+## 配置参考
 
-### 结构化资料导入
+配置由 config.py 集中解析，AstrBot UI schema 为 _conf_schema.json。以下为完整 41 个 schema 字段及默认值；群级每日任务计划保存在插件 SQLite，通过计划管理工具/Plugin Page 修改，不是第二份配置 schema。
 
-准备一个原始 PDF 和一份符合 `docs/structured-material-v1.md` 的 JSON。JSON 的 `document.original_file_sha256` 必须等于原始 PDF 的 SHA-256。Plugin Page → 资料库 → 文件导入 → 结构化资料导入会分别 staging 两个文件，后端显示题目、材料、块、小问、答案状态、定位和 fatal/error/review 统计；确认前不会写 SQLite，任一文件或 JSON 内容变化都会使 token 失效。
+| 字段 | 类型 / 默认值 | 作用 |
+| --- | --- | --- |
+| operator_ids | list[string] / [] | 可私聊操作的 QQ 用户 ID；AstrBot Admin 仍有效。 |
+| timezone | string / Asia/Shanghai | 活动日期和 Scheduler 使用的 IANA 时区；无效值回退至默认时区。 |
+| auto_scan_enabled | bool / false | 自动扫描及相关 DDL 检查总开关。 |
+| scan_interval_minutes | int / 60，5–1440 | 自动扫描间隔分钟数。 |
+| llm_provider_id | string / "" | 可选 provider ID；空值时按当前会话/宿主默认 provider 解析。 |
+| extra_event_source_urls | list[string] / [] | 额外通知列表页 URL；按来源适配器允许的主机约束校验。 |
+| radar_keywords | list[string] / [] | 活动识别的附加关键词。 |
+| radar_action_keywords | list[string] / [] | 报名/投稿/参与动作的附加关键词。 |
+| radar_historical_keywords | list[string] / [] | 历史、结果类信号附加关键词。 |
+| radar_auto_publish_sources | list[string] / [] | 允许自动发布的额外来源 key；仍受发布规则约束。 |
+| radar_source_policies | list[object] / [] | 每来源设置 key、display_name、discover_enabled、auto_publish_enabled。 |
+| auto_publish_events | bool / false | 活动自动发布总开关；需由操作者预授权。 |
+| deadline_reminder_days | list[int] / [7,3,1] | 截止日前提醒天数。 |
+| deadline_same_day_enabled | bool / true | 是否发送 DDL 当日提醒。 |
+| daily_case_enabled | bool / false | 全局每日案例默认启用状态。 |
+| daily_case_time | string / 08:00 | 每日案例本地发送时间 HH:MM。 |
+| daily_case_selection_mode | string / random | 案例方向模式：random、fixed、rotation。 |
+| daily_case_subject | string / "" | 案例固定方向；空值由随机/轮换模式决定。 |
+| daily_case_rotation_subjects | list[string] / [] | 案例方向轮换的有序规范方向 ID。 |
+| daily_case_rotation_start_date | string / "" | 案例轮换锚点 YYYY-MM-DD；首次启用会按配置时区持久化。 |
+| daily_case_rotation_start_index | int / 0，最小 0 | 案例轮换起始列表下标。 |
+| daily_case_card_max_chars | int / 1800，600–5000 | 每日案例卡片上限；超限跳过而非截断证据内容。 |
+| daily_question_enabled | bool / false | 全局每日一题默认启用状态。 |
+| question_message_max_chars | int / 1600，300–4000 | 题面、选项、答题要求、答案/解析消息的字符预算。 |
+| daily_question_time | string / 08:00 | 每日一题本地发送时间 HH:MM。 |
+| daily_question_selection_mode | string / random | 题目方向模式：random、fixed、rotation。 |
+| daily_question_origin | string / random | 每日题来源：real、mock、random。 |
+| daily_question_subject | string / "" | 题目固定方向；空值由方向模式决定。 |
+| daily_question_type | string / "" | 旧兼容字段；未显式指定新题型模式时，非空值表示固定题型。 |
+| daily_question_type_selection_mode | string / random | 独立题型模式：random、fixed、rotation。 |
+| daily_question_fixed_type | string / "" | 新模式下的固定题型。 |
+| daily_question_rotation_types | list[string] / [] | 题型轮换有序列表。 |
+| daily_question_type_rotation_start_date | string / "" | 题型轮换锚点；留空首次启用按本地日期持久化。 |
+| daily_question_type_rotation_start_index | int / 0，最小 0 | 题型轮换起始下标。 |
+| daily_question_rotation_subjects | list[string] / [] | 题目方向轮换有序列表。 |
+| daily_question_rotation_start_date | string / "" | 题目方向轮换锚点；留空首次启用按本地日期持久化。 |
+| daily_question_rotation_start_index | int / 0，最小 0 | 题目方向轮换起始下标。 |
+| case_source_court_enabled | bool / true | 最高人民法院案例来源开关。 |
+| case_source_spp_enabled | bool / true | 最高人民检察院案例来源开关。 |
+| law_update_enabled | bool / false | 可选法律更新来源开关。 |
+| http_timeout_seconds | int / 20，5–120 | 单次异步 HTTP 请求超时秒数。 |
 
-结构化题目默认只是 `real_question_candidate` / `pending_review`，不会进入 `origin=real` 的核验真题库存。原始文件和 JSON 会保存在插件数据目录的 `assets/` 与 `imports/` 下，来源 hash、创建者、会话、PDF 定位和 JSON payload 均保留。真实题库内容必须由用户依法取得并逐题核验；仓库不内置题库，也不把 PDF 提交到 Git。
+标准方向 ID：criminal_law、criminal_procedure、civil_law、commercial_law、civil_procedure、intellectual_property、constitutional_administrative、civil_commercial、judicial_practice、economic_law、other；支持代码定义的中文别名（如刑法、刑诉、民法、商法、民诉、知产、宪法与行政法、民商法、司法实务、经济法、其他）。其中 civil_commercial 的检索可匹配 civil_law 与 commercial_law。题型 ID：single_choice、multiple_choice、indefinite_choice、true_false、short_answer、case_analysis。不要填写未支持的枚举。
 
-该数据库、凭据、API key、QQ token、日志和缓存均不进入 Git。
+轮换使用时区本地日期、独立起始日期和有序列表确定方向/题型；不是“每成功发送一次递增”的内存计数。每日案例、每日题方向、每日题型的锚点互相独立。空的起始日期在第一次启用时建立持久锚点；如果没有符合明确方向、来源或题型的库存，严格跳过并记录原因。
 
-## Commands and LLM Tools
+学校四方向预设顺序为 intellectual_property → civil_commercial → judicial_practice → economic_law，对应知识产权、民商法、司法实务、经济法。它不自动启用，也不是所有群的默认配置。
 
-管理命令需要 AstrBot Admin 或 configured operator。扫描、查询、发布和确认要求私聊；`bind`/`unbind`/`rename` 可由管理员或 operator 在群聊中操作当前会话目标。DDL 提醒使用配置时区的本地日历日期。
+群级配置若有明确值，仅覆盖该群、该内容类型的相应设置；未覆盖的值继承全局计划。计划修改通过 prepare → preview → confirm 保存。暂停案例不改变每日一题，反之亦然。
 
-```text
-/law status
-/law scan
-/law events
-/law event <id>
-/law deadlines
-/law sources
-/law targets
-/law bind [当前群别名]
-/law bind-umo <unified_msg_origin> [群别名]
-/law unbind [unified_msg_origin]
-/law rename <目标群名或 ID> <新别名>
-/law publish <id>
-/law confirm <token>
-/law case [方向]
-/law question [real|mock|random] [方向] [题型]
-/law study <资料库题目ID>
-/law current
-/law next
-/law next-question
-/law answer
-/law next-answer
-/law explanation
-/law next-explanation
-/law close
-/law import <imports目录相对路径> [case|mock_question|real_question_candidate]
-/law plans [群名]
-/law question-import <JSON路径>
-/law review [来源ID]
-/law review-get <待复核ID>
-/law review-status <待复核ID> <pending|resolved|superseded>
-/law case-tag <案例ID> <方向...>
-/law laws
-/law help
-```
+## /law 命令
 
-群内 `/law bind 法硕一群` 会把当前群的真实 `unified_msg_origin` 与别名一起保存；私聊绑定其他目标必须使用明确的 `/law bind-umo <unified_msg_origin> [群别名]`，插件不会根据群名猜 UMO。已绑定群可用 `/law rename <目标群名或 ID> <新别名>` 改名，或在当前群使用 `/law rename <新别名>`。
+所有命令以 /law 开始，命令解析忽略大小写。大多数管理命令必须私聊并由 Admin/operator 使用。{...} 表示参数，[...] 表示可选参数。
 
-自然语言可以直接说“给我一道知识产权真题多选题”“给我一个刑法案例”“把这道题发到一群和二群”“看看未来七天一群的安排”。`law_get_daily_case` 与 `law_generate_question` 返回短期、绑定操作者和私聊会话的 `content_ref`；随后发布 Tool 传入该引用即可发布刚才看到的同一条内容，不会重新随机或生成。若明确要求重新出题，则不传引用。所有 Tool 仍执行私聊、Admin/operator 权限检查。
+| 子命令 | 示例/用途 | 访问与副作用 |
+| --- | --- | --- |
+| status | /law status | 私聊 Admin/operator；只读运行状态。 |
+| scan | /law scan | 私聊 Admin/operator；立即触发已配置来源扫描。 |
+| events | /law events current competition、/law events historical | 私聊；按状态/类型/关键词查询，默认 current。状态：current、needs_review、historical、all；review 可指 needs_review。 |
+| event | /law event 12 | 私聊；查询活动详情。 |
+| deadlines | /law deadlines | 私聊；按配置时区查询提醒相关截止节点。 |
+| sources | /law sources | 私聊；来源状态/抓取运行信息。 |
+| targets | /law targets | 私聊；查看绑定发布目标。 |
+| bind | 群内 /law bind 法硕一群 | Admin/operator；把当前群真实 UMO 与别名绑定。私聊不接受猜测群名。 |
+| bind-umo | /law bind-umo {真实UMO} [别名] | 私聊 Admin/operator；明确绑定给定 UMO。 |
+| unbind | 群内 /law unbind；私聊 /law unbind {真实UMO} | Admin/operator；解除指定/当前绑定目标。 |
+| rename | 群内 /law rename 法硕学习群；私聊 /law rename 一群 法硕学习群 | Admin/operator；只改目标别名，不更改 UMO。 |
+| publish | /law publish {event_id} [目标别名/ID...] | 私聊；准备活动发布，返回固定正文和目标预览，不立即发送。多群时必须明确目标。 |
+| confirm | /law confirm {token} | 私聊；确认此前的短期发布预览。token 锁定操作者、正文和目标，不能重复使用。 |
+| case | /law case [方向] | 私聊；获取当日/匹配案例学习内容，不在群内发送。 |
+| question | /law question [real / mock / random] [方向] [题型] | 私聊；按条件选择/生成题目并开启当前私聊 Session；省略项按产品规则随机。非法显式筛选报错。 |
+| study | /law study {资料库题目ID} | 私聊 Admin/operator；打开已存模拟题或候选题 Session；身份标签保持原状。 |
+| current | /law current | Session 当前精确会话；查看当前题面及当前小问揭晓状态。 |
+| next | /law next | Session 当前精确会话；继续阅读当前题面/材料的下一页。 |
+| next-question | /law next-question | Session 当前精确会话；进入下一独立小问。 |
+| answer / next-answer | /law answer、/law next-answer | Session 当前精确会话；显式揭晓当前小问答案/答案续页。 |
+| explanation / next-explanation | /law explanation、/law next-explanation | Session 当前精确会话；单独揭晓解析/解析续页。 |
+| close | /law close | Admin/operator；关闭当前精确会话。 |
+| import | /law import {imports内相对路径} [auto / case / mock_question / real_question_candidate] | 私聊 Admin/operator；从插件 imports 受控目录立即归档；不能给任意绝对路径。 |
+| plans / plan | /law plans [目标别名/ID] | 私聊；只读查看全局/群级每日计划与安排。 |
+| question-import / import-questions | /law question-import "{JSON路径}" | 私聊 Admin/operator；导入用户依法取得且经核验的真题 JSON，返回新增数与库存。带空格路径应加引号。 |
+| case-tag | /law case-tag {案例ID} {方向...} | 私聊 Admin/operator；设置案例人工方向标签。 |
+| review | /law review [来源ID] | 私聊 Admin/operator；列待复核项目，安全题目视图不含答案/解析/原始完整片段。 |
+| review-get | /law review-get {复核ID} | 私聊 Admin/operator；读取安全复核详情。 |
+| review-status | /law review-status {ID} {pending / resolved / superseded} | 私聊 Admin/operator；更新复核队列状态；resolved 不等于核验真题身份升级。 |
+| laws | /law laws | 私聊；只读查看已保存的法规更新。 |
+| help | /law help | 显示简要命令帮助。 |
 
-每日案例和每日一题的方向、题型与来源约束由同一个日期解析器计算，但两项任务完全独立。`random` 使用稳定的日期/目标哈希；`rotation` 使用配置时区的日历日期、各自的起始日期和有序列表；没有匹配内容时严格跳过并记录原因，不静默换方向、题型或来源。计划预览不会生成内容，确认后才保存。
+参数形式以当前仓库 CLI parser 为准；常用中文题型别名包括单选、多选、不定项、判断、简答、案例分析。发布目标名若重名，应使用唯一别名或 ID 消除歧义。
 
-题目和案例的实际群发送统一为：选择内容 → 选择目标 → 固定正文预览 → 明确确认 → 发送。确认阶段不重新调用 LLM、不重新随机选择，也不会扩大预览中的目标群。
+活动类型筛选可使用 competition、call_for_submissions、forum、training、internship、activity、moot_court、conference、recruitment；未写类型时可将剩余词作为关键词。题目来源 random 的候选为真实已核验题与模拟题；real_question_candidate 不属于其中的真题库存。
 
-可用 Tools 包括：`law_status`、`law_scan_events`、`law_list_events`、`law_get_event`、`law_list_deadlines`、`law_get_daily_case`、`law_generate_question`、`law_study_question`、`law_question_session`、`law_question_inventory`、`law_archive_learning_material`、`law_import_learning_document`、`law_search_learning_library`、`law_get_learning_item`、`law_update_learning_item`、`law_list_targets`、`law_rename_target`、`law_get_daily_plans`、`law_prepare_publish_event`、`law_prepare_publish_question`、`law_prepare_publish_case`、`law_confirm_publish`、`law_prepare_daily_plan_update`、`law_confirm_daily_plan_update` 和 `law_list_law_updates`。`law_generate_question` 与题目类 `law_get_learning_item` 返回答案隔离会话；`law_question_session` 的 action 为 `current`、`next`、`next-question`、`answer`、`next-answer`、`explanation`、`next-explanation` 或 `close`。
+## 自然语言与 LLM Tools
 
-### 学习资料库
+可以在私聊中说“看看最近有哪些法硕比赛”“给我一道知识产权真题多选题”“给我一个司法实务案例”“把刚才这道题发到法硕一群”“显示一群未来七天案例和题目计划”。LLM 负责把意图映射为结构化参数；插件继续做权限、方向/类型校验、证据检查和目标锁定。
 
-只有用户明确说“收藏”“保存”“归档”“加入题库”或“记下来”时，Agent 才应调用 `law_archive_learning_material`。用户提供的原文会原样保存到同一个 SQLite 数据库，并与 Agent 整理出的摘要、争议焦点、题干、选项或学习要点分开保存。
+题目/案例读取 Tool 可返回短期 content_ref；“把刚才那道题发到群里”通过引用锁定相同内容，“重新出一道题再发”则需明确选择新内容。发布流程先预览，确认时不会重新生成或随机选择。长期计划变更必须预览并确认。
 
-资料身份由后端确定：普通案例为 `user_case`，未核验题目为 `real_question_candidate`，原创练习题为 `mock_question`。Tool 不能创建 `official_case` 或 `verified_real_question`，也不会因为 structured JSON 中出现 `official` 或 `verified` 就提升身份。现有 verified 真题 JSON 导入路径继续独立运行。
+当前注册的 25 个 Tools：
 
-`law_search_learning_library` 支持标题、原文、摘要、题干、学习要点和方向的普通文本查询；`law_get_learning_item` 对非题目返回资料详情，对题目则打开答案隔离的学习会话；`law_study_question` 可显式开始学习模拟题或 `real_question_candidate`，候选题仍标记“待人工核验”。`law_update_learning_item` 只允许修改标题、方向、备注、案例学习要点或题目解析，不能修改创建者、来源 hash 或核验身份。相关 Tools 都要求私聊及 AstrBot Admin/operator 权限。
+| Tool | 用途 |
+| --- | --- |
+| law_status | 助手状态。 |
+| law_scan_events | 触发来源扫描。 |
+| law_list_events | 按状态、类型和关键词查询活动。 |
+| law_get_event | 活动详情。 |
+| law_list_deadlines | 截止日期列表。 |
+| law_get_daily_case | 按方向获取案例学习内容并返回可复用引用。 |
+| law_generate_question | 按来源/方向/题型获取或生成题目。 |
+| law_study_question | 按资料库 ID 开启候选/模拟题学习。 |
+| law_question_session | 当前 Session 的题面续读/答案/解析/切换/关闭动作。 |
+| law_question_inventory | 查看真题库存与覆盖情况。 |
+| law_archive_learning_material | 用户明确要求后收藏学习资料。 |
+| law_import_learning_document | 从受控资料目录导入文档。 |
+| law_search_learning_library | 搜索资料库。 |
+| law_get_learning_item | 读取资料；题目使用答案安全边界。 |
+| law_update_learning_item | 修改允许的标题/方向/备注/学习字段。 |
+| law_list_targets | 查看绑定群及任务配置。 |
+| law_rename_target | 受控修改目标别名。 |
+| law_get_daily_plans | 查看当前/未来计划。 |
+| law_prepare_publish_question | 准备指定题目的发布预览。 |
+| law_prepare_publish_case | 准备案例发布预览。 |
+| law_prepare_daily_plan_update | 准备长期每日任务计划变更。 |
+| law_confirm_daily_plan_update | 确认已预览的计划变更。 |
+| law_list_law_updates | 查询法规更新。 |
+| law_prepare_publish_event | 准备活动发布预览。 |
+| law_confirm_publish | 确认一次性发布。 |
 
-#### 互动题目会话
+Tool 注册不等于已验证任意表达下的真实模型理解效果。真实自然语言 Tool Calling 还依赖 AstrBot 会话模型和 provider 配置。
 
-题面、共享材料、选项和原文答题要求先展示；不会把答案或解析包含在初次 Tool 返回、手动群发布预览或每日一题消息中。使用 `/law answer` 或自然语言明确要求答案后才显示当前小问答案；`/law explanation` 单独显示来源解析。若来源没有可靠答案/解析，会明确提示不可用，不调用 LLM 猜答案。
+## 活动雷达与 DDL
 
-题面、选项、答题要求、答案和解析按最终消息长度预算分页，标题、进度、来源和续读提示均计入 `question_message_max_chars`。长材料或题面使用 `/law next` 续读；答案分页使用 `/law next-answer`，解析分页使用 `/law next-explanation`，不会把答案续页误认为题面续读；`/law next-question` 进入下一独立小问。结构化多小问题会先展示公共题干，再展示当前小问及其专属答题要求，公共题干不会在小问中重复。`/law current` 显示当前小问各自的答案/解析揭晓状态，`/law close` 结束会话。新题只 supersede 相同 `unified_msg_origin` 的活动会话，不覆盖其他聊天；会话快照、页码和按小问记录的答案/解析揭晓事件持久化在插件 SQLite。`real_question_candidate / pending_review` 可由 operator 手动学习，但绝不进入 `origin=real` verified inventory。
+活动通过来源适配器抓取原始文档，再做规则优先的提取、验证、确定性 upsert 和 SQLite 持久化。内置活动来源聚焦 China-JM 通知列表；extra_event_source_urls 仅提供额外同主机通知列表入口。实际可用范围取决于官网结构和网络/TLS。
 
-### 真题导入格式
+雷达状态根据证据和配置本地时钟呈现 current、needs_review、historical；普通“当前活动”查询不会把历史通知伪装成有效报名。时间线区分报名截止、投稿截止、初赛/复赛/决赛、结果等节点。未确认的 LLM 日期不会驱动正式提醒或自动发布。
 
-管理员可在私聊执行 `/law question-import <path>`，导入用户合法取得且已核验的 JSON；带空格的路径请使用引号。文件可以是数组，也可以是 `{ "questions": [...] }`。每条记录至少需要：`source_name`、`exam_name`、`subject`、`question_type`、`stem`，以及 `source_url`、`source_locator` 或 `question_number` 之一；还必须明确 `verification_status` 为 `verified`、`official` 或 `user_verified`。导入命令会返回新增数量和当前库存；仓库不内置伪造或未经授权的真题。
+启用 auto_scan_enabled 才会运行周期扫描和提醒检查。自动发布另受 auto_publish_events、来源发现/发布策略、当前状态、确认截止日期与幂等规则共同限制；默认不自动发群。可通过 /law scan 手动触发一次扫描，通过 /law events current、/law deadlines 和 /law sources 查询。
 
-自然语言修改每日计划时，服务会先返回作用群、案例/题目范围、来源/题型、方向模式及未来安排预览，只有明确确认后才保存。计划的参数若明确提供了不支持的方向、题型、来源或选择模式会直接报错，不会静默改成随机；rotation 未提供起始日期时按配置时区的当天日期起算。案例与每日一题分别持有自己的全局默认和群级覆盖，暂停一项不会停止其他群或另一种内容。
+## 群目标、预览与发布
 
-```json
-{
-  "questions": [
+群内 /law bind {别名} 从当前真实消息会话读取 UMO。私聊新增目标需已知、明确的 UMO；系统不根据别名构造群地址。别名用于用户选择，UMO 是实际路由标识。多个目标时必须明确指定具体目标；“所有群”也必须由操作者明确表达。
+
+人工发布流程：
+
+1. 查询或选择一条活动/题目/案例。
+2. 指定已绑定目标；有歧义时先消歧。
+3. 插件固定内容正文和目标 ID，生成预览及短期确认 token。
+4. 操作者审阅预览后显式确认。
+5. 仅向预览时锁定的目标发送；确认不重新调用 LLM、不重新抽取内容、不扩大目标。
+
+token 绑定操作者并限时、一次性。目标失效、token 过期、重复确认或发送部分失败会作为失败/部分结果返回，不把部分成功伪装成全成功。自动 Scheduler 发送仅能依预先配置授权策略执行。
+
+## 每日案例、每日一题与计划
+
+两类计划单独启停、定时、轮换和记录；一个任务失败、暂停或缺货不会推动或阻止另一个任务。同一群、同一天、同一内容类型幂等。scheduler 默认关闭；单独启用每日任务即可按计划唤醒，不要求自动扫描也开启。
+
+- 案例方向：random / fixed / rotation；只从真实官方案例库选择。缺匹配案例则跳过，不用模型编造真实案例。
+- 每日题方向：random / fixed / rotation；来源 real / mock / random；题型模式也独立为 random / fixed / rotation。显式约束组合必须全部满足；缺少符合条件库存则跳过，不能静默切换来源、方向或题型。
+- 轮换采用配置时区的本地日期、列表、起始日期和起始位置计算。每日案例、每日题方向、每日题型的锚点互相独立。起始日期空值在首次启用时建立持久化锚点；插件重启、漏发某日或重试都不会造成内存索引漂移。
+- 全局默认适用于无群级覆盖的绑定目标；目标的群级明确值只覆盖对应任务字段。学校四方向预设可用于案例、题目分别配置，也可自定义顺序/列表。预览可查看未来日期安排；长期变更确认前不持久化。
+- 每日题/案例的自动正文分别走安全题目 renderer/案例卡片。题目发布先不含答案；用户在目标群会话中明确请求后再揭晓。不同目标拥有独立的已发送身份历史。
+
+典型计划示例：每日案例轮换 知识产权 → 民商法 → 司法实务 → 经济法；每日题目方向采用另一列表，题目来源仍可独立设为 random，题型采用单独轮换。没有真实内容的轮换日会被跳过并记录，而非替换方向。
+
+## 学习资料库、来源身份与检索
+
+主要身份包括：
+
+| 身份 | 说明 |
+| --- | --- |
+| verified_real_question / 已核验真题 | 只由经过核验且有来源记录的专用真题导入进入真题库存。 |
+| mock_question | AI 原创练习，明确标记模拟题；持久库存可复用。 |
+| real_question_candidate | 结构化导入或用户提供的待核验题目；只能被明确学习，不等于真题库存。 |
+| official_case | 经受信最高法/最高检来源路径采集的真实案例。 |
+| user_case / note | 用户归档内容或普通笔记，不自动变成官方案例。 |
+
+资料记录保留 created_by、原始来源、URL/hash、分类与整理结果。相同原文可复用 Source 记录，但不同条目的方向、备注、摘要等不因去重而覆盖。读、搜、改均经过现有 operator/Admin 权限校验。
+
+题目 safe detail/search 不暴露隐藏答案、解析、原始完整 JSON 或源文；结构化题目搜索面向标题、题干、选项、答题要求、小问和关联材料，不以隐藏答案建立搜索旁路。题目通过 Question Session 显式揭晓。非题目资料可返回受限详情。资料更新字段由 LibraryService 白名单控制。
+
+## 普通文档导入
+
+支持 TXT、Markdown、DOCX 和文本可抽取的 PDF。扫描 PDF 可能无法提取文字，本插件没有 OCR；不支持 .doc。解析保留可得的页码/段落/行号 locator，模糊内容需要复核，不自动生成官方身份或答案。
+
+传统导入命令只接受插件数据目录下 imports/ 的相对文件路径：
+
+    /law import {相对路径} [auto|case|mock_question|real_question_candidate]
+
+示例：/law import reading/contract.md。不会执行宏或将绝对路径开放给 Tool。Plugin Page 上传先进入插件 staging 目录，显示提取和分类预览，确认后才归档；取消/未确认不会写入资料条目。普通文件当前上限为 20 MiB、PDF 200 页、提取文本 600,000 字符、最多拆分 100 个候选条目；超限时拒绝/报告，不应通过绕过限制导入。
+
+## Structured Material v1：PDF 与 JSON 成对导入
+
+该格式是候选资料交换契约，不是官方身份声明。规范详见 docs/structured-material-v1.md。Schema 固定为字符串 "1.0"；prepare 同时校验原 PDF 字节 SHA-256、JSON 原文 hash 与规范化 payload hash，confirm 使用同一快照。请先阅读 validator 预览中的 fatal/error/review、材料、小问、答题要求、locator 与答案来源，再确认。
+
+下面是虚构结构骨架，不是题目示例，也不能原样作为真实导入；64 个零仅是 hash 占位符，必须替换为原 PDF 的真实 SHA-256：
+
     {
-      "source_name": "用户合法取得题库",
-      "exam_name": "某考试试卷",
-      "exam_year": "2024",
-      "paper": "专业课",
-      "question_number": "1",
-      "source_url": "https://example.test/question/1",
-      "subject": "知识产权",
-      "question_type": "多选",
-      "stem": "题干",
-      "options": ["A", "B", "C", "D"],
-      "answer": ["A"],
-      "answer_source": "official",
-      "verification_status": "verified"
+      "schema_version": "1.0",
+      "document": {
+        "title": "synthetic fixture",
+        "source_type": "synthetic_fixture",
+        "original_filename": "fixture.pdf",
+        "original_file_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "preparation_method": "mixed",
+        "verification_status": "pending_review"
+      },
+      "materials": [
+        {"id": "M1", "title": "fixture material", "blocks": [
+          {"id": "M1-B1", "order": 1, "kind": "paragraph", "text": "synthetic material only", "locator": "PDF第1页", "provenance": "source_text"}
+        ]}
+      ],
+      "questions": [
+        {
+          "id": "Q1", "source_number": "Q1", "question_type": "single_choice",
+          "material_refs": ["M1"], "stem_blocks": [],
+          "options": [{"key": "A", "text": "synthetic option"}],
+          "subquestions": [], "answer_requirements": [],
+          "answer": {"keys": ["A"], "status": "provided", "provenance": "source_text"},
+          "answer_status": "provided", "explanation_blocks": [],
+          "locators": ["PDF第1页"], "verification_status": "pending_review"
+        }
+      ],
+      "cases": []
     }
-  ]
-}
-```
 
-插件会保存题目 hash、来源定位和答案身份；没有可靠答案时只显示“未提供”，不让模型猜成官方答案。当前仓库没有随代码提交真实题库，安装后真题数量取决于管理员导入的数据。
+可用题型：single_choice、multiple_choice、indefinite_choice、true_false、short_answer、case_analysis。materials 保存共享事实/材料；Question 的 stem_blocks 保存顶层问题；真正独立的小问才放 subquestions；评分和作答规范放 answer_requirements。答案和解释与题面分开，保留 locator、provenance。JSON 中声称 official/verified 不授予该身份。
 
-### Embedded Plugin Page
+确认导入后，题目身份是 real_question_candidate，验证状态 pending_review；它不会进入 /law question real 的核验真题库存。候选题可由有权限的操作者显式学习，屏幕上仍会标明候选身份。官方案例身份只由受信 source adapter 路径确定。
 
-AstrBot 4.25+ 的插件详情页会发现 `pages/law-assistant/index.html`。页面包含总览、资料库搜索/详情/允许字段更新、文件导入、待复核队列、活动雷达详情、每日计划编辑与未来 14 天预览、群目标改名/解绑、运行记录六个区域。资料上传只接受 `.txt`、`.md`、`.docx` 和文本型 `.pdf`，先进入插件数据目录的 `imports/` staging，再由后端生成候选预览，点击确认后才写入 Library。扫描 PDF、旧版 `.doc`、OCR 和 QQ 文件附件仍需后续实机能力。
+## 已核验真题 JSON 导入
 
-所有 Web API 使用稳定的 `{ "success": true, "data": ... }` 或 `{ "success": false, "error": ..., "message": ... }` 返回格式；计划、导入、恢复全局覆盖和解绑目标均遵守 prepare → preview → confirm。页面不自行计算轮换、不提升真题或官方案例身份，也不返回任意 SQL 或文件执行接口。
+专用真题导入与 Structured Material 候选导入是不同路径。操作者必须拥有使用权并逐项核验来源；本仓库不提供任何真实真题正文。私聊执行：
 
-### 受控文档导入与官方案例拆分
+    /law question-import "/path/to/verified questions.json"
 
-先将文件复制到运行时目录：
+也接受 /law import-questions 别名。文件可以是 JSON 数组或 { "questions": [...] }。每项至少提供 source_name、exam_name、方向 subject、question_type、原题 stem，并提供可定位来源（source_url、source_locator 或 question_number）；verification_status 必须明确为实现接受的 verified 类状态（verified、official 或 user_verified）。答案来源通过 answer_source 标出，例如 official、third_party、user_verified、unverified 或 not_provided；必须依据数据实际证据填写，不要把 AI 生成解析填成官方答案。没有可靠答案时留空/标明 not provided，不猜测。
 
-```text
-data/plugin_data/astrbot_plugin_law_assistant/imports/
-```
+结构示意（全部字段和值均为占位，不是真实题目）：
 
-然后在管理员私聊执行，例如：
+    {
+      "questions": [
+        {
+          "source_name": "licensed source label",
+          "exam_name": "verified exam title",
+          "exam_year": "YYYY",
+          "paper": "paper locator",
+          "question_number": "question locator",
+          "source_url": "https://source.example/item",
+          "source_locator": "page/section locator",
+          "subject": "criminal_law",
+          "question_type": "single_choice",
+          "stem": "〔占位：由用户依法提供的原题文本〕",
+          "options": ["A. 〔选项占位〕", "B. 〔选项占位〕"],
+          "answer": "A",
+          "answer_source": "official",
+          "explanation": "",
+          "verification_status": "verified"
+        }
+      ]
+    }
 
-```text
-/law import "试卷 with spaces.txt" real_question_candidate
-/law import "官方案例合集.docx" case
-```
+命令会校验并返回导入计数及库存覆盖信息；身份键确定性去重并可更新同一题定位的记录。重复导入不是版权许可，也不代表插件核实了用户的判断。请保留原许可和来源记录。真题全文存储/群发前须自行确认授权条件。
 
-`auto` 会根据题号或案例标题尝试确定类型；对无法可靠确定边界的片段会保留原件并标记 `needs_review`，不会凭空拆分或补写答案。导入支持 `.txt`、`.md`、标准 `.docx` 和文本型 `.pdf`，单文件默认上限 20 MB、PDF 200 页、提取文本 600000 字符、单次 100 个候选条目。旧版 `.doc`、扫描件/OCR 和 QQ 文件附件不在本轮实现范围。
+## 待复核队列
 
-试卷拆分支持 `第1题`、`第 1 题`、`1、`、`1.`、`（一）` 等明确题号，以及文末“答案/参考答案/答案与解析”表和逐题附答案。独立答案表不计入题干定位；答案无法与题号确定对应时会创建持久化待复核记录。管理员可用 `/law review [来源ID]` 查看待复核条目，用 `/law review-get <ID>` 查看原文片段和定位，用 `/law review-status <ID> resolved` 或 `superseded` 维护状态。待复核候选不会进入普通题库或每日案例选择。
+结构化题目复核详情含 answer_safe: true、题干/选项等白名单 safe_preview 与结构化 safe_structure，但不包含答案、解析、原始 fragment 或完整 payload。复核状态为 pending、resolved、superseded；更改队列状态只影响复核记录，不会将候选题自动升级为已核验真题，也不会创建官方案例身份。对身份和答案来源的确认责任仍属于授权操作者的真实证据核验，代码保持来源类型边界。
 
-原件复制到插件专属 `assets/<sha256>.<ext>`，数据库来源记录保存文件 hash、提取文本 hash、解析状态、警告和每个条目的定位。重复导入同一文件不会重复复制原件或生成相同条目；部分条目失败不会回滚已经成功归档的条目。安装或升级前应备份运行时 SQLite；安装包不覆盖现有数据库。
+## Question Session：题面、答案与解析分阶段
 
-最高法/最高检适配器取得的真实官方文章才可进入 `official_case` 入口。文章导语不会作为案件；有明确单案标题和案情/裁判结构的文章可以形成一个条目，能识别的每个“案例一/案例二”等独立条目均保留官方文章 URL 和文章内定位；边界不清的片段会持久化为待复核并跳过发布。拆分规则版本变化后，同一官方来源会重新处理，旧的拆分条目停用但历史发送记录不补发；管理员人工方向标签会保留。每日案例与手动案例预览只针对一个独立案例，案例卡片默认 1800 字符，超过预算且无法在证据约束下压缩时返回 `content_too_long`，不发送整篇合集。
+/law question ... 选择题目，/law study {ID} 学习库候选/模拟题。群发布或每日一题则在目标发送成功后，才建立该目标精确 UMO 下的 Session。
+
+1. 初次 prompt 先呈现题目身份、方向/题型、公共材料、顶层题干、选项/小问和答题要求；答案与解析不在题面中。
+2. /law next 续读当前题面/材料页；/law next-question 进入下一独立小问；多小问题目仍先呈现共享材料和顶层公共题干。
+3. /law answer 显式揭晓当前小问可核验答案；答案多页用 /law next-answer 续读。
+4. /law explanation 单独揭晓来源解析；多页用 /law next-explanation。
+5. /law current 查看当前小问的题面位置与该小问独立揭晓状态；/law close 关闭（Admin/operator）。
+
+最终每条消息受 question_message_max_chars 约束，标题、进度、来源和分页尾缀也计入预算；长语义块必要时安全拆分，不会删掉内容或混合答案进题面。每个 QQ unified_msg_origin 只有自己的持久 Session；新题仅替代同范围旧 Session。题目快照 hash、进度和按小问揭晓事件持久化，重启后恢复；缺答案/解析时显示 unavailable，不调用 LLM 补造。real_question_candidate / pending_review 可由授权者显式学习，但整个 Session 保留候选标识。
+
+## Plugin Page（AstrBot 4.25+）
+
+插件页面由 AstrBot Plugin Page Bridge 承载，不提供独立服务：
+
+| 页面区域 | 主要用途 |
+| --- | --- |
+| Overview | 插件/数据库状态、资料与任务概况。 |
+| Library | 搜索、安全详情、允许的更新、普通文档上传、结构化 PDF+JSON prepare/confirm、待复核队列。 |
+| Radar | 活动扫描、状态/活动查询、详情。 |
+| Plans | 全局与群级每日案例/题目计划预览、准备修改、确认/恢复覆盖。 |
+| Targets | 已绑定目标、别名、明确的改名/解绑确认流程。 |
+| History | 已保存的每日发送、发布、提醒、来源运行记录。 |
+
+页面 API 经 AstrBot 插件路由/Bridge 认证，插件不要求另设 dashboard 账号。AstrBot 4.22–4.24 不提供此内嵌页面能力，但核心插件兼容目标不变。
+
+## 数据、隐私与数据库迁移
+
+SQLite 和用户数据写入 AstrBot 插件专属路径：
+
+    data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
+
+同目录另有用户导入原件/暂存文件目录 imports/、assets/。插件不会把 API Key、provider credential、QQ token 存入此业务数据库。数据库保存来源、活动、目标、发布状态、学习条目、Question Session 快照及计划等业务数据；应限制操作系统目录权限，并把数据库和导入原件视为敏感/有版权的数据。
+
+当前 schema v12；迁移按顺序、事务处理。版本路径概览：
+
+| 路径 | 主要增加/调整 |
+| --- | --- |
+| v0 → v1 | 初始活动、活动日期时间线和 source run 表。 |
+| v1 → v2 | 活动元数据/修订、原始来源文档、发布目标/发布记录、提醒、案例、每日内容和法规更新表。 |
+| v2 → v3 | 将提醒幂等身份改为活动、日期类型、截止值、目标和提前天数，保留已发送状态。 |
+| v3 → v4 | 增加真题库存和全局/目标每日计划；旧案例方向字段迁为人工标签。 |
+| v4 → v5 | 分离来源提供的案例方向与管理员人工分类，保护人工标签不被重抓覆盖。 |
+| v5 → v6 | 学习资料库来源、条目、题目/案例与结构化学习表。 |
+| v6 → v7 | 来源唯一性调整，以保留同一原文对应的不同 URL/来源记录。 |
+| v7 → v8 | 待复核记录及官方案例拆分条目的 active 状态。 |
+| v8 → v9 | 独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态。 |
+| v9 → v10 | Structured Material 导入、共享材料、内容块、小问、来源关系与 review。 |
+| v10 → v11 | 按精确 QQ 会话隔离的不可变 Question Session 快照和揭晓事件。 |
+| v11 → v12 | 真题身份 v2 与历史 answer_source 规范化。 |
+
+上表是迁移主题摘要，不替代 SQL migrations 或旧 CaseItem/RealQuestion 等兼容说明。升级前备份数据库和插件用户文件。安装包不会携带或覆盖运行时数据。外部分享日志/数据库前应检查，其中可能包含用户提交的学习材料及来源信息。
+
+## 排障
+
+| 现象 | 检查项 |
+| --- | --- |
+| /law 无回应或未注册 | 检查 AstrBot 日志、插件依赖安装、metadata.yaml 兼容范围、插件是否成功 reload；私聊 /law status。 |
+| 管理命令提示无权限 | 确认是在私聊使用；检查 AstrBot Admin 或 operator_ids 的 QQ 用户 ID 格式。群 Session 交互例外仅限同一精确会话。 |
+| 活动扫描 0 来源/失败 | /law sources 查看 source_runs，检查 auto_scan_enabled、来源策略、DNS/TLS/站点变更及超时；不要关闭 TLS 校验作为修复。 |
+| 某活动无 DDL | 检查原文日期 evidence、确认状态、日期 kind、配置时区，以及它是否被标为历史/待复核。未验证日期不会触发正式提醒。 |
+| 发布没有发出 | 检查目标是否绑定/启用、唯一别名解析、预览 token 是否仍在有效期、目标权限和 publisher 返回；确认前不会群发。 |
+| 每日计划跳过 | 查看 Plans 与 History、该群级是否覆盖、目标时间/本地日期、origin/subject/type 库存、内容是否已成功发送；严格约束不满足时按设计 skip。 |
+| 真题无匹配 | 查看 question inventory；候选 structured import 不进入 origin=real。检查验证状态、来源/年份/方向/题型筛选和使用授权。 |
+| /law question-import 路径失败 | 确认文件实际位于 AstrBot 所在主机，使用 JSON 路径并为含空格路径加引号；检查 UTF-8 JSON 结构和来源身份字段。 |
+| Question Session 不显示答案 | 首屏隐藏是预期行为；执行 /law answer。若显示未提供，则来源没有可核验答案，不会由模型补写。解析单独使用 /law explanation。 |
+| Plugin Page 不显示 | 需 AstrBot 4.25+，并确认插件加载、Page discovery 与 Dashboard Bridge；4.22–4.24 核心命令仍兼容但无内嵌页。 |
+| 迁移失败或数据库异常 | 停止重载、保留日志，复制并校验备份；不要手动改 schema version 或删除 SQLite/WAL/SHM。 |
+
+## 开发与验证
+
+推荐 Python 3.12（AstrBot 4.22/4.25 环境也要求该主版本）：
+
+    python -m pip install -r requirements.txt
+    python -m pip install pytest pytest-asyncio ruff quart
+    python -m compileall .
+    ruff format --check .
+    ruff check .
+    pytest
+    node --test tests/page_lifecycle.test.mjs
+    git diff --check
+
+完整兼容性 smoke 需对应版本官方 AstrBot source checkout：
+
+    python tests/compatibility_smoke.py <AstrBot-4.22.0-source> --commit 81c7b0f7150485beb6124a7ec524a8d8534e7f6e
+    python tests/compatibility_smoke.py <AstrBot-4.25.0-source> --commit 02291a3217c92faa0c577bf9d89076949c40954c
+
+AstrBot 4.25 还可执行：
+
+    python tests/page_discovery_smoke.py <AstrBot-4.25.0-source> <plugin-root>
+    python tests/web_api_route_smoke.py <AstrBot-4.25.0-source> <plugin-root>
+
+单元测试使用确定性 fake、临时 SQLite，不要求真实 QQ、LLM 或外网。可选官网只读 smoke：
+
+    python scripts/live_smoke.py
+
+该脚本可能受站点可用性影响，不能替代 fixture tests，也不发送 QQ 消息。构建 release ZIP：
+
+    python scripts/build_release.py --output dist
+
+ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、缓存、SQLite、日志、虚拟环境和常见凭据文件。当前 CI workflow CI 在 main push 与 pull request 运行 5 个 required jobs：Quality / Unit、AstrBot compatibility (4.22.0)、AstrBot compatibility (4.25.0)、Release package smoke (4.22.0)、Release package smoke (4.25.0)。release jobs 从最终提交构建/解压 ZIP 并执行包内编译和 loader smoke；4.25 还执行 Page discovery/API route smoke，生成名为 astrbot_plugin_law_assistant-0.5.2 的 artifact。具体运行结果需以该 commit 的 Actions 页面为准。
+
+回归 fixture 不得包含真实题库正文、凭据或生产数据库。真实 QQ/NapCat、真实模型自然语言稳定性、Windows 本机 AstrBot 部署、官网当前实时可用性、用户真题版权及逐题内容质量，需要分别在有授权的实际环境验收；上述本地/CI 测试不能代替它们。
 
 ## 更新日志 / Changelog
 
-版本使用 Semantic Versioning 三段式 `MAJOR.MINOR.PATCH`：PATCH 用于向后兼容的 bug fix，MINOR 用于向后兼容的新功能，MAJOR 用于 breaking change。任何版本号更新都必须在同一轮同步更新本节。
+版本日期按 Git 中首次引入该 metadata 版本的提交日期记录；不是外部发布或 GitHub Release 日期。重要提交锚点可用仓库 git log 核对。
 
-### 0.5.2 — Unreleased
+| 版本 | 首次版本提交 |
+| --- | --- |
+| 0.1.0 | 201692426ee4926310276c38c539635b467e19db |
+| 0.2.0 | 37313c00711e3eca69522170bc24de017b7aa572 |
+| 0.3.0 | f950ca8811fa2f86ef394f722bc9109004a2d9fd |
+| 0.4.0 | 6f1382c8517d3634c827cc712bf08485ddbfa4c7 |
+| 0.5.0 | d45ace225b5229194cff3d936a7dfac78d8dc906 |
+| 0.5.1 | cfbb5817cf8bd26a7afe263acfb8f7509f9ecfe4 |
+| 0.5.2 | d4b2ddf3f1fdab76043144b7acdf44a82ad5733c |
 
-- 修复结构化客观题进入待复核队列时，safe preview 对 option dict 直接 `join` 导致 `TypeError` 的问题。
-- 待复核 safe preview 现在仅把选项白名单中的 key/text 确定性投影为文本，同时保留 `safe_structure.options` 的结构化 DTO。
-- 不改变答案安全边界；复核页仍不会暴露答案、解析或原始隐藏 evidence。
+### 0.5.2 — 2026-09-27
 
-### 0.5.1
+- 修复结构化选择题进入待复核队列时选项 DTO 导致 safe preview 序列化异常的问题。
+- 保持题目复核只返回安全题干/选项预览，不向复核详情暴露答案、解析和原始完整片段。
+- 隔离验收真实客观题候选数据处理链：445 题、11 份材料、2,781 个 block；候选数据仍待核验，不作为仓库内置题库。
 
-- 修复结构化资料中的选择题答案以 `answer.keys`、`correct_keys` 等合法结构保存时，Question Session 显式揭晓仍误报“未提供答案”的问题。
-- 兼容旧版本已持久化的结构化选择题答案，无需重新导入资料或迁移数据库。
-- 保持答案安全的分阶段展示：首次题面仍隐藏答案，只有显式请求答案后才显示。
+### 0.5.1 — 2026-09-27
 
-### 0.5.0
+- 修复 Structured Material 选择题的 answer.keys 等已接受答案结构不能在 Question Session 中显式揭晓的问题。
+- 旧版本已持久化的结构化选择题无需重新导入即可使用；首屏仍隐藏答案，只有显式 answer action 才揭晓来源答案。
+- 同步 schema v12、README changelog 与版本说明。
 
-- 增加基于 PDF 与 JSON 原件 hash 绑定的 Structured Material 候选题导入。
-- 增加持久化 Question Session、材料/题面续读，以及答案和解析分阶段揭晓。
-- 支持 `indefinite_choice` 题型，并保留真题身份、来源与答案 provenance。
-- 保持 Library 与 WebUI 的答案安全读取边界，以及按精确 QQ 会话隔离的题目交互。
-- 增加 AstrBot 4.25+ 嵌入式 Plugin Page。
+### 0.5.0 — 2026-09-23
 
-## Development
+- 建立持久化、精确 QQ 会话范围的 Question Session 快照与按小问记录的揭晓事件。
+- 支持题面/共享材料分页、独立小问、indefinite_choice，并将答案和解析分开显式揭晓。
+- 强化真实题身份、来源与 answer_source 的持久化约束；候选题仍不能进入 verified-real inventory。
+- 收紧 Library、Plugin Page、搜索、详情和待复核题目的 answer-safe 边界；兼容历史会话快照显示。
+- 手动/每日题目发布与答案安全 Session 共享展示逻辑。
 
-```bash
-python -m pip install -r requirements.txt
-python -m compileall .
-ruff format --check .
-ruff check .
-pytest
-git diff --check
-```
+### 0.4.0 — 2026-09-23
 
-测试使用 deterministic fakes，不依赖真实 QQ、LLM provider、外部网站或生产数据库。可选 live smoke 只读取公开网页，不写数据库、不发送消息：
+- 引入 Structured Material v1 JSON 契约、确定性 validator、结构化预览和 PDF+JSON hash-bound prepare/confirm 导入。
+- 保存 shared materials、stem/answer/explanation blocks、answer requirements、subquestions、locators、provenance 和 review records。
+- 结构化导入保持 real_question_candidate / pending_review；数据中的 official/verified 声明不会授予真实身份。
+- 对真实 PDF 结构化、年份、answer mapping、污染内容及 block 边界进行仓库外数据审计；真实原件/题目 JSON 未提交 Git。
 
-```bash
-python scripts/live_smoke.py
-```
+### 0.3.0 — 2026-09-21
 
-构建干净发布包（ZIP 不提交到 Git）：
+- 增加 AstrBot 4.25+ embedded Plugin Page、受控 Web API、页面国际化与 dashboard navigation。
+- 增加 Overview、Library、Radar、Plans、Targets、History 的资料、计划、目标和历史管理流程。
+- 页面上传采用 staging 与 prepare/confirm；修正真实 Bridge 响应解包、计划恢复预览及页面翻译路径。
+- 保持 4.22+ 基础插件兼容，较新 Page 能力按宿主支持情况提供。
 
-```bash
-python scripts/build_release.py --output dist
-```
+### 0.2.0 — 2026-09-17
 
-`.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；4.25.0 额外验证 Plugin Page discovery、`/api/plug/astrbot_plugin_law_assistant/...` route contract 和解压 ZIP 的页面加载；required failure 不用 `continue-on-error` 隐藏。
+- 扩展活动扫描、法律活动状态/来源策略、截止提醒、官方案例与法规更新存储。
+- 增加多群目标、确认式发布、每日案例/题目计划、方向/题型轮换及计划预览。
+- 建立学习资料库、持久模拟题与核验真题 JSON 导入；增加 TXT/Markdown/DOCX/文本 PDF 受控解析、学习资料拆分与待复核队列。
+- 扩展自然语言 LLM Tools、发布目标别名、来源记录/幂等与调度生命周期测试。
 
-CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.2.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
+### 0.1.0 — 2026-09-17
 
-本地的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用 deterministic fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取、Dashboard 浏览器操作和真实 LLM provider 仍需后续实机验收。
+- 建立 AstrBot Law Assistant 插件基础：/law、LLM Tools、统一 LawAssistantService、来源扩展点、SQLite schema/migration、Scheduler 与 Publisher 边界。
+- 建立 Python 3.12 测试和 AstrBot v4.22.0/v4.25.0 精确源码兼容性 CI。
+- 初始实现无生产赛事网站清单，不声称尚未实现的自动赛事抓取/每日内容能力可用。
+
+### 版本规则
+
+本项目采用 Semantic Versioning：MAJOR.MINOR.PATCH。
+
+- **PATCH**：向后兼容的错误修复。
+- **MINOR**：向后兼容的新功能。
+- **MAJOR**：不兼容的 API、配置或行为变化。
+
+任何版本号变更都必须在同一提交更新本 README 的 Changelog；历史记录仅总结该版本在本仓库中已实现的行为，不暗示未经证实的外部发布或生产验收。
+
+## 延伸规范
+
+- AGENTS.md：项目长期开发、可信边界、兼容性与验证规则。
+- docs/structured-material-v1.md：完整的 Structured Material v1 交换格式和 validator 规则。
+- metadata.yaml 与 _conf_schema.json：插件元数据及 AstrBot WebUI 配置字段事实来源。
+- .github/workflows/ci.yml：当前 CI job、版本矩阵和 release artifact 事实来源。

@@ -67,6 +67,7 @@
 
 - `single_choice`
 - `multiple_choice`
+- `indefinite_choice`
 - `true_false`
 - `short_answer`
 - `case_analysis`
@@ -200,6 +201,12 @@
 
 当前 Plugin Page 只允许以原始 PDF + JSON 的组合启动 0.4B 导入；旧的 TXT/Markdown/DOCX/PDF `prepare → confirm` 仍走原有分段路径，不能用旧正则分段器替代结构化导入。原始资料和 JSON 只保存于插件数据目录，不进入 Git。
 
-## 当前边界
+## 0.4B 初始边界（历史说明）
 
 0.4B 不实现官方身份升级、答案继续作答协议、独立会话系统、RAG 或每日任务接管。正式导入仍是候选资料保存与检索基础；真实 PDF 的内容、版权和逐题核验责任由操作者承担，插件不会把外部模型整理结果当作官方事实。
+
+## 截至 0.5.2 的当前边界
+
+Structured Material v1 仍是候选资料交换与持久化契约，不是身份升级机制。导入的题目保持 `real_question_candidate` / `pending_review`，不会自动进入 `origin=real` 的核验真题库存；即使通过 `/law study <资料库题目ID>` 打开 Question Session，也会保留候选标签。复核队列状态变为 `resolved` 也不会自动授予真题或官方案例身份。
+
+Question Session、答案/解析分阶段揭晓以及每日计划已经由插件其他模块实现，但不改变本格式的可信身份规则。Structured Material 导入本身不批准答案、不执行候选到 verified 的身份升级，也不把结构化声明当作来源核验。专用候选身份审批/升级流程、RAG/向量检索仍未实现。真实 PDF 的内容、版权许可、原题身份和逐题核验责任由操作者承担；外部模型整理内容仍按其 provenance 和 review 状态处理。
