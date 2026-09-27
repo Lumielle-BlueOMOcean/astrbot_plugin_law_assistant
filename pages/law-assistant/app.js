@@ -243,7 +243,7 @@ async function renderOverview() {
     const radar = data.radar || {};
     const learning = data.learning || {};
     view.append(metricGrid([
-      [t("page.overview.version", "插件版本"), plugin.version || "0.5.0", `schema v${data.schema_version ?? "—"}`],
+      [t("page.overview.version", "插件版本"), plugin.version || "0.5.1", `schema v${data.schema_version ?? "—"}`],
       [t("page.overview.currentEvents", "当前活动"), radar.current || 0, t("page.overview.currentEventsDetail", "排除历史与待复核")],
       [t("page.overview.cases", "官方案例"), learning.official_case || 0, t("page.overview.casesDetail", "可用于每日案例")],
       [t("page.overview.realQuestions", "核验真题"), learning.verified_real || 0, t("page.overview.realQuestionsDetail", "来源身份独立保存")],

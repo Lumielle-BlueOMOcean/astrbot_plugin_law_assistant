@@ -1,6 +1,6 @@
 # 微光·法务助手 / Lumielle Law Assistant
 
-AstrBot QQ 法律信息助手。`0.5.0` 在活动、官方案例、法规更新、学习资料库、受控文档导入、每日任务、多群定向发布和 AstrBot 4.25+ 嵌入式管理页基础上，增加持久化互动题目会话：先展示题干，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
+AstrBot QQ 法律信息助手。当前版本 `0.5.1` 修复结构化选择题答案以 `keys` 等字段保存时无法在 Question Session 中显式揭晓的问题，并兼容旧版已入库数据，无需重新导入。互动题目仍先展示题面，答案和解析仅在用户明确请求后分别揭晓。以来源证据和 SQLite 状态为事实基础，LLM 只做受证据约束的解释或原创模拟题生成。
 
 ## Implemented
 
@@ -77,7 +77,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 
 ### Plugin ZIP
 
-在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.0.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
+在 AstrBot 4.25+ 的插件管理页面上传 `astrbot_plugin_law_assistant-0.5.1.zip`；如果当前版本不提供 ZIP 上传入口，将 ZIP 解压为 `data/plugins/astrbot_plugin_law_assistant/`，保证 `metadata.yaml` 位于该目录根部，然后重新加载插件。AstrBot 4.22–4.24 继续使用 URL 或目录安装，基础命令、Tools 和 scheduler 可用，但不显示嵌入式 Plugin Page。
 
 完整嵌入式 WebUI 需要 AstrBot `>=4.25`；基础插件功能兼容 `>=4.22.0,<5`。页面认证由 AstrBot Dashboard 提供，插件不建立第二套账号密码系统。
 
@@ -117,7 +117,7 @@ git clone https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant.g
 data/plugin_data/astrbot_plugin_law_assistant/law_assistant.sqlite3
 ```
 
-当前 schema version 为 `11`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系，v10→v11 增加按 QQ 会话隔离的题目快照与揭晓事件；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时 SQLite；安装包不覆盖现有数据库。
+当前 schema version 为 `12`。v5→v6 建立学习资料库表，v6→v7 调整来源唯一性以保留同一原文对应的不同 URL，v7→v8 增加待复核记录和官方案例拆分结果的 active 状态，v8→v9 增加独立题型计划轴、每日内容来源身份、跨来源活动关联和 canonical 发布幂等状态，v9→v10 增加结构化导入身份、共享材料、内容块、小问和材料关系，v10→v11 增加按 QQ 会话隔离的题目快照与揭晓事件，v11→v12 增加真题身份 v2 和历史 `answer_source` 规范化；不迁移旧 `CaseItem`、`RealQuestion` 或历史发送内容。升级前请备份运行时 SQLite；安装包不覆盖现有数据库。
 
 ### 结构化资料导入
 
@@ -250,6 +250,24 @@ data/plugin_data/astrbot_plugin_law_assistant/imports/
 
 最高法/最高检适配器取得的真实官方文章才可进入 `official_case` 入口。文章导语不会作为案件；有明确单案标题和案情/裁判结构的文章可以形成一个条目，能识别的每个“案例一/案例二”等独立条目均保留官方文章 URL 和文章内定位；边界不清的片段会持久化为待复核并跳过发布。拆分规则版本变化后，同一官方来源会重新处理，旧的拆分条目停用但历史发送记录不补发；管理员人工方向标签会保留。每日案例与手动案例预览只针对一个独立案例，案例卡片默认 1800 字符，超过预算且无法在证据约束下压缩时返回 `content_too_long`，不发送整篇合集。
 
+## 更新日志 / Changelog
+
+版本使用 Semantic Versioning 三段式 `MAJOR.MINOR.PATCH`：PATCH 用于向后兼容的 bug fix，MINOR 用于向后兼容的新功能，MAJOR 用于 breaking change。任何版本号更新都必须在同一轮同步更新本节。
+
+### 0.5.1 — Unreleased
+
+- 修复结构化资料中的选择题答案以 `answer.keys`、`correct_keys` 等合法结构保存时，Question Session 显式揭晓仍误报“未提供答案”的问题。
+- 兼容旧版本已持久化的结构化选择题答案，无需重新导入资料或迁移数据库。
+- 保持答案安全的分阶段展示：首次题面仍隐藏答案，只有显式请求答案后才显示。
+
+### 0.5.0
+
+- 增加基于 PDF 与 JSON 原件 hash 绑定的 Structured Material 候选题导入。
+- 增加持久化 Question Session、材料/题面续读，以及答案和解析分阶段揭晓。
+- 支持 `indefinite_choice` 题型，并保留真题身份、来源与答案 provenance。
+- 保持 Library 与 WebUI 的答案安全读取边界，以及按精确 QQ 会话隔离的题目交互。
+- 增加 AstrBot 4.25+ 嵌入式 Plugin Page。
+
 ## Development
 
 ```bash
@@ -275,6 +293,6 @@ python scripts/build_release.py --output dist
 
 `.github/workflows/ci.yml` 在 `push main` 和 pull request 上运行质量/单元检查，并运行 4.22.0、4.25.0 两个真实 AstrBot loader compatibility job；4.25.0 额外验证 Plugin Page discovery、`/api/plug/astrbot_plugin_law_assistant/...` route contract 和解压 ZIP 的页面加载；required failure 不用 `continue-on-error` 隐藏。
 
-CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.0.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
+CI 还会从最终提交构建 `astrbot_plugin_law_assistant-0.5.1.zip`，排除 `.git`、测试、开发脚本、缓存、运行时 SQLite 和敏感文件；在 ZIP 解压目录分别执行 AstrBot 4.22/4.25 loader smoke，并在 4.25 exact source 上执行真实 Plugin Page discovery、Plugin API route contract smoke。GitHub Actions artifact 提供 ZIP，不把 ZIP 提交到仓库。
 
 本地的 DOCX、文本型 PDF、受控目录导入和官方合集拆分均使用 deterministic fixture 验证；真实 Windows AstrBot、QQ 文件附件、真实 QQ 群发布、外部官网实时抓取、Dashboard 浏览器操作和真实 LLM provider 仍需后续实机验收。

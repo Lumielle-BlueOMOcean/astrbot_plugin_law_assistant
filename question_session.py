@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
@@ -82,10 +83,19 @@ def _block_text(blocks: Any) -> str:
     )
 
 
-def _answer_blocks(value: Any) -> list[str]:
+def _content_blocks(value: Any) -> list[str]:
+    """Expand general answer/explanation content without interpreting answer keys."""
     if isinstance(value, dict):
-        value = value.get("blocks", value.get("text", value.get("answer", "")))
+        for field in ("blocks", "text", "answer", "value"):
+            candidate = value.get(field)
+            if candidate not in (None, "", [], {}):
+                value = candidate
+                break
+        else:
+            return []
     if isinstance(value, (list, tuple)):
+        if all(isinstance(item, dict) for item in value):
+            return _ordered_block_texts(value)
         return [
             text
             for text in (
@@ -96,6 +106,49 @@ def _answer_blocks(value: Any) -> list[str]:
         ]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def _choice_answer_keys(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        values = value
+    elif isinstance(value, set):
+        values = sorted(value, key=str)
+    else:
+        value_text = "" if value is None else str(value).strip()
+        values = re.split(r"[,，、/\\\s]+", value_text)
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        item_text = "" if item is None else str(item).strip()
+        parts = re.split(r"[,，、/\\\s]+", item_text)
+        for part in parts:
+            key = part.strip().upper()
+            if key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
+def _answer_blocks(value: Any, question_type: str = "") -> list[str]:
+    """Render stored answer semantics while leaving explanation content generic."""
+    if question_type in {"single_choice", "multiple_choice", "indefinite_choice"}:
+        if isinstance(value, dict):
+            for field in ("keys", "correct_keys", "answers", "key", "value"):
+                if field not in value:
+                    continue
+                keys = _choice_answer_keys(value[field])
+                if keys:
+                    return ["、".join(keys)]
+            return []
+        return _content_blocks(value)
+
+    if question_type == "true_false":
+        answer_value = value.get("value") if isinstance(value, dict) else value
+        if isinstance(answer_value, bool):
+            return ["正确" if answer_value else "错误"]
+
+    return _content_blocks(value)
 
 
 def _prompt_blocks(blocks: Any, max_chars: int) -> list[str]:
@@ -669,8 +722,8 @@ def build_question_session_snapshot(
         )
         stem = str(content.get("question") or content.get("stem") or "")
         options = content.get("options") or []
-        answer_blocks = _answer_blocks(content.get("answer"))
-        explanation_blocks = _answer_blocks(content.get("explanation"))
+        answer_blocks = _answer_blocks(content.get("answer"), question_type)
+        explanation_blocks = _content_blocks(content.get("explanation"))
         materials: list[dict[str, Any]] = []
         prompts = [
             {
@@ -700,6 +753,16 @@ def build_question_session_snapshot(
             question = (
                 result.get("content") if isinstance(result.get("content"), dict) else {}
             )
+        payload = (
+            structured.get("payload")
+            if isinstance(structured.get("payload"), dict)
+            else {}
+        )
+        question_type = str(
+            payload.get("question_type")
+            or question.get("question_type")
+            or question_type
+        )
         stem_blocks = result.get("stem_blocks")
         if not stem_blocks:
             stem_blocks = question.get("stem") or question.get("question") or ""
@@ -731,8 +794,11 @@ def build_question_session_snapshot(
                             subquestion.get("stem_blocks", [])
                         ),
                         "options": [],
-                        "answer_blocks": _answer_blocks(subquestion.get("answer")),
-                        "explanation_blocks": _answer_blocks(
+                        "answer_blocks": _answer_blocks(
+                            subquestion.get("answer"),
+                            str(subquestion.get("question_type") or question_type),
+                        ),
+                        "explanation_blocks": _content_blocks(
                             subquestion.get("explanation_blocks", [])
                         ),
                         "answer_requirements": _requirements(
@@ -749,16 +815,13 @@ def build_question_session_snapshot(
                     "options": [
                         str(option) for option in question.get("options", []) or []
                     ],
-                    "answer_blocks": _answer_blocks(question.get("answer")),
-                    "explanation_blocks": _answer_blocks(question.get("explanation")),
+                    "answer_blocks": _answer_blocks(
+                        question.get("answer"), question_type
+                    ),
+                    "explanation_blocks": _content_blocks(question.get("explanation")),
                     "answer_requirements": [],
                 }
             )
-        payload = (
-            structured.get("payload")
-            if isinstance(structured.get("payload"), dict)
-            else {}
-        )
         requirements = _requirements(
             structured.get("answer_requirements")
             or payload.get("answer_requirements")

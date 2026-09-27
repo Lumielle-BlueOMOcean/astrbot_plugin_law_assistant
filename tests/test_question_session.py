@@ -186,6 +186,186 @@ def _structured_candidate() -> dict[str, object]:
     }
 
 
+def _candidate_with_answer(answer, question_type: str = "single_choice"):
+    return {
+        "origin": "candidate",
+        "subject": "criminal_law",
+        "question_type": question_type,
+        "item": {
+            "id": 901,
+            "item_type": "question",
+            "identity": "real_question_candidate",
+            "subjects": ["criminal_law"],
+        },
+        "question": {
+            "question_identity": "real_question_candidate",
+            "question_type": question_type,
+            "stem": "以下哪项符合虚构题目条件？",
+            "options": ["A. 选项甲", "B. 选项乙", "C. 选项丙", "D. 选项丁"],
+            "answer": answer,
+            "explanation": "合成解析正文。",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("question_type", "answer", "expected"),
+    [
+        (
+            "single_choice",
+            {"keys": ["B"], "provenance": "source_text"},
+            "B",
+        ),
+        (
+            "multiple_choice",
+            {"keys": ["A", "C"], "provenance": "source_text"},
+            "A、C",
+        ),
+        (
+            "indefinite_choice",
+            {"keys": ["D"], "provenance": "source_text"},
+            "D",
+        ),
+        (
+            "indefinite_choice",
+            {"keys": ["B", "D"], "provenance": "source_text"},
+            "B、D",
+        ),
+    ],
+)
+def test_structured_choice_answers_reveal_all_canonical_keys(
+    question_type, answer, expected
+):
+    snapshot = build_question_session_snapshot(
+        _candidate_with_answer(answer, question_type)
+    )
+
+    prompt = format_session_prompt(snapshot)
+    revealed = format_session_answer(snapshot)
+
+    assert "来源资料参考答案" not in prompt
+    assert f"第 1/1 页\n{expected}" in revealed
+    assert "原始资料未提供可核验参考答案" not in revealed
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "question_type", "expected"),
+    [
+        ("keys", [], "single_choice", "C"),
+        ("correct_keys", ["C"], "single_choice", "C"),
+        ("answers", ["D"], "single_choice", "D"),
+        ("key", "A", "single_choice", "A"),
+        ("value", "C,A", "multiple_choice", "C、A"),
+    ],
+)
+def test_structured_choice_answer_aliases_use_first_nonempty_supported_field(
+    field, value, question_type, expected
+):
+    answer = {field: value, "provenance": "source_text"}
+    if field == "keys":
+        answer["correct_keys"] = ["C"]
+    snapshot = build_question_session_snapshot(
+        _candidate_with_answer(answer, question_type)
+    )
+
+    assert f"第 1/1 页\n{expected}" in format_session_answer(snapshot)
+
+
+def test_choice_answer_keys_take_priority_over_generic_answer_blocks():
+    snapshot = build_question_session_snapshot(
+        _candidate_with_answer(
+            {
+                "keys": ["A", "C"],
+                "blocks": [
+                    {
+                        "id": "answer-block",
+                        "order": 1,
+                        "text": "合成来源答案补充文字。",
+                    }
+                ],
+                "provenance": "source_text",
+            },
+            "multiple_choice",
+        )
+    )
+
+    answer = format_session_answer(snapshot)
+    assert "A、C" in answer
+    assert "原始资料未提供可核验参考答案" not in answer
+
+
+@pytest.mark.parametrize(("value", "expected"), [(True, "正确"), (False, "错误")])
+def test_true_false_structured_boolean_answer_is_rendered_as_text(value, expected):
+    snapshot = build_question_session_snapshot(
+        _candidate_with_answer(
+            {"value": value, "provenance": "source_text"}, "true_false"
+        )
+    )
+
+    answer = format_session_answer(snapshot)
+    assert expected in answer
+    assert "'value':" not in answer
+
+
+def test_explanation_uses_generic_content_without_choice_key_interpretation():
+    candidate = _candidate_with_answer({"keys": ["B"], "provenance": "source_text"})
+    candidate["question"]["explanation"] = {
+        "keys": ["D"],
+        "provenance": "source_text",
+    }
+    snapshot = build_question_session_snapshot(candidate)
+
+    explanation = format_session_explanation(snapshot)
+    assert "该题没有来源提供的独立解析" in explanation
+    assert "D" not in explanation
+
+
+def test_subjective_structured_answer_blocks_keep_source_order():
+    snapshot = build_question_session_snapshot(
+        _candidate_with_answer(
+            {
+                "blocks": [
+                    {"id": "a2", "order": 2, "text": "第二段答案。"},
+                    {"id": "a1", "order": 1, "text": "第一段答案。"},
+                ],
+                "provenance": "source_text",
+            },
+            "short_answer",
+        )
+    )
+
+    answer = format_session_answer(snapshot)
+    assert answer.index("第一段答案。") < answer.index("第二段答案。")
+
+
+def test_structured_subquestion_answer_uses_parent_question_type():
+    candidate = _candidate_with_answer(None, "multiple_choice")
+    candidate["subquestions"] = [
+        {
+            "id": "sub-1",
+            "source_number": "1",
+            "stem_blocks": [{"id": "sub-stem", "order": 1, "text": "小问一。"}],
+            "answer": {"keys": ["A", "C"], "provenance": "source_text"},
+            "explanation_blocks": [],
+        }
+    ]
+    snapshot = build_question_session_snapshot(candidate)
+
+    assert "A、C" in format_session_answer(snapshot)
+
+
+def test_unresolved_structured_answer_keeps_missing_answer_fallback():
+    candidate = _candidate_with_answer(None)
+    candidate["question"]["answer_status"] = "unresolved"
+    candidate["question"]["answer_reason"] = "虚构 fixture 未提供答案"
+    candidate["question"]["explanation"] = "不能从解析推断答案。"
+    snapshot = build_question_session_snapshot(candidate)
+
+    answer = format_session_answer(snapshot)
+    assert "原始资料未提供可核验参考答案；不会使用模型补写答案。" in answer
+    assert "不能从解析推断答案。" not in answer
+
+
 def test_prompt_answer_and_explanation_are_revealed_separately() -> None:
     snapshot = build_question_session_snapshot(_real_question())
 

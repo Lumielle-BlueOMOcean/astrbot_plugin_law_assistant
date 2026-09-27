@@ -8,6 +8,7 @@ import pytest
 
 from library_repository import LibraryRepository
 from library_service import LibraryService
+from service import LawAssistantService
 from storage import SQLiteStorage
 from structured_ingestion import StructuredMaterialIngestionService
 from structured_material import validate_structured_material
@@ -335,3 +336,86 @@ def test_structured_validator_keeps_identity_as_candidate_only():
     assert all(
         item.get("identity_granted") is False for item in validation.valid_case_items
     )
+
+
+@pytest.mark.asyncio
+async def test_persisted_structured_choice_keys_reveal_after_reopen_without_reimport(
+    tmp_path,
+):
+    db_path = tmp_path / "persisted-choice.sqlite3"
+    pdf_bytes = _text_pdf_bytes("Synthetic source PDF for choice answer regression")
+    payload = _payload(pdf_bytes)
+    question = payload["questions"][0]
+    question["question_type"] = "single_choice"
+    question["options"] = [
+        {"key": "A", "text": "虚构选项甲"},
+        {"key": "B", "text": "虚构选项乙"},
+    ]
+    question["answer"] = {"keys": ["B"], "provenance": "source_text"}
+    question["subquestions"] = []
+
+    storage = SQLiteStorage(db_path)
+    library = LibraryService(LibraryRepository(storage.connection))
+    ingestion = StructuredMaterialIngestionService(tmp_path, library)
+    original_path = ingestion.import_dir / "choice-source.pdf"
+    original_path.parent.mkdir(parents=True, exist_ok=True)
+    original_path.write_bytes(pdf_bytes)
+    staged = await ingestion.stage_json_upload(
+        "choice-material.json", json.dumps(payload, ensure_ascii=False).encode()
+    )
+    prepared = await ingestion.prepare(
+        "choice-source.pdf",
+        staged["staged_path"],
+        created_by="synthetic-operator",
+        session_origin="private:synthetic-operator",
+        original_filename="choice-source.pdf",
+        structured_filename="choice-material.json",
+    )
+    confirmed = await ingestion.confirm(prepared)
+    assert confirmed["archived"] == 2
+
+    item_id = storage.connection.execute(
+        "SELECT item_id FROM structured_item_bindings WHERE external_id = 'question-1'"
+    ).fetchone()[0]
+    stored_answer = json.loads(
+        storage.connection.execute(
+            "SELECT answer_json FROM learning_questions WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()[0]
+    )
+    assert stored_answer == {"keys": ["B"], "provenance": "source_text"}
+    storage.close()
+
+    reopened = SQLiteStorage(db_path)
+    reopened_library = LibraryService(LibraryRepository(reopened.connection))
+    service = LawAssistantService(reopened, library_service=reopened_library)
+
+    safe_detail = await service.get_learning_item(item_id)
+    assert safe_detail["success"] is True
+    assert "answer" not in safe_detail["question"]
+    assert "explanation" not in safe_detail["question"]
+    assert "keys" not in json.dumps(safe_detail, ensure_ascii=False)
+    assert (await service.search_learning_library(query="A、C"))["items"] == []
+
+    scope = "aiocqhttp:FriendMessage:synthetic-operator"
+    opened = await service.start_library_question_session(
+        item_id,
+        session_origin=scope,
+        actor_id="synthetic-operator",
+    )
+    assert opened["success"] is True
+    assert "来源资料参考答案" not in opened["text"]
+    assert "原始资料未提供可核验参考答案" not in opened["text"]
+    prompt = await service.question_session_action(
+        "next", session_origin=scope, actor_id="synthetic-operator"
+    )
+    assert "虚构选项乙" in prompt["text"]
+    assert "来源资料参考答案" not in prompt["text"]
+    assert "原始资料未提供可核验参考答案" not in prompt["text"]
+
+    revealed = await service.question_session_action(
+        "answer", session_origin=scope, actor_id="synthetic-operator"
+    )
+    assert "第 1/1 页\nB" in revealed["text"]
+    assert "原始资料未提供可核验参考答案" not in revealed["text"]
+    reopened.close()

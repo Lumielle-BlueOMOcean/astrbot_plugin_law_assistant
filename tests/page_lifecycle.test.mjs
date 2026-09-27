@@ -90,7 +90,7 @@ test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async (
 test("overview renders safe active-session progress from the Bridge payload", async () => {
   const { bridge, elements, page } = await loadPage();
   bridge.apiGet = async () => ({
-    plugin: { version: "0.5.0" },
+    plugin: { version: "0.5.1" },
     schema_version: 12,
     radar: { current: 0 },
     learning: {},
