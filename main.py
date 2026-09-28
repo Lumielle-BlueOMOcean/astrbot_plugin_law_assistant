@@ -174,18 +174,24 @@ class LawAssistant(Star):
             logger=logger,
         )
         self.service.materialize_config_rotation_anchors()
+        stored_daily_case_enabled = any(
+            item["content_type"] == "daily_case" and item["enabled"]
+            for item in self.storage.list_daily_plans()
+        )
+        scan_scheduler_enabled = bool(
+            self.plugin_config.auto_scan_enabled
+            or self.plugin_config.law_update_enabled
+            or (
+                case_sources
+                and (self.plugin_config.daily_case_enabled or stored_daily_case_enabled)
+            )
+        )
+        due_scheduler_enabled = self.service.has_due_scheduler_work()
         self.scheduler = LawAssistantScheduler(
             self.service,
-            enabled=(
-                self.plugin_config.auto_scan_enabled
-                or self.plugin_config.daily_case_enabled
-                or self.plugin_config.daily_question_enabled
-                or self.plugin_config.law_update_enabled
-                or any(
-                    bool(item.get("enabled"))
-                    for item in self.storage.list_daily_plans()
-                )
-            ),
+            enabled=scan_scheduler_enabled or due_scheduler_enabled,
+            scan_enabled=scan_scheduler_enabled,
+            due_enabled=due_scheduler_enabled,
             interval_minutes=self.plugin_config.scan_interval_minutes,
             logger=logger,
         )
@@ -195,6 +201,9 @@ class LawAssistant(Star):
             self.web_api.register(context)
 
     async def initialize(self) -> None:
+        self.service.scheduled_reveals.recover_inflight(
+            at=self.service._now_utc().isoformat()
+        )
         await self.scheduler.start()
 
     async def terminate(self) -> None:
@@ -203,8 +212,7 @@ class LawAssistant(Star):
         self.storage.close()
 
     async def _wake_scheduler(self) -> None:
-        self.scheduler.enabled = True
-        await self.scheduler.start()
+        await self.scheduler.wake()
 
     def _authorized(
         self, event: AstrMessageEvent, *, allow_group: bool = False
@@ -248,7 +256,7 @@ class LawAssistant(Star):
         message_text = str(event.get_message_str() or "").strip()
         question_import_path = _extract_question_import_path(message_text)
         try:
-            parts = shlex.split(message_text)
+            parts = _normalize_law_command_parts(message_text)
         except ValueError as exc:
             yield event.plain_result(f"命令格式错误：{exc}")
             return
@@ -307,7 +315,8 @@ class LawAssistant(Star):
             if event.is_private_chat():
                 if len(parts) < 3 or not _looks_like_umo(parts[2]):
                     text = (
-                        "私聊绑定请使用 /law bind-umo <unified_msg_origin> [群别名]。"
+                        "私聊绑定必须提供已知的真实 unified_msg_origin；"
+                        "维护命令：law bind-umo <unified_msg_origin> [群别名]。"
                     )
                 else:
                     text = _json_text(
@@ -333,7 +342,7 @@ class LawAssistant(Star):
         elif subcommand == "rename":
             if event.is_private_chat():
                 if len(parts) < 4:
-                    text = "私聊改名请使用 /law rename <目标群名或 ID> <新别名>。"
+                    text = "私聊改名请使用：法务 改名 <现有群名或 ID> <新别名>。"
                 else:
                     text = _json_text(
                         await self.service.rename_target(parts[2], " ".join(parts[3:]))
@@ -345,7 +354,7 @@ class LawAssistant(Star):
                     )
                 )
             else:
-                text = "群聊改名请使用 /law rename <新别名>。"
+                text = "群聊改名请使用：法务 改名 <新别名>。"
         elif subcommand == "publish" and len(parts) > 2:
             text = _json_text(
                 await self.service.prepare_publish_event(
@@ -456,6 +465,12 @@ class LawAssistant(Star):
         else:
             text = self._help_text()
         yield event.plain_result(text)
+
+    @filter.command("法务")
+    async def law_chinese(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
+        """中文命令别名；复用 /law 的解析、权限及 Service 路径。"""
+        async for result in self.law(event):
+            yield result
 
     @filter.llm_tool(name="law_status")
     async def law_status(self, event: AstrMessageEvent) -> str:
@@ -1030,17 +1045,12 @@ class LawAssistant(Star):
     @staticmethod
     def _help_text() -> str:
         return (
-            "用法：/law status、/law scan、/law events [current|needs_review|historical|all]、"
-            "/law deadlines、"
-            "/law case [方向]、/law question [real|mock|random] [方向] [题型]、"
-            "/law study <资料题目ID>、/law current、/law next、/law next-question、"
-            "/law answer、/law next-answer、/law explanation、/law next-explanation、/law close、"
-            "/law import <受控目录相对路径> [case|mock_question|real_question_candidate]、"
-            "/law targets、/law plans、/law question-import <JSON路径>、"
-            "/law review [来源ID]、/law review-get <ID>、/law review-status <ID> <状态>、"
-            "/law bind [当前群别名]、/law bind-umo <UMO> [群别名]、"
-            "/law rename <目标> <新别名>、/law publish <id> [群名]、"
-            "/law confirm <token>、/law help"
+            "常用：法务 状态、法务 活动、法务 截止、法务 题目 [方向] [题型]、"
+            "法务 真题 [方向] [题型]、法务 模拟题 [方向] [题型]、法务 案例 [方向]、"
+            "法务 当前、法务 下一页、法务 下一题、法务 答案、法务 解析、法务 结束、"
+            "法务 计划、法务 群计划、法务 绑定 <别名>、法务 帮助。"
+            "管理与维护：/law scan、/law import、/law question-import、/law review、"
+            "/law review-status、/law bind-umo、/law rename、/law publish、/law confirm。"
         )
 
 
@@ -1172,7 +1182,9 @@ def _extract_question_import_path(message_text: str) -> str | None:
     fields = message_text.strip().split(None, 2)
     if len(fields) < 3:
         return None
-    if fields[0].lower() != "/law" or fields[1].lower() not in {
+    if fields[0].lower() not in {"/law", "law", "/法务", "法务"} or fields[
+        1
+    ].lower() not in {
         "question-import",
         "import-questions",
     }:
@@ -1181,6 +1193,51 @@ def _extract_question_import_path(message_text: str) -> str | None:
     if len(path) >= 2 and path[0] == path[-1] and path[0] in {"'", '"'}:
         path = path[1:-1]
     return path or None
+
+
+def _normalize_law_command_parts(message_text: str) -> list[str]:
+    """Normalize Chinese user commands and legacy roots to one handler syntax."""
+    fields = shlex.split(str(message_text or "").strip())
+    if not fields:
+        return ["/law", "help"]
+    if fields[0].casefold() in {"/law", "law", "/法务", "法务"}:
+        subcommand = fields[1] if len(fields) > 1 else "help"
+        arguments = fields[2:]
+    else:
+        subcommand = fields[0]
+        arguments = fields[1:]
+
+    aliases = {
+        "状态": "status",
+        "扫描": "scan",
+        "活动": "events",
+        "截止": "deadlines",
+        "题目": "question",
+        "案例": "case",
+        "当前": "current",
+        "下一页": "next",
+        "下一题": "next-question",
+        "答案": "answer",
+        "答案续页": "next-answer",
+        "解析": "explanation",
+        "解析续页": "next-explanation",
+        "结束": "close",
+        "计划": "plans",
+        "群计划": "plans",
+        "群目标": "targets",
+        "绑定": "bind",
+        "改名": "rename",
+        "帮助": "help",
+    }
+    normalized = aliases.get(subcommand, subcommand.casefold())
+    if subcommand in {"真题", "模拟题"}:
+        return [
+            "/law",
+            "question",
+            "real" if subcommand == "真题" else "mock",
+            *arguments,
+        ]
+    return ["/law", normalized, *arguments]
 
 
 def _event_dict(event: Any) -> dict[str, Any]:

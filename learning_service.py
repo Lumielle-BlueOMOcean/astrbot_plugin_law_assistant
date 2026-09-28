@@ -90,6 +90,7 @@ class LearningService:
         exam_year: str | None = None,
         session_origin: str | None = None,
         used_content_keys: set[tuple[str, str]] | None = None,
+        previous_content_key: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         return await self._provider().select_question(
             origin=origin,
@@ -99,6 +100,7 @@ class LearningService:
             exam_year=exam_year,
             session_origin=session_origin,
             used_content_keys=used_content_keys,
+            previous_content_key=previous_content_key,
         )
 
     def import_real_questions(

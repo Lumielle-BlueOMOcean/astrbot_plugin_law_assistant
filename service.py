@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
+import json
 import logging
 import secrets
+import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 if __package__ and "." in __package__:
     from .activity_radar import (
@@ -17,13 +21,17 @@ if __package__ and "." in __package__:
         radar_policy_for,
     )
     from .content import (
+        RealQuestion,
         normalize_subject,
         parse_origin,
         parse_question_type,
         parse_subject,
+        real_question_identity_key,
     )
     from .daily_plans import DailyPlan
     from .daily_resolver import resolve_daily_constraints
+    from .daily_timing import local_due_datetime, next_daily_due
+    from .date_parser import parse_datetime_value
     from .document_extractors import DocumentParseError, DocumentSegment, ParsedDocument
     from .learning_segmentation import (
         CASE_SEGMENTATION_VERSION,
@@ -33,6 +41,7 @@ if __package__ and "." in __package__:
     from .library_models import LibrarySource
     from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
+    from .pagination import page_payload, page_request
     from .publisher import format_deadline_reminder, format_event
     from .question_session import (
         build_question_session_snapshot,
@@ -45,6 +54,7 @@ if __package__ and "." in __package__:
         prepare_question_session_snapshot,
     )
     from .question_session_repository import QuestionSessionRepository
+    from .scheduled_reveals import ScheduledRevealRepository
     from .sources.base import Extractor, SourceAdapter, Validator
     from .storage import SQLiteStorage
     from .structured_ingestion import (
@@ -59,19 +69,24 @@ else:
         radar_policy_for,
     )
     from content import (
+        RealQuestion,
         normalize_subject,
         parse_origin,
         parse_question_type,
         parse_subject,
+        real_question_identity_key,
     )
     from daily_plans import DailyPlan
     from daily_resolver import resolve_daily_constraints
+    from daily_timing import local_due_datetime, next_daily_due
+    from date_parser import parse_datetime_value
     from document_extractors import DocumentParseError, DocumentSegment, ParsedDocument
     from learning_segmentation import CASE_SEGMENTATION_VERSION, segment_official_cases
     from learning_service import LearningService
     from library_models import LibrarySource
     from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
+    from pagination import page_payload, page_request
     from publisher import format_deadline_reminder, format_event
     from question_session import (
         build_question_session_snapshot,
@@ -84,6 +99,7 @@ else:
         prepare_question_session_snapshot,
     )
     from question_session_repository import QuestionSessionRepository
+    from scheduled_reveals import ScheduledRevealRepository
     from sources.base import Extractor, SourceAdapter, Validator
     from storage import SQLiteStorage
     from structured_ingestion import (
@@ -171,6 +187,78 @@ class PendingStructuredImport:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingCandidatePromotion:
+    owner_id: str
+    items: tuple[dict[str, Any], ...]
+    prevalidation_failures: tuple[dict[str, Any], ...]
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEventStatusOverride:
+    owner_id: str
+    event_id: int
+    source_hash: str
+    status: str
+    reason: str
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEventDateReview:
+    owner_id: str
+    event_id: int
+    event_date_id: int
+    source_hash: str
+    evidence_hash: str
+    evidence_text: str
+    old_value: dict[str, Any]
+    proposed_value: dict[str, Any]
+    decision: str
+    reason: str
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PendingManagementBatch:
+    owner_id: str
+    action: str
+    item_ids: tuple[int, ...]
+    changes: dict[str, Any]
+    expected: dict[int, dict[str, Any]]
+    preview: tuple[dict[str, Any], ...]
+    created_at: datetime
+    expires_at: datetime
+    promotion_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingModerationBatch:
+    owner_id: str
+    domain: str
+    status: str
+    reason: str
+    item_ids: tuple[int, ...]
+    expected: dict[int, dict[str, Any]]
+    preview: tuple[dict[str, Any], ...]
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDataClear:
+    owner_id: str
+    scope: str
+    snapshot: dict[str, list[tuple[Any, ...]]]
+    preview: dict[str, Any]
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ContentReference:
     content_type: str
     content: dict[str, Any]
@@ -197,6 +285,8 @@ _DAILY_HISTORY_SAFE_FIELDS = (
     "content_type",
     "status",
     "attempted_at",
+    "intended_local_at",
+    "target_label",
     "finished_at",
     "error_summary",
     "source_kind",
@@ -259,11 +349,21 @@ class LawAssistantService:
         self._plan_reset_confirmations: dict[str, PendingPlanReset] = {}
         self._import_confirmations: dict[str, PendingImport] = {}
         self._structured_import_confirmations: dict[str, PendingStructuredImport] = {}
+        self._candidate_promotion_confirmations: dict[
+            str, PendingCandidatePromotion
+        ] = {}
+        self._event_status_confirmations: dict[str, PendingEventStatusOverride] = {}
+        self._event_date_review_confirmations: dict[str, PendingEventDateReview] = {}
+        self._management_batch_confirmations: dict[str, PendingManagementBatch] = {}
+        self._moderation_batch_confirmations: dict[str, PendingModerationBatch] = {}
+        self._data_clear_confirmations: dict[str, PendingDataClear] = {}
         self._unbind_confirmations: dict[
             str, tuple[int, datetime, datetime, str | None]
         ] = {}
         self._content_references: dict[str, ContentReference] = {}
         self.question_sessions = QuestionSessionRepository(storage.connection)
+        self.scheduled_reveals = ScheduledRevealRepository(storage.connection)
+        self._scheduled_reveal_lock = asyncio.Lock()
         self._scheduler_wakeup: Any | None = None
 
     def set_scheduler_wakeup(self, callback: Any | None) -> None:
@@ -340,9 +440,16 @@ class LawAssistantService:
             source_kind=(
                 source_kind
                 or (
-                    "library_question"
-                    if item
-                    else ("real_question" if origin == "real" else "generated_question")
+                    str(content.get("source_kind") or "")
+                    or (
+                        "library_question"
+                        if item
+                        else (
+                            "real_question"
+                            if origin == "real"
+                            else "generated_question"
+                        )
+                    )
                 )
             ),
             source_item_key=item_key,
@@ -474,7 +581,7 @@ class LawAssistantService:
         if session is None:
             return {
                 "success": False,
-                "reason": "当前会话没有进行中的题目；可用 /law question 或 /law study <ID> 开始。",
+                "reason": "当前会话没有进行中的题目；可以请我出一道题，或打开资料库中的题目开始学习。",
             }
         action = str(action).strip().lower().replace("_", "-")
         if action == "close":
@@ -497,9 +604,9 @@ class LawAssistantService:
         if action == "next":
             if session.get("current_stage") in {"answer", "explanation"}:
                 continuation = (
-                    "/law next-answer"
+                    "继续查看答案"
                     if session["current_stage"] == "answer"
-                    else "/law next-explanation"
+                    else "继续查看解析"
                 )
                 return {
                     "success": False,
@@ -532,7 +639,7 @@ class LawAssistantService:
                     return {
                         "success": True,
                         "session_id": session["id"],
-                        "text": "本题内容已展示完毕，可继续讨论、使用 /law answer 查看答案，或在有下一小问时使用 /law next-question。",
+                        "text": "本题内容已展示完毕。你可以继续讨论、明确要求查看答案，或在有下一小问时进入下一小问。",
                     }
                 prompt_page = encode_session_page_index(snapshot, display_page + 1)
             session = (
@@ -551,9 +658,7 @@ class LawAssistantService:
         elif action in {"next-answer", "next-explanation"}:
             kind = "answer" if action == "next-answer" else "explanation"
             if session.get("current_stage") != kind:
-                reveal_command = (
-                    "/law answer" if kind == "answer" else "/law explanation"
-                )
+                reveal_command = "查看答案" if kind == "answer" else "查看解析"
                 return {
                     "success": False,
                     "reason": f"当前尚未进入{('答案' if kind == 'answer' else '解析')}分页；请先使用 {reveal_command}。",
@@ -621,16 +726,23 @@ class LawAssistantService:
                 action == "answer"
                 and self._question_session_has_unread_content(session)
             )
-            session = (
-                self.question_sessions.reveal(
+            async with self._scheduled_reveal_lock:
+                session = (
+                    self.question_sessions.reveal(
+                        session["id"],
+                        action,
+                        actor_id=str(actor_id),
+                        at=self._now_utc().isoformat(),
+                        prompt_index=session["current_prompt_index"],
+                    )
+                    or session
+                )
+                self.scheduled_reveals.skip_for_manual_reveal(
                     session["id"],
                     action,
-                    actor_id=str(actor_id),
-                    at=self._now_utc().isoformat(),
                     prompt_index=session["current_prompt_index"],
+                    at=self._now_utc().isoformat(),
                 )
-                or session
-            )
             prompt_index = session["current_prompt_index"]
             page_index = session["current_prompt_page"]
             text = (
@@ -756,7 +868,7 @@ class LawAssistantService:
         return {
             "schema_version": self.storage.schema_version,
             "plugin": {
-                "version": "0.5.2",
+                "version": "0.6.0",
                 "schema_version": self.storage.schema_version,
                 "scheduler_enabled": bool(
                     any(
@@ -808,6 +920,58 @@ class LawAssistantService:
         )
         return [_event_dashboard_dict(event) for event in events]
 
+    async def dashboard_radar_events_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        radar_status: str = "current",
+        event_type: str | None = None,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        if radar_status not in {"current", "needs_review", "historical", "all"}:
+            raise ValueError("不支持的活动状态")
+        normalized_page, normalized_size, offset = page_request(page, page_size)
+        selected: list[LegalEvent] = []
+        total = 0
+        normalized_keyword = str(keyword or "").casefold()
+        for event in self.storage.iter_events():
+            status = self._radar_status(event)
+            if radar_status != "all" and status != radar_status:
+                continue
+            if event_type and event.event_type.casefold() != str(event_type).casefold():
+                continue
+            if (
+                normalized_keyword
+                and normalized_keyword
+                not in (
+                    f"{event.title} {event.organizer} {event.summary} {event.eligibility}"
+                ).casefold()
+            ):
+                continue
+            if offset <= total < offset + normalized_size:
+                selected.append(
+                    replace(
+                        event,
+                        metadata={
+                            **event.metadata,
+                            "radar_status": status,
+                            "status_override": self.storage.get_event_status_override(
+                                int(event.id)
+                            )
+                            if event.id is not None
+                            else None,
+                        },
+                    )
+                )
+            total += 1
+        return page_payload(
+            [_event_dashboard_dict(event) for event in selected],
+            page=normalized_page,
+            page_size=normalized_size,
+            total=total,
+        )
+
     async def dashboard_history(
         self, kind: str, *, limit: int = 50
     ) -> list[dict[str, Any]]:
@@ -823,9 +987,58 @@ class LawAssistantService:
             return self.storage.list_reminders(limit=safe_limit)
         if kind == "sources":
             return self.storage.list_source_runs(limit=safe_limit)
+        if kind == "reveals":
+            return self.scheduled_reveals.list_history(limit=safe_limit)
         raise ValueError(
-            "history kind 必须是 daily、publications、reminders 或 sources"
+            "history kind 必须是 daily、publications、reminders、sources 或 reveals"
         )
+
+    async def dashboard_page(
+        self, kind: str, *, page: int = 1, page_size: int = 20
+    ) -> dict[str, Any]:
+        normalized_page, normalized_size, _ = page_request(page, page_size)
+        if kind == "cases":
+            if self.library_service is None:
+                return page_payload(
+                    [], page=normalized_page, page_size=normalized_size, total=0
+                )
+            repository = self.library_service.repository
+            items = repository.search(
+                item_type="case",
+                identity="official_case",
+                limit=normalized_size,
+                offset=(normalized_page - 1) * normalized_size,
+            )
+            total = repository.count_search(item_type="case", identity="official_case")
+            return page_payload(
+                [self.library_service._item_summary(item) for item in items],
+                page=normalized_page,
+                page_size=normalized_size,
+                total=total,
+            )
+        result = self.storage.dashboard_list_page(
+            kind, page=normalized_page, page_size=normalized_size
+        )
+        items = result["items"]
+        if kind == "daily":
+            items = [_daily_history_safe_record(item) for item in items]
+        elif kind == "targets":
+            items = [{**item, "enabled": bool(item.get("enabled"))} for item in items]
+        elif kind == "reveals":
+            for item in items:
+                item["page_progress"] = json.loads(
+                    item.pop("page_progress_json", "[]") or "[]"
+                )
+                target = (
+                    self.storage.get_target(int(item["target_id"]))
+                    if item.get("target_id") is not None
+                    else None
+                )
+                item["target_label"] = target["label"] if target else "已解绑目标"
+        elif kind == "sources":
+            items = [{**item, "success": bool(item.get("success"))} for item in items]
+        result["items"] = items
+        return result
 
     async def scan_events(
         self,
@@ -1183,7 +1396,15 @@ class LawAssistantService:
             result.append(
                 replace(
                     event,
-                    metadata={**event.metadata, "radar_status": derived_status},
+                    metadata={
+                        **event.metadata,
+                        "radar_status": derived_status,
+                        "status_override": self.storage.get_event_status_override(
+                            int(event.id)
+                        )
+                        if event.id is not None
+                        else None,
+                    },
                 )
             )
         result.sort(key=self._event_sort_key)
@@ -1195,16 +1416,284 @@ class LawAssistantService:
             return None
         return replace(
             event,
-            metadata={**event.metadata, "radar_status": self._radar_status(event)},
+            metadata={
+                **event.metadata,
+                "radar_status": self._radar_status(event),
+                "status_override": self.storage.get_event_status_override(int(event.id))
+                if event.id is not None
+                else None,
+            },
         )
 
     def _radar_status(self, event: LegalEvent) -> str:
+        override = (
+            self.storage.get_event_status_override(event.id)
+            if event.id is not None
+            else None
+        )
+        if override is not None:
+            return str(override["override_status"])
         return derive_radar_status(
             event,
             self._now_utc(),
             getattr(self.config, "timezone", "Asia/Shanghai"),
             tuple(getattr(self.config, "radar_historical_keywords", ()) or ()),
         )
+
+    async def prepare_event_status_override(
+        self,
+        event_id: int,
+        status: str,
+        reason: str,
+        *,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {
+            "current",
+            "needs_review",
+            "historical",
+            "ignored",
+            "derived",
+        }:
+            return {"ready": False, "reason": "不支持的雷达展示状态"}
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason or len(normalized_reason) > 500:
+            return {"ready": False, "reason": "请填写不超过 500 字的处理原因"}
+        event = self.storage.get_event(int(event_id))
+        if event is None:
+            return {"ready": False, "reason": "活动不存在"}
+        now = self._now_utc()
+        token = secrets.token_urlsafe(18)
+        self._event_status_confirmations[token] = PendingEventStatusOverride(
+            owner_id=str(actor_id),
+            event_id=int(event_id),
+            source_hash=event.raw_content_hash,
+            status=normalized_status,
+            reason=normalized_reason,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        current_override = self.storage.get_event_status_override(int(event_id))
+        return {
+            "ready": True,
+            "token": token,
+            "event_id": int(event_id),
+            "title": event.title,
+            "derived_status": derive_radar_status(
+                event,
+                now,
+                getattr(self.config, "timezone", "Asia/Shanghai"),
+                tuple(getattr(self.config, "radar_historical_keywords", ()) or ()),
+            ),
+            "current_override": current_override,
+            "status_after": normalized_status,
+            "reason": normalized_reason,
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        }
+
+    async def confirm_event_status_override(
+        self, token: str, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._event_status_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "确认 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        self._event_status_confirmations.pop(str(token), None)
+        now = self._now_utc()
+        if now > pending.expires_at:
+            return {"success": False, "reason": "确认 token 已过期"}
+        event = self.storage.get_event(pending.event_id)
+        if event is None or event.raw_content_hash != pending.source_hash:
+            return {"success": False, "reason": "活动来源已变化，请重新预览"}
+        try:
+            self.storage.set_event_status_override(
+                pending.event_id,
+                pending.status,
+                actor_id=str(actor_id),
+                reason=pending.reason,
+                at=now.isoformat(),
+            )
+        except ValueError as exc:
+            return {"success": False, "reason": str(exc)}
+        return {
+            "success": True,
+            "event_id": pending.event_id,
+            "radar_status": self._radar_status(event),
+            "status_override": self.storage.get_event_status_override(pending.event_id),
+        }
+
+    async def prepare_event_date_review(
+        self,
+        event_id: int,
+        event_date_id: int,
+        proposed_datetime: str,
+        reason: str,
+        *,
+        actor_id: str,
+        decision: str = "accepted",
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        normalized_decision = str(decision or "accepted").strip().lower()
+        if normalized_decision not in {"accepted", "rejected"}:
+            return {"ready": False, "reason": "复核决定必须是 accepted 或 rejected"}
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason or len(normalized_reason) > 500:
+            return {"ready": False, "reason": "请填写不超过 500 字的复核原因"}
+        event = self.storage.get_event(int(event_id))
+        if event is None:
+            return {"ready": False, "reason": "活动不存在"}
+        event_date = next(
+            (item for item in event.dates if item.id == int(event_date_id)), None
+        )
+        if event_date is None:
+            return {"ready": False, "reason": "日期节点不属于该活动"}
+        raw_value = str(proposed_datetime or "").strip()
+        parsed = parse_datetime_value(raw_value, timezone_name=event_date.timezone)
+        if parsed is None:
+            return {"ready": False, "reason": "建议日期必须是有效 ISO 日期或时间"}
+        supplied_precision = "minute" if ":" in raw_value else "date"
+        if supplied_precision != event_date.precision:
+            return {"ready": False, "reason": "建议日期精度必须与原证据一致"}
+        parsed = parsed.astimezone(ZoneInfo(event_date.timezone))
+        old_value = {
+            "kind": event_date.kind,
+            "datetime": event_date.datetime.isoformat()
+            if event_date.datetime
+            else None,
+            "timezone": event_date.timezone,
+            "label": event_date.label,
+            "confirmed": event_date.confirmed,
+            "precision": event_date.precision,
+        }
+        proposed_value = {
+            "kind": event_date.kind,
+            "datetime": parsed.isoformat(),
+            "timezone": event_date.timezone,
+            "label": event_date.label,
+        }
+        evidence_hash = hashlib.sha256(
+            "\0".join(
+                (
+                    event.raw_content_hash,
+                    str(event_date.id),
+                    event_date.kind,
+                    event_date.evidence_text,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        now = self._now_utc()
+        token = secrets.token_urlsafe(18)
+        self._event_date_review_confirmations[token] = PendingEventDateReview(
+            owner_id=str(actor_id),
+            event_id=int(event_id),
+            event_date_id=int(event_date_id),
+            source_hash=event.raw_content_hash,
+            evidence_hash=evidence_hash,
+            evidence_text=event_date.evidence_text,
+            old_value=old_value,
+            proposed_value=proposed_value,
+            decision=normalized_decision,
+            reason=normalized_reason,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "event_id": int(event_id),
+            "event_date_id": int(event_date_id),
+            "old_value": old_value,
+            "proposed_value": proposed_value,
+            "decision": normalized_decision,
+            "reason": normalized_reason,
+            "evidence_hash": evidence_hash,
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        }
+
+    async def confirm_event_date_review(
+        self, token: str, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._event_date_review_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "复核 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "复核 token 不属于当前操作者"}
+        self._event_date_review_confirmations.pop(str(token), None)
+        now = self._now_utc()
+        if now > pending.expires_at:
+            return {"success": False, "reason": "复核 token 已过期"}
+        try:
+            review_id = self.storage.record_event_date_review(
+                event_id=pending.event_id,
+                event_date_id=pending.event_date_id,
+                source_hash=pending.source_hash,
+                evidence_hash=pending.evidence_hash,
+                evidence_text=pending.evidence_text,
+                old_value=pending.old_value,
+                proposed_value=pending.proposed_value,
+                decision=pending.decision,
+                actor_id=str(actor_id),
+                reason=pending.reason,
+                at=now.isoformat(),
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "reason": str(exc)}
+        event = self.storage.get_event(pending.event_id)
+        reviewed_date = (
+            next(
+                (item for item in event.dates if item.id == pending.event_date_id), None
+            )
+            if event
+            else None
+        )
+        return {
+            "success": True,
+            "review_id": review_id,
+            "decision": pending.decision,
+            "confirmed": reviewed_date.confirmed if reviewed_date else False,
+            "event_date": pending.proposed_value
+            if pending.decision == "accepted"
+            else pending.old_value,
+        }
+
+    async def list_event_date_reviews(
+        self, *, actor_id: str, limit: int = 50
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        return {
+            "success": True,
+            "items": self.storage.list_event_date_reviews(limit=limit),
+        }
 
     def _event_sort_key(self, event: LegalEvent) -> tuple[datetime, float, int]:
         deadlines = [
@@ -1600,8 +2089,7 @@ class LawAssistantService:
                 return {"success": False, "reason": "目标群已不存在或已停用"}
         for plan in pending.plans:
             self.storage.upsert_daily_plan(plan, pending.target_id)
-        if any(plan.enabled for plan in pending.plans) or self._has_enabled_plan():
-            await self._wake_scheduler()
+        await self._wake_scheduler()
         return {"success": True, "content_types": list(pending.content_types)}
 
     async def prepare_daily_plan_override_removal(
@@ -1694,6 +2182,7 @@ class LawAssistantService:
                 }
         for content_type in pending.content_types:
             self.storage.delete_daily_plan(pending.target_id, content_type)
+        await self._wake_scheduler()
         return {"success": True, "content_types": list(pending.content_types)}
 
     def _has_enabled_plan(self) -> bool:
@@ -2555,6 +3044,24 @@ class LawAssistantService:
             }
         return await self.library_service.search_learning_library(**kwargs)
 
+    async def search_management_learning_library(
+        self, *, actor_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        kwargs["include_inactive"] = bool(kwargs.get("include_inactive", False))
+        return await self.library_service.search_learning_library(**kwargs)
+
     async def get_learning_item(self, item_id: int) -> dict[str, Any]:
         if self.library_service is None:
             return {
@@ -2585,12 +3092,780 @@ class LawAssistantService:
             }
         return await self.library_service.update_learning_item(item_id, changes)
 
+    def _management_actor_allowed(self, actor_id: str | None) -> bool:
+        actor = str(actor_id or "").strip()
+        if actor == "webui":
+            return True
+        configured = (
+            self.config.get("operator_ids", [])
+            if isinstance(self.config, dict)
+            else getattr(self.config, "operator_ids", [])
+        )
+        return actor != "" and actor in {str(value) for value in (configured or [])}
+
+    async def get_management_learning_item(
+        self, item_id: int, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        return await self.library_service.get_management_item(item_id)
+
+    async def prepare_library_batch(
+        self,
+        action: str,
+        item_ids: list[int],
+        *,
+        actor_id: str,
+        changes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {"ready": False, "reason": "学习资料库服务不可用"}
+        normalized_action = str(action or "").strip().lower()
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids or len(ids) > 100:
+            return {"ready": False, "reason": "请选择 1 至 100 条资料"}
+        if normalized_action == "promote":
+            promotion = await self.prepare_candidate_promotion(ids, actor_id=actor_id)
+            if not promotion.get("ready"):
+                return promotion
+            promotion_token = str(promotion["token"])
+            preview_items = tuple(
+                {
+                    key: item.get(key)
+                    for key in (
+                        "item_id",
+                        "eligible",
+                        "already_linked",
+                        "will_upsert",
+                        "real_question_id",
+                        "reason",
+                        "normalized",
+                    )
+                }
+                for item in promotion.get("items", [])
+            )
+            promotion_summary = {
+                key: promotion.get(key, 0)
+                for key in (
+                    "selected_count",
+                    "promotable_count",
+                    "already_linked_count",
+                    "unresolved_answer_count",
+                    "upsert_count",
+                )
+            }
+            promotion_summary["validation_failures"] = promotion.get(
+                "validation_failures", []
+            )
+            changes_value: dict[str, Any] = {}
+        elif normalized_action in {"edit", "delete", "restore"}:
+            changes_value = dict(changes or {}) if normalized_action == "edit" else {}
+            if normalized_action == "edit" and not changes_value:
+                return {"ready": False, "reason": "编辑操作需要至少一个字段"}
+            expected: dict[int, dict[str, Any]] = {}
+            preview_list: list[dict[str, Any]] = []
+            normalized_changes: list[dict[str, Any]] = []
+            item_types: set[str] = set()
+            for item_id in ids:
+                bundle = self.library_service.repository.get(item_id)
+                if bundle is None:
+                    return {"ready": False, "reason": f"未找到资料 {item_id}"}
+                item = bundle.item
+                if normalized_action == "delete" and not item.active:
+                    return {"ready": False, "reason": f"资料 {item_id} 已停用"}
+                if normalized_action == "restore" and item.active:
+                    return {"ready": False, "reason": f"资料 {item_id} 已启用"}
+                item_types.add(item.item_type)
+                if normalized_action == "edit":
+                    try:
+                        normalized_changes.append(
+                            self.library_service.normalize_management_changes(
+                                item_id, changes_value
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        return {"ready": False, "reason": f"资料 {item_id}：{exc}"}
+                expected[item_id] = {
+                    "item_hash": item.item_hash,
+                    "updated_at": item.updated_at.isoformat(),
+                    "active": int(item.active),
+                    "identity": item.identity,
+                    "item_type": item.item_type,
+                }
+                preview_list.append(
+                    {
+                        "id": item_id,
+                        "title": item.title,
+                        "identity": item.identity,
+                        "active": item.active,
+                    }
+                )
+            if normalized_action == "edit":
+                if len(item_types) != 1:
+                    return {"ready": False, "reason": "批量编辑要求所选资料类型一致"}
+                if any(
+                    item != normalized_changes[0] for item in normalized_changes[1:]
+                ):
+                    return {
+                        "ready": False,
+                        "reason": "所选资料无法使用同一规范化编辑内容",
+                    }
+                changes_value = normalized_changes[0]
+            preview_items = tuple(preview_list)
+            promotion_token = None
+        else:
+            return {"ready": False, "reason": "不支持的批量操作"}
+
+        token = secrets.token_urlsafe(18)
+        now = self._now_utc()
+        self._management_batch_confirmations[token] = PendingManagementBatch(
+            owner_id=str(actor_id),
+            action=normalized_action,
+            item_ids=tuple(ids),
+            changes=changes_value,
+            expected=locals().get("expected", {}),
+            preview=preview_items,
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+            promotion_token=locals().get("promotion_token"),
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "action": normalized_action,
+            "count": len(ids),
+            "items": list(preview_items),
+            "changes": changes_value,
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            **locals().get("promotion_summary", {}),
+        }
+
+    async def prepare_moderation_batch(
+        self,
+        domain: str,
+        item_ids: list[int],
+        changes: dict[str, Any],
+        *,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        """Prepare an exact-ID Review or Radar status batch for an operator."""
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        normalized_domain = str(domain or "").strip().lower()
+        if normalized_domain not in {"review", "radar"}:
+            return {"ready": False, "reason": "不支持的批量管理列表"}
+        if not isinstance(changes, dict) or set(changes) - {"status", "reason"}:
+            return {"ready": False, "reason": "批量状态参数无效"}
+        status = str(changes.get("status") or "").strip().lower()
+        allowed_statuses = (
+            {"pending", "resolved", "superseded"}
+            if normalized_domain == "review"
+            else {"current", "needs_review", "historical", "ignored", "auto"}
+        )
+        if status not in allowed_statuses:
+            return {"ready": False, "reason": "不支持的批量状态"}
+        reason = str(changes.get("reason") or "").strip()
+        if (
+            normalized_domain == "radar"
+            and status != "auto"
+            and (not reason or len(reason) > 500)
+        ):
+            return {
+                "ready": False,
+                "reason": "人工状态覆盖必须填写不超过 500 字的原因",
+            }
+        try:
+            ids = list(dict.fromkeys(int(value) for value in item_ids))
+        except (TypeError, ValueError):
+            return {"ready": False, "reason": "所选 ID 必须是整数"}
+        if not ids or len(ids) > 100:
+            return {"ready": False, "reason": "请选择 1 至 100 条记录"}
+        expected: dict[int, dict[str, Any]] = {}
+        preview: list[dict[str, Any]] = []
+        now = self._now_utc()
+        if normalized_domain == "review":
+            if self.library_service is None:
+                return {"ready": False, "reason": "学习资料库服务不可用"}
+            for review_id in ids:
+                item = self.library_service.repository.get_review_item(review_id)
+                if item is None:
+                    return {"ready": False, "reason": f"复核记录 {review_id} 不存在"}
+                expected[review_id] = {
+                    "source_id": item.source_id,
+                    "candidate_key": item.candidate_key,
+                    "status": item.status,
+                    "updated_at": item.updated_at.isoformat(),
+                }
+                preview.append(
+                    {
+                        "id": review_id,
+                        "material_type": item.material_type,
+                        "status_before": item.status,
+                        "status_after": status,
+                        "review_reason": item.review_reason,
+                    }
+                )
+        else:
+            for event_id in ids:
+                event = self.storage.get_event(event_id)
+                if event is None:
+                    return {"ready": False, "reason": f"活动 {event_id} 不存在"}
+                override = self.storage.get_event_status_override(event_id)
+                derived_status = derive_radar_status(
+                    event,
+                    now,
+                    getattr(self.config, "timezone", "Asia/Shanghai"),
+                    tuple(getattr(self.config, "radar_historical_keywords", ()) or ()),
+                )
+                expected[event_id] = {
+                    "source_hash": event.raw_content_hash,
+                    "override": override,
+                    "derived_status": derived_status,
+                }
+                preview.append(
+                    {
+                        "id": event_id,
+                        "title": event.title,
+                        "status_before": override["override_status"]
+                        if override
+                        else derived_status,
+                        "status_after": derived_status if status == "auto" else status,
+                        "action": "clear_override"
+                        if status == "auto"
+                        else "set_override",
+                    }
+                )
+        token = secrets.token_urlsafe(18)
+        pending = PendingModerationBatch(
+            owner_id=str(actor_id),
+            domain=normalized_domain,
+            status=status,
+            reason=reason,
+            item_ids=tuple(ids),
+            expected=expected,
+            preview=tuple(preview),
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        self._moderation_batch_confirmations[token] = pending
+        return {
+            "ready": True,
+            "token": token,
+            "domain": normalized_domain,
+            "status": status,
+            "reason": reason,
+            "count": len(ids),
+            "item_ids": list(ids),
+            "items": list(pending.preview),
+            "expires_at": pending.expires_at.isoformat(),
+        }
+
+    async def confirm_moderation_batch(
+        self, token: str, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._moderation_batch_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "批量确认 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "批量确认 token 不属于当前操作者"}
+        self._moderation_batch_confirmations.pop(str(token), None)
+        now = self._now_utc()
+        if now > pending.expires_at:
+            return {"success": False, "reason": "批量确认 token 已过期"}
+        try:
+            if pending.domain == "review":
+                changed = self.library_service.repository.apply_review_status_batch(
+                    list(pending.item_ids),
+                    pending.expected,
+                    pending.status,
+                    actor_id=str(actor_id),
+                    at=now.isoformat(),
+                )
+            else:
+                for event_id in pending.item_ids:
+                    event = self.storage.get_event(event_id)
+                    if event is None:
+                        raise ValueError("活动已删除，请重新预览")
+                    current_derived = derive_radar_status(
+                        event,
+                        now,
+                        getattr(self.config, "timezone", "Asia/Shanghai"),
+                        tuple(
+                            getattr(self.config, "radar_historical_keywords", ()) or ()
+                        ),
+                    )
+                    if current_derived != pending.expected[event_id]["derived_status"]:
+                        raise ValueError("活动自动状态已变化，请重新预览")
+                changed = self.storage.apply_event_status_batch(
+                    list(pending.item_ids),
+                    pending.expected,
+                    pending.status,
+                    actor_id=str(actor_id),
+                    reason=pending.reason,
+                    at=now.isoformat(),
+                )
+        except (TypeError, ValueError, sqlite3.Error, RuntimeError) as exc:
+            return {"success": False, "reason": str(exc), "changed_ids": []}
+        return {
+            "success": True,
+            "domain": pending.domain,
+            "status": pending.status,
+            "changed_ids": changed,
+            "count": len(changed),
+        }
+
+    async def confirm_library_batch(
+        self, token: str, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._management_batch_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "批量确认 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "批量确认 token 不属于当前操作者"}
+        self._management_batch_confirmations.pop(str(token), None)
+        if self._now_utc() > pending.expires_at:
+            return {"success": False, "reason": "批量确认 token 已过期"}
+        if pending.action == "promote":
+            return await self.confirm_candidate_promotion(
+                str(pending.promotion_token), actor_id=actor_id
+            )
+        try:
+            changed = self.library_service.repository.apply_management_batch(
+                action=pending.action,
+                item_ids=list(pending.item_ids),
+                expected=pending.expected,
+                actor_id=str(actor_id),
+                at=self._now_utc().isoformat(),
+                changes=pending.changes,
+            )
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            return {"success": False, "reason": str(exc), "changed_ids": []}
+        if self._scheduler_wakeup is not None and pending.action in {
+            "delete",
+            "restore",
+        }:
+            await self._wake_scheduler()
+        return {
+            "success": True,
+            "action": pending.action,
+            "changed_ids": changed,
+            "count": len(changed),
+        }
+
+    async def prepare_data_clear(self, scope: str, *, actor_id: str) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        try:
+            preview = self.storage.prepare_data_clear(str(scope))
+        except (TypeError, ValueError) as exc:
+            return {"ready": False, "error": "invalid_scope", "reason": str(exc)}
+        token = secrets.token_urlsafe(18)
+        now = self._now_utc()
+        self._data_clear_confirmations[token] = PendingDataClear(
+            owner_id=str(actor_id),
+            scope=str(scope),
+            snapshot=preview["snapshot"],
+            preview={key: value for key, value in preview.items() if key != "snapshot"},
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            **self._data_clear_confirmations[token].preview,
+        }
+
+    async def confirm_data_clear(
+        self, token: str, *, actor_id: str, typed_confirmation: str | None = None
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._data_clear_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "清理 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "清理 token 不属于当前操作者"}
+        self._data_clear_confirmations.pop(str(token), None)
+        if self._now_utc() > pending.expires_at:
+            return {"success": False, "reason": "清理 token 已过期"}
+        try:
+            result = self.storage.confirm_data_clear(
+                pending.scope,
+                pending.snapshot,
+                typed_confirmation=typed_confirmation,
+            )
+        except (TypeError, ValueError, sqlite3.Error, RuntimeError) as exc:
+            return {"success": False, "reason": str(exc)}
+        await self._wake_scheduler()
+        return result
+
+    async def update_management_learning_item(
+        self, item_id: int, changes: dict[str, Any], *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        result = await self.library_service.update_management_item(item_id, changes)
+        if result.get("success"):
+            with self.storage.connection:
+                self.storage.connection.execute(
+                    "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                    "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(actor_id),
+                        "learning_item_updated",
+                        "learning_item",
+                        json.dumps([int(item_id)]),
+                        "{}",
+                        self._now_utc().isoformat(),
+                    ),
+                )
+        return result
+
+    async def soft_delete_learning_items(
+        self, item_ids: list[int], *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        try:
+            changed = self.library_service.repository.soft_delete_items(
+                item_ids, actor_id=str(actor_id), at=self._now_utc().isoformat()
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": "invalid_item_ids", "message": str(exc)}
+        self._audit_operator_action(actor_id, "learning_items_soft_deleted", changed)
+        return {"success": True, "changed_ids": changed, "count": len(changed)}
+
+    async def restore_learning_items(
+        self, item_ids: list[int], *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {
+                "success": False,
+                "error": "library_service_unavailable",
+                "message": "学习资料库服务不可用",
+            }
+        try:
+            changed = self.library_service.repository.restore_items(
+                item_ids, actor_id=str(actor_id), at=self._now_utc().isoformat()
+            )
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": "invalid_item_ids", "message": str(exc)}
+        self._audit_operator_action(actor_id, "learning_items_restored", changed)
+        return {"success": True, "changed_ids": changed, "count": len(changed)}
+
+    def _audit_operator_action(
+        self, actor_id: str, action: str, ids: list[int]
+    ) -> None:
+        with self.storage.connection:
+            self.storage.connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    action,
+                    "learning_item",
+                    json.dumps(ids),
+                    json.dumps({"count": len(ids)}),
+                    self._now_utc().isoformat(),
+                ),
+            )
+
+    async def prepare_candidate_promotion(
+        self,
+        item_ids: list[int],
+        *,
+        actor_id: str,
+        overrides_by_id: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "ready": False,
+                "error": "forbidden",
+                "reason": "需要 operator/Admin 权限",
+            }
+        if self.library_service is None:
+            return {"ready": False, "reason": "学习资料库服务不可用"}
+        normalized_ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not normalized_ids or len(normalized_ids) > 100:
+            return {"ready": False, "reason": "请选择 1 至 100 个候选题"}
+        overrides_by_id = overrides_by_id or {}
+        preview_items: list[dict[str, Any]] = []
+        pending_items: list[dict[str, Any]] = []
+        prevalidation_failures: list[dict[str, Any]] = []
+        for item_id in normalized_ids:
+            bundle = self.library_service.repository.get(item_id)
+            if (
+                bundle is None
+                or bundle.item.identity != "real_question_candidate"
+                or bundle.question is None
+            ):
+                failure = {
+                    "item_id": item_id,
+                    "success": False,
+                    "reason": "不是有效的真题候选",
+                }
+                preview_items.append({**failure, "eligible": False})
+                prevalidation_failures.append(failure)
+                continue
+            override = overrides_by_id.get(str(item_id), {})
+            override = override if isinstance(override, dict) else {}
+            source = bundle.sources[0] if bundle.sources else None
+            source_link = bundle.source_links[0] if bundle.source_links else None
+            question = bundle.question
+            answer_source = question.answer_source or (
+                "not_provided" if question.answer is None else "unverified"
+            )
+            if question.answer is not None and answer_source not in {
+                "official",
+                "third_party",
+                "user_verified",
+                "unverified",
+            }:
+                # Structured-source provenance (for example source_text) is not
+                # itself answer verification. Keep the answer but downgrade its
+                # claim to unverified during explicit identity promotion.
+                answer_source = "unverified"
+            mapping = {
+                "source_name": override.get("source_name")
+                or (source.title if source else ""),
+                "exam_name": override.get("exam_name") or question.exam_name,
+                "subject": override.get("subject")
+                or (bundle.item.subjects[0] if bundle.item.subjects else ""),
+                "question_type": override.get("question_type")
+                or question.question_type,
+                "stem": override.get("stem") or question.stem,
+                "options": override.get("options", list(question.options)),
+                "answer": override.get("answer", question.answer),
+                "explanation": override.get("explanation", question.explanation),
+                "answer_source": override.get("answer_source") or answer_source,
+                "verification_status": "user_verified",
+                "source_url": override.get("source_url")
+                or (source.source_url if source else ""),
+                "source_locator": override.get("source_locator")
+                or (source_link.locator if source_link else ""),
+                "exam_year": override.get("exam_year") or question.exam_year,
+                "exam_date": override.get("exam_date") or question.exam_date,
+                "paper": override.get("paper") or question.paper,
+                "question_number": override.get("question_number")
+                or question.question_number,
+                "metadata": {
+                    "learning_item_id": item_id,
+                    "source_content_hash": source.content_hash if source else "",
+                },
+            }
+            if mapping["answer"] is None:
+                mapping["answer_source"] = "not_provided"
+            try:
+                real_question = RealQuestion.from_mapping(mapping)
+                identity_key = real_question_identity_key(real_question)
+                existing = self.storage.connection.execute(
+                    "SELECT id FROM real_questions WHERE identity_key = ?",
+                    (identity_key,),
+                ).fetchone()
+                item_preview = {
+                    "item_id": item_id,
+                    "eligible": True,
+                    "already_linked": bool(
+                        bundle.structured
+                        and bundle.structured.get("verified_real_question_id")
+                    ),
+                    "will_upsert": existing is not None,
+                    "real_question_id": int(existing["id"]) if existing else None,
+                    "normalized": real_question.to_mapping(),
+                }
+                pending_items.append(
+                    {
+                        "item_id": item_id,
+                        "item_hash": bundle.item.item_hash,
+                        "updated_at": bundle.item.updated_at.isoformat(),
+                        "identity_key": identity_key,
+                        "question": real_question,
+                    }
+                )
+            except (TypeError, ValueError) as exc:
+                item_preview = {
+                    "item_id": item_id,
+                    "eligible": False,
+                    "reason": str(exc),
+                }
+                prevalidation_failures.append(
+                    {"item_id": item_id, "success": False, "reason": str(exc)}
+                )
+            preview_items.append(item_preview)
+        token = secrets.token_urlsafe(18)
+        now = self._now_utc()
+        self._candidate_promotion_confirmations[token] = PendingCandidatePromotion(
+            owner_id=str(actor_id),
+            items=tuple(pending_items),
+            prevalidation_failures=tuple(prevalidation_failures),
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+        return {
+            "ready": True,
+            "token": token,
+            "selected_count": len(normalized_ids),
+            "promotable_count": len(pending_items),
+            "already_linked_count": sum(
+                bool(item.get("already_linked")) for item in preview_items
+            ),
+            "validation_failures": [
+                item for item in preview_items if not item.get("eligible")
+            ],
+            "unresolved_answer_count": sum(
+                bool(item.get("eligible") and item["normalized"].get("answer") is None)
+                for item in preview_items
+            ),
+            "upsert_count": sum(
+                bool(item.get("will_upsert")) for item in preview_items
+            ),
+            "items": preview_items,
+        }
+
+    async def confirm_candidate_promotion(
+        self, token: str, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        pending = self._candidate_promotion_confirmations.get(str(token))
+        if pending is None:
+            return {"success": False, "reason": "确认 token 无效或已使用"}
+        if pending.owner_id != str(actor_id):
+            return {"success": False, "reason": "确认 token 不属于当前操作者"}
+        self._candidate_promotion_confirmations.pop(str(token), None)
+        if self._now_utc() > pending.expires_at:
+            return {"success": False, "reason": "确认 token 已过期"}
+        outcomes = [dict(failure) for failure in pending.prevalidation_failures]
+        connection = self.storage.connection
+        if pending.items:
+            connection.execute("BEGIN IMMEDIATE")
+        try:
+            for index, prepared in enumerate(pending.items):
+                savepoint = f"candidate_promotion_{index}"
+                connection.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    bundle = self.library_service.repository.get(
+                        int(prepared["item_id"])
+                    )
+                    if (
+                        bundle is None
+                        or bundle.item.identity != "real_question_candidate"
+                        or bundle.item.item_hash != prepared["item_hash"]
+                        or bundle.item.updated_at.isoformat() != prepared["updated_at"]
+                    ):
+                        raise ValueError("候选题在预览后发生变化")
+                    linked = self.storage.promote_candidate_real_question(
+                        prepared["question"],
+                        item_id=int(prepared["item_id"]),
+                        actor_id=str(actor_id),
+                        at=self._now_utc().isoformat(),
+                    )
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    outcomes.append({"success": True, **linked})
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    outcomes.append(
+                        {
+                            "item_id": prepared["item_id"],
+                            "success": False,
+                            "reason": str(exc),
+                        }
+                    )
+            if pending.items:
+                connection.commit()
+        except Exception:
+            if pending.items:
+                connection.rollback()
+            raise
+        return {
+            "success": all(item.get("success") for item in outcomes)
+            if outcomes
+            else False,
+            "partial_success": any(item.get("success") for item in outcomes)
+            and any(not item.get("success") for item in outcomes),
+            "results": outcomes,
+        }
+
     async def list_learning_review_items(
         self,
         *,
         source_id: int | None = None,
         status: str = "pending",
         limit: int = 100,
+        page: int | None = None,
+        page_size: int = 20,
     ) -> dict[str, Any]:
         if self.library_service is None:
             return {
@@ -2599,7 +3874,11 @@ class LawAssistantService:
                 "message": "学习资料库服务不可用",
             }
         return await self.library_service.list_review_items(
-            source_id=source_id, status=status, limit=limit
+            source_id=source_id,
+            status=status,
+            limit=limit,
+            page=page,
+            page_size=page_size,
         )
 
     async def get_learning_review_item(self, review_id: int) -> dict[str, Any]:
@@ -2647,6 +3926,27 @@ class LawAssistantService:
         if self.learning_service is None:
             return {"available": False, "reason": "question service unavailable"}
         try:
+            previous_content_key = None
+            if (
+                used_content_keys is None
+                and session_origin
+                and origin
+                in {
+                    "mock",
+                    "random",
+                }
+            ):
+                previous_session = self.question_sessions.get_latest_for_scope(
+                    str(session_origin)
+                )
+                if (
+                    previous_session
+                    and previous_session.get("source_kind") == "library_mock"
+                ):
+                    previous_content_key = (
+                        "library_mock",
+                        str(previous_session.get("source_item_key") or ""),
+                    )
             result = await self.learning_service.generate_question(
                 subject=subject,
                 question_type=question_type,
@@ -2655,6 +3955,7 @@ class LawAssistantService:
                 exam_year=exam_year,
                 session_origin=session_origin,
                 used_content_keys=used_content_keys,
+                previous_content_key=previous_content_key,
             )
         except ValueError as exc:
             return {
@@ -2673,6 +3974,13 @@ class LawAssistantService:
         return self.storage.list_law_updates(limit=limit)
 
     async def run_scheduled_jobs(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        result = await self.run_scheduled_scan_jobs(now=now)
+        result.update(await self.process_due_work(now=now))
+        return result
+
+    async def run_scheduled_scan_jobs(
         self, *, now: datetime | None = None
     ) -> dict[str, Any]:
         auto_scan_enabled = bool(getattr(self.config, "auto_scan_enabled", False))
@@ -2695,6 +4003,11 @@ class LawAssistantService:
         result["reminders_sent"] = (
             await self.check_deadline_reminders(now=current) if auto_scan_enabled else 0
         )
+        return result
+
+    async def process_due_work(self, *, now: datetime | None = None) -> dict[str, Any]:
+        current = now or self.clock()
+        result: dict[str, Any] = {}
         result["daily_case_sent"] = await self._run_daily_content(
             content_type="daily_case",
             now=current,
@@ -2703,7 +4016,224 @@ class LawAssistantService:
             content_type="daily_question",
             now=current,
         )
+        result["scheduled_reveals"] = await self.process_due_reveals(now=current)
         return result
+
+    async def process_due_reveals(
+        self, *, now: datetime | None = None
+    ) -> dict[str, int]:
+        """Deliver due pages from the exact persisted session snapshot."""
+        if self.publisher is None:
+            return {"sent": 0, "skipped": 0, "failed": 0, "needs_review": 0}
+        current = _as_utc(now or self.clock())
+        current_text = current.isoformat()
+        local_today = _local_datetime(
+            current, getattr(self.config, "timezone", "Asia/Shanghai")
+        ).date()
+        totals = {"sent": 0, "skipped": 0, "failed": 0, "needs_review": 0}
+        async with self._scheduled_reveal_lock:
+            for pending in self.scheduled_reveals.list_pending(
+                now=current_text, limit=1000
+            ):
+                due_local_date = _local_datetime(
+                    str(pending["due_at"]),
+                    getattr(self.config, "timezone", "Asia/Shanghai"),
+                ).date()
+                claimed = self.scheduled_reveals.claim_due(
+                    int(pending["id"]), now=current_text
+                )
+                if claimed is None:
+                    continue
+                if due_local_date < local_today:
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "skipped",
+                        at=current_text,
+                        error_summary="超过配置时区的当日发送窗口，未补发旧日期内容",
+                    )
+                    totals["skipped"] += 1
+                    continue
+                session = self.question_sessions.get(int(claimed["session_id"]))
+                target = (
+                    self.storage.get_target(int(claimed["target_id"]))
+                    if claimed.get("target_id") is not None
+                    else None
+                )
+                if (
+                    session is None
+                    or session["status"] != "open"
+                    or session["snapshot_hash"] != claimed["snapshot_hash"]
+                    or session["scope_origin"] != claimed["target_umo"]
+                    or target is None
+                    or not target.get("enabled")
+                    or target["unified_msg_origin"] != claimed["target_umo"]
+                ):
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "skipped",
+                        at=current_text,
+                        error_summary="题目会话已关闭、替代或发布目标已停用",
+                    )
+                    totals["skipped"] += 1
+                    continue
+
+                reveal_kind = str(claimed["reveal_kind"])
+                prompt_index = int(claimed["prompt_index"])
+                if self.scheduled_reveals.was_revealed(
+                    session["id"], reveal_kind, prompt_index
+                ):
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "skipped",
+                        at=current_text,
+                        error_summary="已由人工提前揭晓",
+                    )
+                    totals["skipped"] += 1
+                    continue
+
+                snapshot = prepare_question_session_snapshot(session["snapshot"])
+                prompts = snapshot.get("prompts", [])
+                if prompt_index >= len(prompts):
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "needs_review",
+                        at=current_text,
+                        error_summary="快照中不存在已绑定的小问索引",
+                    )
+                    totals["needs_review"] += 1
+                    continue
+                prompt = prompts[prompt_index]
+                availability_key = (
+                    "answer_available"
+                    if reveal_kind == "answer"
+                    else "explanation_available"
+                )
+                page_key = (
+                    "answer_pages" if reveal_kind == "answer" else "explanation_pages"
+                )
+                if not prompt.get(availability_key, False):
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "skipped",
+                        at=current_text,
+                        error_summary=(
+                            "来源未提供可核验答案"
+                            if reveal_kind == "answer"
+                            else "来源未提供独立解析"
+                        ),
+                    )
+                    totals["skipped"] += 1
+                    continue
+
+                pages = prompt.get(page_key, [])
+                if not pages:
+                    self.scheduled_reveals.finish(
+                        int(claimed["id"]),
+                        "skipped",
+                        at=current_text,
+                        error_summary="没有可发送的揭晓页面",
+                    )
+                    totals["skipped"] += 1
+                    continue
+                known_progress = {int(value) for value in claimed["page_progress"]}
+                failed = False
+                for page_index, text in enumerate(pages):
+                    if page_index in known_progress:
+                        continue
+                    try:
+                        outcome = await self.publisher.publish_text(
+                            str(claimed["target_umo"]), str(text)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - delivery may be ambiguous
+                        self.scheduled_reveals.finish(
+                            int(claimed["id"]),
+                            "needs_review",
+                            at=self._now_utc().isoformat(),
+                            error_summary=str(exc),
+                        )
+                        totals["needs_review"] += 1
+                        failed = True
+                        break
+                    status, error = _delivery_status(outcome)
+                    if status != "sent":
+                        final_status = (
+                            "failed" if status == "failed" else "needs_review"
+                        )
+                        self.scheduled_reveals.finish(
+                            int(claimed["id"]),
+                            final_status,
+                            at=self._now_utc().isoformat(),
+                            error_summary=error or "揭晓页送达状态未确认",
+                        )
+                        totals[final_status] += 1
+                        failed = True
+                        break
+                    self.scheduled_reveals.mark_page_sent(
+                        int(claimed["id"]),
+                        page_index,
+                        at=self._now_utc().isoformat(),
+                    )
+                if failed:
+                    continue
+                finished_at = self._now_utc().isoformat()
+                self.scheduled_reveals.finish(
+                    int(claimed["id"]), "sent", at=finished_at
+                )
+                self.question_sessions.record_reveal_event(
+                    session["id"],
+                    reveal_kind,
+                    actor_id="scheduler",
+                    at=finished_at,
+                    prompt_index=prompt_index,
+                )
+                totals["sent"] += 1
+        return totals
+
+    def has_due_scheduler_work(self) -> bool:
+        if self.scheduled_reveals.list_pending(limit=1):
+            return True
+        targets = self.storage.list_targets(enabled_only=True)
+        return any(
+            self.effective_daily_plan(target["id"], content_type).enabled
+            for target in targets
+            for content_type in ("daily_case", "daily_question")
+        )
+
+    def next_due_at(self, now: datetime | None = None) -> datetime | None:
+        current = now or self.clock()
+        timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
+        local_now = _local_datetime(current, timezone_name)
+        local_today = local_now.date()
+        candidates: list[datetime] = []
+        for target in self.storage.list_targets(enabled_only=True):
+            target_id = int(target["id"])
+            for content_type in ("daily_case", "daily_question"):
+                plan = self.effective_daily_plan(target_id, content_type)
+                if not plan.enabled:
+                    continue
+                due = next_daily_due(current, plan.time, timezone_name)
+                if due.astimezone(
+                    local_now.tzinfo
+                ).date() == local_today and self.storage.has_daily_content(
+                    content_date=local_today.isoformat(),
+                    target_id=target_id,
+                    content_type=content_type,
+                ):
+                    due = next_daily_due(
+                        due + timedelta(seconds=1), plan.time, timezone_name
+                    )
+                candidates.append(due)
+
+        current_utc = _as_utc(current)
+        for job in self.scheduled_reveals.list_pending(limit=1000):
+            due = _as_utc(str(job["due_at"]))
+            local_due = due.astimezone(local_now.tzinfo)
+            if local_due.date() < local_today:
+                continue
+            candidates.append(max(current_utc, due))
+        if not candidates:
+            return None
+        return min(candidates, key=_as_utc)
 
     async def _run_daily_content(
         self,
@@ -2721,6 +4251,11 @@ class LawAssistantService:
             plan = self.effective_daily_plan(target["id"], content_type)
             if not plan.enabled or not _time_is_due(now, plan.time, self.config):
                 continue
+            timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
+            intended_local = local_due_datetime(
+                local_now.date(), plan.time, timezone_name
+            )
+            intended_local_at = f"{intended_local.isoformat()}[{timezone_name}]"
             resolved = resolve_daily_constraints(
                 plan,
                 local_now.date(),
@@ -2742,6 +4277,8 @@ class LawAssistantService:
                     selected_subject,
                     question_type=selected_question_type,
                     origin=resolved["origin"],
+                    intended_local_at=intended_local_at,
+                    target_label=str(target.get("label") or ""),
                 )
                 continue
             content_date = local_now.date().isoformat()
@@ -2780,6 +4317,8 @@ class LawAssistantService:
                     selected_subject,
                     question_type=selected_question_type,
                     origin=resolved["origin"],
+                    intended_local_at=intended_local_at,
+                    target_label=str(target.get("label") or ""),
                 )
                 continue
             raw_body = content.get("content", content)
@@ -2796,6 +4335,8 @@ class LawAssistantService:
                 resolved_question_type=content.get("question_type")
                 or selected_question_type,
                 resolved_origin=content.get("origin") or resolved["origin"],
+                intended_local_at=intended_local_at,
+                target_label=str(target.get("label") or ""),
             )
             if claim_id is None:
                 continue
@@ -2825,7 +4366,7 @@ class LawAssistantService:
                         if isinstance(content.get("item"), dict)
                         else {}
                     )
-                    self._persist_question_snapshot(
+                    opened = self._persist_question_snapshot(
                         question_snapshot,
                         session_origin=target["unified_msg_origin"],
                         target_id=target["id"],
@@ -2852,12 +4393,70 @@ class LawAssistantService:
                             else None
                         ),
                     )
+                    sent_at = self._now_utc()
+                    self._schedule_question_reveals(
+                        plan=plan,
+                        session_id=int(opened["session_id"]),
+                        target_umo=str(target["unified_msg_origin"]),
+                        snapshot=question_snapshot,
+                        snapshot_hash=str(opened["snapshot_hash"]),
+                        sent_at=sent_at,
+                    )
                 self.logger.info(
                     "Law Assistant sent %s to %s",
                     content_type,
                     target["unified_msg_origin"],
                 )
         return sent
+
+    def _schedule_question_reveals(
+        self,
+        *,
+        plan: DailyPlan,
+        session_id: int,
+        target_umo: str,
+        snapshot: dict[str, Any],
+        snapshot_hash: str,
+        sent_at: datetime,
+    ) -> None:
+        """Persist independent delayed jobs for each answer/explanation prompt."""
+        if plan.question_reveal_mode != "delayed":
+            return
+        for prompt_index, prompt in enumerate(snapshot.get("prompts", [])):
+            for kind, delay in (
+                ("answer", plan.answer_reveal_delay_minutes),
+                ("explanation", plan.explanation_reveal_delay_minutes),
+            ):
+                if delay <= 0:
+                    continue
+                job = self.scheduled_reveals.create_for_session(
+                    session_id=session_id,
+                    target_umo=target_umo,
+                    snapshot_hash=snapshot_hash,
+                    question_sent_at=sent_at.isoformat(),
+                    due_at=(sent_at + timedelta(minutes=delay)).isoformat(),
+                    reveal_kind=kind,
+                    prompt_index=prompt_index,
+                    created_at=sent_at.isoformat(),
+                )
+                has_source_content = bool(
+                    prompt.get(
+                        "answer_available"
+                        if kind == "answer"
+                        else "explanation_available",
+                        False,
+                    )
+                )
+                if not has_source_content:
+                    self.scheduled_reveals.skip(
+                        int(job["id"]),
+                        at=sent_at.isoformat(),
+                        reason=(
+                            "来源未提供可核验答案"
+                            if kind == "answer"
+                            else "来源未提供独立解析"
+                        ),
+                    )
 
     def _record_daily_skip(
         self,
@@ -2869,6 +4468,8 @@ class LawAssistantService:
         *,
         question_type: str | None = None,
         origin: str | None = None,
+        intended_local_at: str | None = None,
+        target_label: str = "",
     ) -> None:
         claim_id = self.storage.record_daily_skip(
             content_date=content_date,
@@ -2878,6 +4479,8 @@ class LawAssistantService:
             subject=subject,
             resolved_question_type=question_type,
             resolved_origin=origin,
+            intended_local_at=intended_local_at,
+            target_label=target_label,
         )
         if claim_id is not None:
             self.storage.mark_daily_skipped(claim_id, reason)
@@ -2979,6 +4582,7 @@ def _event_dashboard_dict(event: LegalEvent) -> dict[str, Any]:
         "status": event.status,
         "summary": event.summary,
         "radar_status": event.metadata.get("radar_status"),
+        "status_override": event.metadata.get("status_override"),
         "revision": event.revision,
         "source_published_at": (
             event.source_published_at.isoformat()

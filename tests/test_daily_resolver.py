@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 from datetime import date, timedelta
 
 from daily_plans import DailyPlan
@@ -123,3 +125,72 @@ def test_pre_start_rotation_is_not_resolved_and_preview_does_not_generate_conten
     assert preview[0]["subject"] is None
     assert preview[0]["question_type"] is None
     assert "generated_content" not in preview[0]
+
+
+def test_case_plan_does_not_serialize_question_reveal_controls():
+    plan = DailyPlan.from_mapping(
+        "daily_case",
+        {"question_reveal_mode": "delayed", "answer_reveal_delay_minutes": 30},
+    )
+
+    serialized = plan.to_mapping()
+
+    assert plan.question_reveal_mode == "manual"
+    assert plan.answer_reveal_delay_minutes == 0
+    assert "question_reveal_mode" not in serialized
+    assert "answer_reveal_delay_minutes" not in serialized
+    assert "explanation_reveal_delay_minutes" not in serialized
+
+
+def test_daily_question_reveal_policy_is_validated_and_round_trips():
+    plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_reveal_mode": "delayed",
+            "answer_reveal_delay_minutes": 15,
+            "explanation_reveal_delay_minutes": 30,
+        },
+    )
+
+    assert plan.to_mapping()["question_reveal_mode"] == "delayed"
+    assert plan.to_mapping()["answer_reveal_delay_minutes"] == 15
+    assert plan.to_mapping()["explanation_reveal_delay_minutes"] == 30
+
+    for changes in (
+        {"question_reveal_mode": "automatic-ish"},
+        {"answer_reveal_delay_minutes": -1},
+        {"explanation_reveal_delay_minutes": 10081},
+    ):
+        try:
+            DailyPlan.from_mapping("daily_question", changes)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid reveal policy accepted: {changes!r}")
+
+
+def test_due_time_resolver_uses_local_wall_time_and_handles_dst_gap_and_fold():
+    spec = importlib.util.find_spec("daily_timing")
+    assert spec is not None, "due-time resolver must be available"
+    if spec is None:
+        return
+    timing = importlib.import_module("daily_timing")
+
+    before_due = timing.next_daily_due(
+        "2026-09-29T07:59:00+08:00", "08:00", "Asia/Shanghai"
+    )
+    at_due = timing.next_daily_due(
+        "2026-09-29T08:00:00+08:00", "08:00", "Asia/Shanghai"
+    )
+    spring_gap = timing.local_due_datetime(
+        date(2026, 3, 8), "02:30", "America/New_York"
+    )
+    fall_fold = timing.local_due_datetime(
+        date(2026, 11, 1), "01:30", "America/New_York"
+    )
+
+    assert before_due.isoformat() == "2026-09-29T08:00:00+08:00"
+    assert at_due.isoformat() == "2026-09-30T08:00:00+08:00"
+    assert (spring_gap.hour, spring_gap.minute) == (3, 0)
+    assert spring_gap.fold == 0
+    assert fall_fold.fold == 0

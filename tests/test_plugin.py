@@ -99,9 +99,12 @@ async def test_plugin_import_lifecycle_and_entrypoint_registration(plugin_module
     )
 
     await plugin.initialize()
+    assert plugin.scheduler.enabled is True
+    assert plugin.scheduler.scan_task is not None
     await plugin.terminate()
 
-    assert plugin.scheduler.enabled is True
+    assert plugin.scheduler.enabled is False
+    assert plugin.scheduler.scan_task is None
     assert plugin_module.LawAssistant.law._fake_command == "law"
     assert plugin_module.LawAssistant.law_status._fake_llm_tool == "law_status"
     assert (
@@ -141,6 +144,62 @@ async def test_command_requires_private_admin_or_operator_and_delegates(plugin_m
 
 
 @pytest.mark.asyncio
+async def test_chinese_command_root_uses_same_authorization_and_service_handler(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+    recording = RecordingService()
+    plugin.service = recording
+
+    denied = [
+        item
+        async for item in plugin.law_chinese(
+            FakeEvent(private=True, sender_id="7", message="/法务 status")
+        )
+    ]
+    allowed = [
+        item
+        async for item in plugin.law_chinese(
+            FakeEvent(private=True, sender_id="42", message="法务 状态")
+        )
+    ]
+    english = [
+        item
+        async for item in plugin.law(
+            FakeEvent(private=True, sender_id="42", message="/law status")
+        )
+    ]
+
+    assert "没有" in denied[0]
+    assert allowed == english
+    assert recording.status_calls == 2
+    assert plugin_module.LawAssistant.law_chinese._fake_command == "法务"
+
+
+def test_chinese_command_aliases_normalize_question_origins_and_session_actions(
+    plugin_module,
+):
+    normalize = plugin_module._normalize_law_command_parts
+    assert normalize("法务 真题 刑法 多选") == [
+        "/law",
+        "question",
+        "real",
+        "刑法",
+        "多选",
+    ]
+    assert normalize("法务 模拟题 知识产权 案例分析") == [
+        "/law",
+        "question",
+        "mock",
+        "知识产权",
+        "案例分析",
+    ]
+    assert normalize("法务 下一页") == ["/law", "next"]
+    assert normalize("法务 答案续页") == ["/law", "next-answer"]
+    assert normalize("法务 群计划") == ["/law", "plans"]
+
+
+@pytest.mark.asyncio
 async def test_question_command_returns_bounded_text_and_explicit_answer_continuation(
     plugin_module,
 ):
@@ -177,7 +236,7 @@ async def test_question_command_returns_bounded_text_and_explicit_answer_continu
     assert len(answer) <= 300
     assert "【真题" in answer
     assert '"success"' not in answer
-    assert "/law next-answer" in answer
+    assert "法务 答案续页" in answer
 
     ambiguous_next = await anext(
         plugin.law(
@@ -188,7 +247,7 @@ async def test_question_command_returns_bounded_text_and_explicit_answer_continu
             )
         )
     )
-    assert "/law next-answer" in ambiguous_next
+    assert "继续查看答案" in ambiguous_next
     assert "不会跳转题面" in ambiguous_next
 
     next_answer = await anext(
@@ -233,7 +292,7 @@ async def test_question_command_returns_bounded_text_and_explicit_answer_continu
         )
     )
     assert len(explanation) <= 300
-    assert "/law next-explanation" in explanation
+    assert "法务 解析续页" in explanation
     next_explanation = await anext(
         plugin.law(
             FakeEvent(

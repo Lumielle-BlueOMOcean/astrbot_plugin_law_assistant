@@ -41,6 +41,8 @@ def parse_chinese_dates(
         if parsed is None:
             continue
         value, precision = parsed
+        has_explicit_year = bool(match.group("year_date") or match.group("iso_date"))
+        year_is_anchored = has_explicit_year or publication_year is not None
         kind = _infer_kind(text, match.start())
         evidence = _evidence_text(text, match.start(), match.end(), kind)
         key = (kind, value.isoformat())
@@ -54,7 +56,7 @@ def parse_chinese_dates(
                 timezone=timezone_name,
                 label=_label_for_kind(kind),
                 evidence_text=evidence,
-                confirmed=True,
+                confirmed=year_is_anchored,
                 precision=precision,
             )
         )
@@ -104,15 +106,13 @@ def date_is_on_or_after(
 
 
 def extract_publication_year(text: str, fallback: int | None = None) -> int:
-    match = _PUBLICATION_RE.search(text)
-    if match:
-        found = re.search(r"\d{4}", match.group("value"))
-        if found:
-            return int(found.group())
-    found = re.search(r"20\d{2}", text)
-    return (
-        int(found.group()) if found else (fallback or datetime.now(timezone.utc).year)
-    )
+    """Return a year only from publication metadata, never incidental body text."""
+    published = extract_publication_datetime(text)
+    if published is not None:
+        return published.year
+    if fallback is not None:
+        return int(fallback)
+    return datetime.now(timezone.utc).year
 
 
 def extract_publication_datetime(

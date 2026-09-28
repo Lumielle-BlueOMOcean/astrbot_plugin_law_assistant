@@ -15,6 +15,7 @@ if __package__ and "." in __package__:
         QuestionDetail,
     )
     from .library_repository import LibraryRepository
+    from .pagination import page_payload, page_request
 else:
     from content import parse_question_type, parse_subject
     from library_models import (
@@ -24,6 +25,7 @@ else:
         QuestionDetail,
     )
     from library_repository import LibraryRepository
+    from pagination import page_payload, page_request
 
 
 _MATERIAL_TYPES = {
@@ -254,6 +256,7 @@ class LibraryService:
                 paper=_as_text(structured.get("paper")),
                 question_number=_as_text(structured.get("question_number")),
                 answer_source=_as_text(structured.get("answer_source")),
+                exam_date=_as_text(structured.get("exam_date")),
             )
             source_summary = stem[:300]
         else:
@@ -844,20 +847,40 @@ class LibraryService:
         source_id: int | None = None,
         status: str = "pending",
         limit: int = 100,
+        page: int | None = None,
+        page_size: int = 20,
     ) -> dict[str, Any]:
         if status not in {"pending", "resolved", "superseded"}:
             return _error("invalid_review_status", "不支持的待复核状态")
         try:
+            if page is None:
+                safe_limit = max(1, min(int(limit), 200))
+                normalized_page, normalized_size, offset = 1, safe_limit, 0
+            else:
+                normalized_page, normalized_size, offset = page_request(page, page_size)
+                safe_limit = normalized_size
             items = self.repository.list_review_items(
-                source_id=source_id, status=status, limit=limit
+                source_id=source_id, status=status, limit=safe_limit, offset=offset
             )
         except (TypeError, ValueError):
             return _error("invalid_limit", "limit 必须是整数")
-        return {
+        result = {
             "success": True,
             "count": len(items),
             "items": [self._review_dict(item) for item in items],
         }
+        if page is not None:
+            result.update(
+                page_payload(
+                    result["items"],
+                    page=normalized_page,
+                    page_size=normalized_size,
+                    total=self.repository.count_filtered_review_items(
+                        source_id=source_id, status=status
+                    ),
+                )
+            )
+        return result
 
     async def get_review_item(self, review_id: int) -> dict[str, Any]:
         try:
@@ -906,6 +929,9 @@ class LibraryService:
         material_type: str = "",
         subject: str = "",
         limit: int = 10,
+        page: int | None = None,
+        page_size: int = 20,
+        include_inactive: bool = False,
     ) -> dict[str, Any]:
         normalized_type = str(material_type or "").strip().lower()
         if normalized_type and normalized_type not in _SEARCH_TYPES:
@@ -919,22 +945,44 @@ class LibraryService:
         except ValueError as exc:
             return _error("invalid_subject", str(exc))
         try:
-            safe_limit = max(1, min(int(limit), 50))
-        except (TypeError, ValueError):
-            return _error("invalid_limit", "limit 必须是整数")
+            if page is None:
+                safe_limit = max(1, min(int(limit), 50))
+                normalized_page, normalized_size, offset = 1, safe_limit, 0
+            else:
+                normalized_page, normalized_size, offset = page_request(page, page_size)
+                safe_limit = normalized_size
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_limit", str(exc) or "limit 必须是整数")
+        filters = {
+            "query": str(query or "").strip(),
+            "item_type": _SEARCH_TYPES.get(normalized_type, ""),
+            "identity": _SEARCH_IDENTITIES.get(normalized_type, ""),
+            "subject": normalized_subject or "",
+        }
         items = self.repository.search(
-            query=str(query or "").strip(),
-            item_type=_SEARCH_TYPES.get(normalized_type, ""),
-            identity=_SEARCH_IDENTITIES.get(normalized_type, ""),
-            subject=normalized_subject or "",
+            **filters,
             limit=safe_limit,
+            offset=offset,
+            include_inactive=include_inactive,
         )
-        return {
+        result = {
             "success": True,
             "count": len(items),
             "limit": safe_limit,
             "items": [self._item_summary(item) for item in items],
         }
+        if page is not None:
+            result.update(
+                page_payload(
+                    result["items"],
+                    page=normalized_page,
+                    page_size=normalized_size,
+                    total=self.repository.count_search(
+                        **filters, include_inactive=include_inactive
+                    ),
+                )
+            )
+        return result
 
     def dashboard_summary(self) -> dict[str, int]:
         """Return bounded inventory counters for the dashboard overview."""
@@ -955,6 +1003,8 @@ class LibraryService:
         bundle = self.repository.get(normalized_id)
         if bundle is None:
             return _error("not_found", f"未找到学习条目：{normalized_id}")
+        if not bundle.item.active:
+            return _error("not_found", f"未找到学习条目：{normalized_id}")
         result = {"success": True}
         result.update(
             self._safe_question_bundle_dict(bundle)
@@ -972,8 +1022,244 @@ class LibraryService:
         bundle = self.repository.get(normalized_id)
         if bundle is None:
             return _error("not_found", f"未找到学习条目：{normalized_id}")
+        if not bundle.item.active:
+            return _error("not_found", f"未找到学习条目：{normalized_id}")
         result = {"success": True}
         result.update(self._bundle_dict(bundle))
+        return result
+
+    async def get_management_item(self, item_id: int) -> dict[str, Any]:
+        """Return full normalized content for a separately authorized operator path."""
+        try:
+            normalized_id = int(item_id)
+        except (TypeError, ValueError):
+            return _error("invalid_item_id", "item_id 必须是整数")
+        bundle = self.repository.get(normalized_id)
+        if bundle is None:
+            return _error("not_found", f"未找到学习条目：{normalized_id}")
+        result = {"success": True}
+        result.update(self._bundle_dict(bundle))
+        return result
+
+    def normalize_management_changes(
+        self, item_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Validate and normalize an operator edit without persisting it."""
+        if not isinstance(changes, dict):
+            raise TypeError("changes 必须是 JSON 对象")
+        allowed = {
+            "title",
+            "subjects",
+            "note",
+            "body",
+            "practice_notes",
+            "case_number",
+            "authority",
+            "case_summary",
+            "issues",
+            "reasoning",
+            "result_text",
+            "question_type",
+            "stem",
+            "options",
+            "answer",
+            "explanation",
+            "answer_source",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"不允许修改字段：{sorted(unknown)}")
+        bundle = self.repository.get(int(item_id))
+        if bundle is None:
+            raise ValueError(f"未找到学习条目：{item_id}")
+        normalized = dict(changes)
+        if "title" in normalized:
+            normalized["title"] = _as_text(normalized["title"])
+            if not normalized["title"]:
+                raise ValueError("标题不能为空")
+            normalized["title"] = normalized["title"][:200]
+        if "subjects" in normalized:
+            normalized["subjects"] = _subjects(normalized["subjects"])
+        if bundle.question is not None:
+            if "question_type" in normalized:
+                parsed = parse_question_type(normalized["question_type"])
+                if parsed is None:
+                    raise ValueError("题型不能为空")
+                normalized["question_type"] = parsed
+            if "stem" in normalized:
+                normalized["stem"] = _as_text(normalized["stem"])
+                if not normalized["stem"]:
+                    raise ValueError("题干不能为空")
+            if "options" in normalized:
+                normalized["options"] = list(_as_text_list(normalized["options"]))
+            if "answer_source" in normalized and str(
+                normalized["answer_source"]
+            ) not in {
+                "not_provided",
+                "official",
+                "third_party",
+                "user_verified",
+                "unverified",
+            }:
+                raise ValueError("不支持的答案来源")
+            invalid = set(normalized) & {
+                "practice_notes",
+                "case_number",
+                "authority",
+                "case_summary",
+                "issues",
+                "reasoning",
+                "result_text",
+            }
+            if invalid:
+                raise ValueError("题目不能修改案例字段")
+            if "answer" in normalized and normalized["answer"] is None:
+                normalized["answer_source"] = "not_provided"
+        elif bundle.case is not None:
+            invalid = set(normalized) & {
+                "question_type",
+                "stem",
+                "options",
+                "answer",
+                "explanation",
+                "answer_source",
+                "exam_name",
+                "exam_year",
+                "exam_date",
+                "paper",
+                "question_number",
+            }
+            if invalid:
+                raise ValueError("案例不能修改题目字段")
+            for key in ("issues", "practice_notes"):
+                if key in normalized:
+                    normalized[key] = _as_text_list(normalized[key])
+        else:
+            invalid = set(normalized) - {"title", "subjects", "note", "body"}
+            if invalid:
+                raise ValueError("普通资料只支持标题、方向、正文和备注")
+            for key in ("note", "body"):
+                if key in normalized:
+                    normalized[key] = _as_text(normalized[key])
+        return normalized
+
+    async def update_management_item(
+        self, item_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(changes, dict):
+            return _error("invalid_update", "changes 必须是 JSON 对象")
+        allowed = {
+            "title",
+            "subjects",
+            "note",
+            "body",
+            "practice_notes",
+            "case_number",
+            "authority",
+            "case_summary",
+            "issues",
+            "reasoning",
+            "result_text",
+            "question_type",
+            "stem",
+            "options",
+            "answer",
+            "explanation",
+            "answer_source",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            return _error("invalid_update_field", f"不允许修改字段：{sorted(unknown)}")
+        try:
+            bundle = self.repository.get(int(item_id))
+            if bundle is None:
+                return _error("not_found", f"未找到学习条目：{item_id}")
+            normalized = dict(changes)
+            if "title" in normalized:
+                normalized["title"] = _as_text(normalized["title"])
+                if not normalized["title"]:
+                    raise ValueError("标题不能为空")
+                normalized["title"] = normalized["title"][:200]
+            if "subjects" in normalized:
+                normalized["subjects"] = _subjects(normalized["subjects"])
+            if bundle.question is not None:
+                if "question_type" in normalized:
+                    parsed = parse_question_type(normalized["question_type"])
+                    if parsed is None:
+                        raise ValueError("题型不能为空")
+                    normalized["question_type"] = parsed
+                if "stem" in normalized:
+                    normalized["stem"] = _as_text(normalized["stem"])
+                    if not normalized["stem"]:
+                        raise ValueError("题干不能为空")
+                if "options" in normalized:
+                    normalized["options"] = list(_as_text_list(normalized["options"]))
+                if "answer_source" in normalized:
+                    valid_sources = {
+                        "not_provided",
+                        "official",
+                        "third_party",
+                        "user_verified",
+                        "unverified",
+                    }
+                    if str(normalized["answer_source"]) not in valid_sources:
+                        raise ValueError("不支持的答案来源")
+                invalid = set(normalized) & {
+                    "practice_notes",
+                    "case_number",
+                    "authority",
+                    "case_summary",
+                    "issues",
+                    "reasoning",
+                    "result_text",
+                }
+                if invalid:
+                    raise ValueError("题目不能修改案例字段")
+                if "answer" in normalized and normalized["answer"] is None:
+                    normalized["answer_source"] = "not_provided"
+            elif bundle.case is not None:
+                invalid = set(normalized) & {
+                    "question_type",
+                    "stem",
+                    "options",
+                    "answer",
+                    "explanation",
+                    "answer_source",
+                    "exam_name",
+                    "exam_year",
+                    "exam_date",
+                    "paper",
+                    "question_number",
+                }
+                if invalid:
+                    raise ValueError("案例不能修改题目字段")
+                for field_name in ("issues", "practice_notes"):
+                    if field_name in normalized:
+                        normalized[field_name] = _as_text_list(normalized[field_name])
+            else:
+                invalid = set(normalized) - {"title", "subjects", "note", "body"}
+                if invalid:
+                    raise ValueError("普通资料只支持标题、方向、正文和备注")
+                for field_name in ("note", "body"):
+                    if field_name in normalized:
+                        normalized[field_name] = _as_text(normalized[field_name])
+            updated = self.repository.update_management(int(item_id), normalized)
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_update", str(exc))
+        if updated is None:
+            return _error("not_found", f"未找到学习条目：{item_id}")
+        result = {"success": True, "message": "管理资料已更新"}
+        result.update(self._bundle_dict(updated))
         return result
 
     async def update_learning_item(
@@ -1050,6 +1336,8 @@ class LibraryService:
             "created_at": item.created_at.isoformat(),
             "updated_at": item.updated_at.isoformat(),
             "active": item.active,
+            "deleted_at": item.deleted_at,
+            "deleted_by": item.deleted_by,
         }
 
     @staticmethod
@@ -1311,6 +1599,7 @@ class LibraryService:
                 "paper": bundle.question.paper,
                 "question_number": bundle.question.question_number,
                 "answer_source": bundle.question.answer_source,
+                "exam_date": bundle.question.exam_date,
             }
         if bundle.structured is not None:
             result["structured"] = bundle.structured

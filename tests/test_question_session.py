@@ -697,7 +697,9 @@ async def test_final_question_answer_and_explanation_pages_obey_message_budget(
         if "本题内容已展示完毕" in result["text"]:
             break
 
-    async def collect_pages(action: str, continuation: str) -> list[str]:
+    async def collect_pages(
+        action: str, next_action: str, continuation: str
+    ) -> list[str]:
         result = await service.question_session_action(
             action, session_origin=scope, actor_id="42"
         )
@@ -707,14 +709,18 @@ async def test_final_question_answer_and_explanation_pages_obey_message_budget(
             if continuation not in result["text"]:
                 break
             result = await service.question_session_action(
-                continuation.removeprefix("/law "),
+                next_action,
                 session_origin=scope,
                 actor_id="42",
             )
         return pages
 
-    answer_pages = await collect_pages("answer", "/law next-answer")
-    explanation_pages = await collect_pages("explanation", "/law next-explanation")
+    answer_pages = await collect_pages(
+        "answer", "next-answer", "答案未完，请回复「法务 答案续页」继续。"
+    )
+    explanation_pages = await collect_pages(
+        "explanation", "next-explanation", "解析未完，请回复「法务 解析续页」继续。"
+    )
 
     for message in prompt_messages + answer_pages + explanation_pages:
         assert len(message) <= limit
@@ -726,8 +732,13 @@ async def test_final_question_answer_and_explanation_pages_obey_message_budget(
         assert sum(page.count(marker) for page in explanation_pages) == 1
     assert len(answer_pages) > 1
     assert len(explanation_pages) > 1
-    assert all("/law next-answer" in page for page in answer_pages[:-1])
-    assert all("/law next-explanation" in page for page in explanation_pages[:-1])
+    assert all(
+        "答案未完，请回复「法务 答案续页」继续。" in page for page in answer_pages[:-1]
+    )
+    assert all(
+        "解析未完，请回复「法务 解析续页」继续。" in page
+        for page in explanation_pages[:-1]
+    )
     storage.close()
 
 
@@ -754,10 +765,10 @@ async def test_single_oversized_answer_is_lossless_across_bounded_pages(tmp_path
         lines = message.split("\n")
         assert "参考答案" in lines[1]
         body_lines = lines[2:]
-        if body_lines and body_lines[-1] == "答案未完，继续使用 /law next-answer。":
+        if body_lines and body_lines[-1] == "答案未完，请回复「法务 答案续页」继续。":
             body_lines.pop()
         pages.append("\n".join(body_lines))
-        if "/law next-answer" not in message:
+        if "答案未完，请回复「法务 答案续页」继续。" not in message:
             break
         result = await service.question_session_action(
             "next-answer", session_origin=scope, actor_id="42"
@@ -1104,3 +1115,90 @@ async def test_d45_snapshot_reopens_without_rewriting_and_keeps_session_content(
         if event["event_kind"] in {"answer_revealed", "explanation_revealed"}
     ] == [("explanation_revealed", 0), ("answer_revealed", 0)]
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_q309_style_shared_stem_and_requirements_survive_restart_without_leaking(
+    tmp_path,
+):
+    shared_a = "【公共题干】公共事实甲：" + "甲乙之间发生连续法律关系。" * 24
+    shared_b = "公共事实乙：" + "证据材料与时间顺序均须综合判断。" * 24
+    content = _structured_candidate()
+    content["stem_blocks"] = [
+        {"id": "shared-a", "order": 1, "text": shared_a},
+        {"id": "shared-b", "order": 2, "text": shared_b},
+    ]
+    content["subquestions"][0]["answer_requirements"] = [
+        {"order": 1, "text": "【小问一专属要求】逐层说明请求权基础。"}
+    ]
+    content["subquestions"][1]["answer_requirements"] = [
+        {"order": 1, "text": "【小问二专属要求】区分抗辩与否认。"}
+    ]
+    content["subquestions"][0]["answer"] = {
+        "blocks": [{"order": 1, "text": "【小问一隐藏答案】"}]
+    }
+    content["subquestions"][1]["answer"] = {
+        "blocks": [{"order": 1, "text": "【小问二隐藏答案】"}]
+    }
+    db_path = tmp_path / "q309-synthetic-session.sqlite3"
+    storage = SQLiteStorage(db_path)
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(question_message_max_chars=520),
+    )
+    scope = "aiocqhttp:FriendMessage:4209"
+    opened = service.open_question_session(
+        content,
+        session_origin=scope,
+        actor_id="4209",
+    )
+
+    assert opened["success"] is True
+    assert "【小问一隐藏答案】" not in opened["text"]
+    assert "【小问二隐藏答案】" not in opened["text"]
+    active = service.question_sessions.get_active(scope)
+    assert active is not None
+    first_prompt = active["snapshot"]["prompts"][0]
+    assert all(len(page) <= 520 for page in first_prompt["stem_pages"])
+    assert len(first_prompt["stem_pages"]) > 1
+    assert "【小问一专属要求】" in "\n".join(first_prompt["stem_pages"])
+    assert "【小问二专属要求】" not in "\n".join(first_prompt["stem_pages"])
+    first_prompt_pages = len(first_prompt["stem_pages"])
+    storage.close()
+
+    storage = SQLiteStorage(db_path)
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(question_message_max_chars=520),
+    )
+    assert service.question_sessions.get_active("aiocqhttp:FriendMessage:other") is None
+    for _ in range(1, first_prompt_pages):
+        page = await service.question_session_action(
+            "next", session_origin=scope, actor_id="4209"
+        )
+        assert page["success"] is True
+        assert len(page["text"]) <= 520
+        assert "【小问一隐藏答案】" not in page["text"]
+    all_first_pages = "\n".join(
+        service.question_sessions.get_active(scope)["snapshot"]["prompts"][0][
+            "stem_pages"
+        ]
+    )
+    for marker in ("【公共题干】", "公共事实甲：", "公共事实乙："):
+        assert all_first_pages.count(marker) == 1
+    assert all_first_pages.count("【小问一专属要求】") == 1
+
+    next_question = await service.question_session_action(
+        "next-question", session_origin=scope, actor_id="4209"
+    )
+    assert next_question["success"] is True
+    assert "【小问二专属要求】" in next_question["text"]
+    assert "【小问一专属要求】" not in next_question["text"]
+    assert "【公共题干】" not in next_question["text"]
+    assert "【小问二隐藏答案】" not in next_question["text"]
+    current = await service.question_session_action(
+        "current", session_origin=scope, actor_id="4209"
+    )
+    assert "答案：未揭晓" in current["text"]
+    assert "解析：未揭晓" in current["text"]
+    storage.close()

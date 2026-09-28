@@ -82,3 +82,59 @@ async def test_llm_date_without_matching_evidence_is_unconfirmed() -> None:
         date for date in events[0].dates if date.kind == "registration_deadline"
     )
     assert llm_date.confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_incidental_body_year_does_not_anchor_month_day_deadline() -> None:
+    document = SourceDocument(
+        source_key="synthetic",
+        source_item_key="year-evidence",
+        url="https://example.test/year-evidence",
+        title="法律硕士竞赛通知",
+        content=(
+            "法律硕士竞赛现接受报名。报名截止日期为3月20日。"
+            "本通知引用2020年颁布的某项规定。"
+        ),
+        fetched_at="2026-02-01T00:00:00+08:00",
+    )
+    extractor = EventExtractor(
+        timezone_name="Asia/Shanghai",
+        now=lambda: datetime(2026, 2, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    events = await extractor.extract(document)
+
+    assert len(events) == 1
+    deadline = next(date for date in events[0].dates if date.kind.endswith("deadline"))
+    assert deadline.datetime.year == 2026
+    assert deadline.confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_llm_cannot_anchor_month_day_to_its_own_guessed_year() -> None:
+    class FakeLLM:
+        async def generate_json(self, prompt, *, session_origin=None):
+            return {
+                "dates": [
+                    {
+                        "kind": "registration_deadline",
+                        "value": "2026-03-20",
+                        "evidence": "报名截止日期为3月20日",
+                    }
+                ]
+            }
+
+    document = SourceDocument(
+        source_key="synthetic",
+        source_item_key="llm-guessed-year",
+        url="https://example.test/llm-guessed-year",
+        title="法律硕士竞赛通知",
+        content="法律硕士竞赛现接受报名。报名截止日期为3月20日。",
+        fetched_at="2026-02-01T00:00:00+08:00",
+    )
+    events = await EventExtractor(llm_service=FakeLLM()).extract(document)
+
+    date = next(
+        item for item in events[0].dates if item.kind == "registration_deadline"
+    )
+    assert date.confirmed is False

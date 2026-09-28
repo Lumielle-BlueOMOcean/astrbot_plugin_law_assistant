@@ -79,8 +79,7 @@ async def test_scheduler_wakes_after_confirming_first_enabled_daily_plan(tmp_pat
     )
 
     async def wake_scheduler():
-        scheduler.enabled = True
-        await scheduler.start()
+        await scheduler.wake()
 
     service.set_scheduler_wakeup(wake_scheduler)
     preview = await service.prepare_daily_plan_update(
@@ -307,7 +306,7 @@ async def test_official_case_reprocesses_when_segmentation_version_changes(tmp_p
     assert extractor.calls == 1
     official = await library.list_official_cases()
     assert official["count"] == 3
-    old_bundle = await library.get_learning_item(old["items"][0]["item_id"])
+    old_bundle = await library.get_management_item(old["items"][0]["item_id"])
     assert old_bundle["item"]["active"] is False
 
     await service.scan_cases()

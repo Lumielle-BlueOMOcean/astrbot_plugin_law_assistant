@@ -23,8 +23,13 @@ def test_plugin_page_assets_are_self_contained_and_safe():
 def test_plugin_page_exposes_all_0_3d_management_entrypoints():
     javascript = (PAGE_ROOT / "app.js").read_text(encoding="utf-8")
     for endpoint in (
-        "library/item",
-        "library/update",
+        "library/manage-item",
+        "management/library-search",
+        "management/library-update",
+        "management/batch-prepare",
+        "management/batch-confirm",
+        "management/clear-prepare",
+        "management/clear-confirm",
         "reviews",
         "review/status",
         "plans/prepare",

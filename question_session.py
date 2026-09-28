@@ -548,7 +548,7 @@ def _render_snapshot(
             return f"{_header(snapshot)}\n{progress}题干续页 {page}/{total}"
 
         prompt_suffix = lambda _page, _total: (
-            "答案与解析可分别使用 /law answer 和 /law explanation 查看。"
+            "回复「法务 答案」查看答案；回复「法务 解析」查看解析。"
         )
         if is_legacy_pages and body:
             stem_pages, page_starts = _paginate_legacy_pages(
@@ -568,6 +568,7 @@ def _render_snapshot(
             legacy_prompt_page_starts.append(None)
 
         answer_blocks = list(prompt.get("source_answer_blocks", []))
+        answer_available = bool(answer_blocks)
         if not answer_blocks:
             answer_blocks = ["原始资料未提供可核验参考答案；不会使用模型补写答案。"]
         answer_label = str(prompt.get("answer_label") or "参考答案")
@@ -588,11 +589,12 @@ def _render_snapshot(
             limit,
             prefix_for_page=answer_prefix,
             suffix_for_page=lambda page, total: (
-                "答案未完，继续使用 /law next-answer。" if page < total else ""
+                "答案未完，请回复「法务 答案续页」继续。" if page < total else ""
             ),
         )
 
         explanation_blocks = list(prompt.get("source_explanation_blocks", []))
+        explanation_available = bool(explanation_blocks)
         if not explanation_blocks:
             explanation_blocks = ["该题没有来源提供的独立解析；不会让模型猜测补充。"]
         explanation_label = str(prompt.get("explanation_label") or "解析")
@@ -613,7 +615,7 @@ def _render_snapshot(
             limit,
             prefix_for_page=explanation_prefix,
             suffix_for_page=lambda page, total: (
-                "解析未完，继续使用 /law next-explanation。" if page < total else ""
+                "解析未完，请回复「法务 解析续页」继续。" if page < total else ""
             ),
         )
         rendered_prompts.append(
@@ -623,6 +625,8 @@ def _render_snapshot(
                 "stem_pages": stem_pages,
                 "answer_pages": answer_pages,
                 "explanation_pages": explanation_pages,
+                "answer_available": answer_available,
+                "explanation_available": explanation_available,
             }
         )
     snapshot["prompts"] = rendered_prompts

@@ -123,6 +123,97 @@ def test_configured_source_can_be_allowed_to_auto_publish():
 
 
 @pytest.mark.asyncio
+async def test_radar_override_and_date_review_are_confirmed_audited_and_evidence_safe(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    from models import EventDate
+
+    now = datetime(2026, 9, 20, 9, 0, tzinfo=ZONE)
+    storage = SQLiteStorage(tmp_path / "radar-review.sqlite3")
+    event = _event()
+    event.dates = (
+        EventDate(
+            kind="registration_deadline",
+            datetime=datetime(2026, 9, 30, tzinfo=ZONE),
+            timezone="Asia/Shanghai",
+            label="报名截止",
+            evidence_text="报名截止：9月30日",
+            confirmed=False,
+            precision="date",
+        ),
+    )
+    event_id = storage.upsert_event(event)
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai", operator_ids=["operator-1"]),
+        clock=lambda: now,
+    )
+    stored = storage.get_event(event_id)
+    date_id = stored.dates[0].id
+
+    status_preview = await service.prepare_event_status_override(
+        event_id, "current", "人工复核发现活动仍在报名", actor_id="operator-1"
+    )
+    assert status_preview["ready"] is True
+    assert storage.get_event_status_override(event_id) is None
+    denied_status = await service.confirm_event_status_override(
+        status_preview["token"], actor_id="ordinary-user"
+    )
+    applied_status = await service.confirm_event_status_override(
+        status_preview["token"], actor_id="operator-1"
+    )
+    assert denied_status["success"] is False
+    assert applied_status["success"] is True
+    assert (await service.get_event(event_id)).metadata["radar_status"] == "current"
+
+    date_preview = await service.prepare_event_date_review(
+        event_id,
+        date_id,
+        "2026-10-01",
+        "仅修正人工录入日期，原文仍未核实年份",
+        actor_id="operator-1",
+    )
+    assert date_preview["ready"] is True
+    before_confirm = storage.get_event(event_id)
+    assert before_confirm.dates[0].datetime.date().isoformat() == "2026-09-30"
+    assert before_confirm.dates[0].confirmed is False
+
+    stale_event = replace(event, raw_content_hash="changed-source-hash")
+    storage.upsert_event(stale_event)
+    rejected_stale = await service.confirm_event_date_review(
+        date_preview["token"], actor_id="operator-1"
+    )
+    assert rejected_stale["success"] is False
+    assert storage.list_event_date_reviews() == []
+
+    fresh_event = storage.get_event(event_id)
+    fresh_preview = await service.prepare_event_date_review(
+        event_id,
+        fresh_event.dates[0].id,
+        "2026-10-01",
+        "复核记录保留原始证据且不自动确认日期",
+        actor_id="operator-1",
+    )
+    applied_review = await service.confirm_event_date_review(
+        fresh_preview["token"], actor_id="operator-1"
+    )
+    final_event = storage.get_event(event_id)
+    review_history = storage.list_event_date_reviews()
+
+    assert applied_review["success"] is True
+    assert final_event.raw_content_hash == "changed-source-hash"
+    assert final_event.dates[0].datetime.date().isoformat() == "2026-10-01"
+    assert final_event.dates[0].confirmed is False
+    assert review_history[0]["review_status"] == "accepted"
+    assert review_history[0]["actor_id"] == "operator-1"
+    assert review_history[0]["evidence_text_snapshot"] == "报名截止：9月30日"
+    assert review_history[0]["evidence_hash"] != ""
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_scan_skips_sources_with_discovery_disabled_and_reports_them(tmp_path):
     disabled = FakeAdapter(
         "extra:disabled",

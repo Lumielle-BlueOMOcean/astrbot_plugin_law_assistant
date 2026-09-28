@@ -1450,13 +1450,29 @@ def _case_summary(
         for field in block_fields
         if isinstance(item.get(field), list)
     )
+
+    def texts(field: str) -> list[str]:
+        blocks = item.get(field, [])
+        if not isinstance(blocks, list):
+            return []
+        return [
+            str(block.get("text") or "") for block in blocks if isinstance(block, dict)
+        ]
+
     item_id = item.get("id")
     return {
         "index": index,
         "id": item_id,
         "title": item.get("title", ""),
+        "case_number": item.get("case_number", ""),
+        "authority": item.get("authority", ""),
         "subjects": copy.deepcopy(item.get("subjects", [])),
         "block_count": block_count,
+        "basic_facts": texts("basic_facts_blocks") or texts("blocks"),
+        "issues": texts("issues_blocks"),
+        "holding": texts("holding_blocks"),
+        "result": texts("result_blocks"),
+        "learning_points": texts("learning_points_blocks"),
         "locators": copy.deepcopy(item.get("locators", [])),
         "review_status": "pending_review" if item_id in review_ids else "ready",
         "identity_granted": False,

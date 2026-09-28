@@ -78,6 +78,9 @@ class CaseItem:
     subjects: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
     id: int | None = None
+    active: bool = True
+    deleted_at: str | None = None
+    deleted_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

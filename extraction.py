@@ -10,7 +10,6 @@ if __package__ and "." in __package__:
     from .date_parser import (
         date_is_on_or_after,
         extract_publication_datetime,
-        extract_publication_year,
         parse_chinese_dates,
         parse_datetime_value,
     )
@@ -20,7 +19,6 @@ else:
     from date_parser import (
         date_is_on_or_after,
         extract_publication_datetime,
-        extract_publication_year,
         parse_chinese_dates,
         parse_datetime_value,
     )
@@ -118,9 +116,9 @@ class EventExtractor:
         published_at = extract_publication_datetime(
             text, timezone_name=self.timezone_name
         )
-        publication_year = extract_publication_year(
-            text, fallback=_as_datetime(document.fetched_at, self.zone).year
-        )
+        # Only an explicit publication timestamp may anchor a month/day date.
+        # The fetched timestamp and incidental years in the body are not evidence.
+        publication_year = published_at.year if published_at is not None else None
         dates = [
             date
             for date in parse_chinese_dates(
@@ -262,8 +260,12 @@ def _llm_date_is_supported(
     """Accept an LLM date only when source text proves value and semantic kind."""
     if not _evidence_matches(source_text, evidence):
         return False
+    source_publication = extract_publication_datetime(
+        source_text, timezone_name=zone.key
+    )
+    trusted_year = source_publication.year if source_publication else None
     evidence_dates = parse_chinese_dates(
-        evidence, publication_year=value.year, timezone_name=zone.key
+        evidence, publication_year=trusted_year, timezone_name=zone.key
     )
     if not evidence_dates:
         return False

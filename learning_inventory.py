@@ -153,6 +153,7 @@ class LearningContentProvider:
         source_name: str | None = None,
         exam_year: str | None = None,
         used_content_keys: set[tuple[str, str]] | None = None,
+        previous_content_key: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         request = QuestionRequest.from_values(
             origin=origin,
@@ -176,6 +177,16 @@ class LearningContentProvider:
         all_mock_candidates = self._mock_question_bundles(
             request.subject, request.question_type
         )
+        if previous_content_key and len(all_mock_candidates) > 1:
+            all_mock_candidates = [
+                bundle
+                for bundle in all_mock_candidates
+                if not _is_used(
+                    {previous_content_key},
+                    "library_mock",
+                    bundle.item.id,
+                )
+            ]
         mock_candidates = [
             bundle
             for bundle in all_mock_candidates

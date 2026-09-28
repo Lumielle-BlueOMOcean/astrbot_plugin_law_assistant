@@ -187,6 +187,14 @@ def test_valid_document_preview_preserves_order_provenance_and_counts():
     }
     assert preview["questions"][0]["stem_block_count"] == 1
     assert preview["cases"][0]["title"] == "虚构合同案例"
+    case_preview = preview["cases"][0]
+    assert case_preview["authority"] == "测试机构（非官方声明）"
+    assert case_preview["case_number"] == "虚构案号-001"
+    assert case_preview["basic_facts"] == ["这是人工编写的虚构案情。"]
+    assert case_preview["issues"] == ["合同责任如何判断？"]
+    assert case_preview["holding"] == ["本样本不表达任何真实裁判结果。"]
+    assert case_preview["result"] == []
+    assert case_preview["learning_points"] == ["仅用于验证结构化资料格式。"]
 
 
 def test_json_text_is_parsed_and_unknown_schema_is_fatal():

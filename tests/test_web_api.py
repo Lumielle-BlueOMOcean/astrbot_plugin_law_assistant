@@ -73,6 +73,10 @@ def test_web_api_routes_use_plugin_namespace():
         ("/astrbot_plugin_law_assistant/structured/prepare", "POST"),
         ("/astrbot_plugin_law_assistant/structured/confirm", "POST"),
         ("/astrbot_plugin_law_assistant/plans/prepare", "POST"),
+        ("/astrbot_plugin_law_assistant/management/library-search", "GET"),
+        ("/astrbot_plugin_law_assistant/management/library-update", "POST"),
+        ("/astrbot_plugin_law_assistant/management/batch-prepare", "POST"),
+        ("/astrbot_plugin_law_assistant/management/clear-prepare", "POST"),
     }
 
 
@@ -87,9 +91,46 @@ async def test_web_api_registers_overview_and_returns_stable_json(tmp_path):
 
     assert response.status_code == 200
     assert payload["success"] is True
-    assert payload["data"]["schema_version"] == 12
-    assert payload["data"]["plugin"]["version"] == "0.5.2"
+    assert payload["data"]["schema_version"] == 13
+    assert payload["data"]["plugin"]["version"] == "0.6.0"
     assert "learning" in payload["data"]
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_library_search_pages_deleted_items_without_changing_safe_search(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    archived = await service.library_service.archive_learning_material(
+        raw_text="inactive management search fixture",
+        material_type="note",
+        title="可恢复合成资料",
+        subjects="民法",
+        created_by="operator-fixture",
+        session_origin="test",
+    )
+    item_id = archived["item_id"]
+    deleted = await service.soft_delete_learning_items([item_id], actor_id="webui")
+    assert deleted["success"] is True
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        management = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/management/library-search"
+            "?include_inactive=1&page=1&page_size=20"
+        )
+        management_payload = await management.get_json()
+        safe = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/library/search?page=1&page_size=20"
+        )
+        safe_payload = await safe.get_json()
+
+    assert management.status_code == 200
+    assert management_payload["data"]["total"] == 1
+    assert management_payload["data"]["items"][0]["id"] == item_id
+    assert safe.status_code == 200
+    assert safe_payload["data"]["total"] == 0
     service.storage.close()
 
 
@@ -534,4 +575,38 @@ async def test_dashboard_uses_verified_inventory_and_safe_daily_history(tmp_path
     assert "SECRET_DAILY_ANSWER" in json.dumps(
         service.storage.list_daily_contents(), ensure_ascii=False
     )
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_history_page_exposes_schedule_diagnostics_without_content_body(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    target = await service.bind_target("aiocqhttp:group:diagnostics", "诊断测试群")
+    service.storage.claim_daily_content(
+        content_date="2026-09-29",
+        target_id=target["id"],
+        content_type="daily_question",
+        body={"question": "safe question preview", "answer": "HIDDEN_ANSWER"},
+        source_kind="library_mock",
+        source_item_key="synthetic-question-1",
+        resolved_subject="civil_law",
+        resolved_question_type="multiple_choice",
+        resolved_origin="mock",
+        intended_local_at="2026-09-29T08:00:00+08:00[Asia/Shanghai]",
+        target_label="诊断测试群",
+    )
+
+    page = await service.dashboard_page("daily", page=1, page_size=20)
+
+    assert page["total"] == 1
+    row = page["items"][0]
+    assert row["intended_local_at"] == "2026-09-29T08:00:00+08:00[Asia/Shanghai]"
+    assert row["target_label"] == "诊断测试群"
+    assert row["resolved_origin"] == "mock"
+    assert row["resolved_subject"] == "civil_law"
+    assert row["resolved_question_type"] == "multiple_choice"
+    assert "body" not in row and "body_json" not in row
+    assert "HIDDEN_ANSWER" not in json.dumps(row, ensure_ascii=False)
     service.storage.close()

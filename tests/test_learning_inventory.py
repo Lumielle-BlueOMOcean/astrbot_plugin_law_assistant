@@ -5,9 +5,11 @@ import json
 import pytest
 
 from learning_inventory import LearningContentProvider
+from learning_service import LearningService
 from library_models import LibrarySource
 from library_repository import LibraryRepository
 from library_service import LibraryService
+from service import LawAssistantService
 from storage import SQLiteStorage
 
 
@@ -55,6 +57,11 @@ def _source(*, source_kind="file", title="测试资料"):
         created_by="42",
         session_origin="private:42",
     )
+
+
+class FirstChoiceRandom:
+    def choice(self, values):
+        return values[0]
 
 
 @pytest.mark.asyncio
@@ -226,6 +233,121 @@ async def test_provider_generates_indefinite_choice_mock(tmp_path):
     assert result["origin"] == "mock"
     assert result["question_type"] == "indefinite_choice"
     assert llm.calls == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mock_random_selection_uses_exact_session_origin_no_repeat_key(tmp_path):
+    storage, library, provider = _services(tmp_path)
+    identifiers = []
+    for title in ("合成题甲", "合成题乙"):
+        archived = await library.archive_learning_material(
+            raw_text=f"{title} 原始资料",
+            material_type="mock_question",
+            title=title,
+            subjects="刑法",
+            structured_json={
+                "question_type": "single_choice",
+                "stem": f"{title} 题干？",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "A",
+                "explanation": "合成解析。",
+            },
+            created_by="operator-1",
+            session_origin="private:operator-1",
+        )
+        identifiers.append(str(archived["item_id"]))
+
+    first = await provider.select_question(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:operator-1",
+    )
+    remaining = await provider.select_question(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:operator-1",
+        used_content_keys={("library_mock", str(first["question_id"]))},
+    )
+    same_id_other_scope = await provider.select_question(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:another-operator",
+        used_content_keys={("real_question", str(first["question_id"]))},
+    )
+
+    assert first["available"] is True
+    assert remaining["available"] is True
+    assert remaining["question_id"] != first["question_id"]
+    assert str(remaining["question_id"]) in identifiers
+    assert same_id_other_scope["available"] is True
+    assert same_id_other_scope["question_id"] in {int(value) for value in identifiers}
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_mock_session_avoids_immediate_repeat_only_in_exact_scope(
+    tmp_path,
+):
+    storage, library, _ = _services(tmp_path)
+    for title in ("合成题甲", "合成题乙"):
+        await library.archive_learning_material(
+            raw_text=f"{title} 原始资料",
+            material_type="mock_question",
+            title=title,
+            subjects="刑法",
+            structured_json={
+                "question_type": "single_choice",
+                "stem": f"{title} 题干？",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "A",
+                "explanation": "合成解析。",
+            },
+            created_by="operator-1",
+            session_origin="private:operator-1",
+        )
+    learning = LearningService(
+        storage, None, library_service=library, rng=FirstChoiceRandom()
+    )
+    service = LawAssistantService(
+        storage, learning_service=learning, library_service=library
+    )
+
+    first = await service.start_question_session(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:operator-1",
+        actor_id="operator-1",
+    )
+    first_session = service.question_sessions.get_latest_for_scope("private:operator-1")
+    second = await service.start_question_session(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:operator-1",
+        actor_id="operator-1",
+    )
+    second_session = service.question_sessions.get_latest_for_scope(
+        "private:operator-1"
+    )
+    other_scope = await service.start_question_session(
+        origin="mock",
+        subject="criminal_law",
+        question_type="single_choice",
+        session_origin="private:other",
+        actor_id="other",
+    )
+
+    assert first["success"] is second["success"] is other_scope["success"] is True
+    assert (
+        first_session["source_kind"] == second_session["source_kind"] == "library_mock"
+    )
+    assert first_session["source_item_key"] != second_session["source_item_key"]
+    assert service.question_sessions.get_active("private:other") is not None
     storage.close()
 
 

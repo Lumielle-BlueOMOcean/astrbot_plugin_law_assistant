@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime as DateTime
 from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 if __package__ and "." in __package__:
     from .content import RealQuestion, real_question_identity_key, subject_filter
@@ -21,7 +22,7 @@ else:
     from date_parser import date_is_on_or_after
     from models import CaseItem, EventDate, LawUpdate, LegalEvent, SourceDocument
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -986,6 +987,146 @@ def _migrate_11_to_12(connection: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_12_to_13(connection: sqlite3.Connection) -> None:
+    """Persist delayed reveals, review state, and daily-run schedule diagnostics."""
+    _add_column_if_missing(
+        connection,
+        "daily_plans",
+        "question_reveal_mode",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )
+    _add_column_if_missing(
+        connection,
+        "daily_plans",
+        "answer_reveal_delay_minutes",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(answer_reveal_delay_minutes >= 0)",
+    )
+    _add_column_if_missing(
+        connection,
+        "daily_plans",
+        "explanation_reveal_delay_minutes",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(explanation_reveal_delay_minutes >= 0)",
+    )
+    _add_column_if_missing(connection, "daily_contents", "intended_local_at", "TEXT")
+    _add_column_if_missing(
+        connection, "daily_contents", "target_label", "TEXT NOT NULL DEFAULT ''"
+    )
+    if _table_exists(connection, "case_items"):
+        _add_column_if_missing(
+            connection,
+            "case_items",
+            "active",
+            "INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))",
+        )
+        _add_column_if_missing(connection, "case_items", "deleted_at", "TEXT")
+        _add_column_if_missing(connection, "case_items", "deleted_by", "TEXT")
+    if _table_exists(connection, "learning_items"):
+        _add_column_if_missing(connection, "learning_items", "deleted_at", "TEXT")
+        _add_column_if_missing(connection, "learning_items", "deleted_by", "TEXT")
+    if _table_exists(connection, "learning_questions"):
+        _add_column_if_missing(
+            connection, "learning_questions", "exam_date", "TEXT NOT NULL DEFAULT ''"
+        )
+    if _table_exists(connection, "structured_item_bindings"):
+        _add_column_if_missing(
+            connection,
+            "structured_item_bindings",
+            "verified_real_question_id",
+            "INTEGER REFERENCES real_questions(id) ON DELETE SET NULL",
+        )
+        _add_column_if_missing(
+            connection, "structured_item_bindings", "promoted_by", "TEXT"
+        )
+        _add_column_if_missing(
+            connection, "structured_item_bindings", "promoted_at", "TEXT"
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scheduled_reveal_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES question_sessions(id)
+                ON DELETE CASCADE,
+            target_id INTEGER REFERENCES publish_targets(id) ON DELETE SET NULL,
+            target_umo TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            question_sent_at TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            reveal_kind TEXT NOT NULL CHECK(reveal_kind IN ('answer', 'explanation')),
+            prompt_index INTEGER NOT NULL DEFAULT 0 CHECK(prompt_index >= 0),
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'sending', 'sent', 'skipped', 'failed', 'needs_review'
+            )),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            attempted_at TEXT,
+            finished_at TEXT,
+            page_progress_json TEXT NOT NULL DEFAULT '[]',
+            error_summary TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(session_id, reveal_kind, prompt_index)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_reveal_due "
+        "ON scheduled_reveal_jobs(status, due_at)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_status_overrides (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+            override_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_date_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            event_date_id INTEGER REFERENCES event_dates(id) ON DELETE SET NULL,
+            evidence_hash TEXT NOT NULL,
+            evidence_text_snapshot TEXT NOT NULL,
+            old_value_json TEXT NOT NULL,
+            proposed_value_json TEXT NOT NULL,
+            review_status TEXT NOT NULL CHECK(review_status IN (
+                'pending', 'accepted', 'rejected'
+            )),
+            actor_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_event_date_reviews_event "
+        "ON event_date_reviews(event_id, id)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operator_action_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target_ids_json TEXT NOT NULL,
+            outcome_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_operator_action_audits_created "
+        "ON operator_action_audits(created_at DESC)"
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
@@ -999,6 +1140,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: _migrate_9_to_10,
     10: _migrate_10_to_11,
     11: _migrate_11_to_12,
+    12: _migrate_12_to_13,
 }
 
 
@@ -1374,11 +1516,262 @@ class SQLiteStorage:
             ).fetchall()
         return [self._event_from_row(row) for row in rows]
 
+    def iter_events(self) -> Iterator[LegalEvent]:
+        """Yield events in a stable order without materializing the full table."""
+        cursor = self._connection.execute(
+            "SELECT * FROM events ORDER BY updated_at DESC, id DESC"
+        )
+        for row in cursor:
+            yield self._event_from_row(row)
+
     def get_event(self, event_id: int) -> LegalEvent | None:
         row = self._connection.execute(
             "SELECT * FROM events WHERE id = ?", (event_id,)
         ).fetchone()
         return self._event_from_row(row) if row else None
+
+    def get_event_status_override(self, event_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM event_status_overrides WHERE event_id = ?",
+            (int(event_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_event_status_override(
+        self,
+        event_id: int,
+        status: str,
+        *,
+        actor_id: str,
+        reason: str,
+        at: str,
+    ) -> None:
+        if status not in {
+            "current",
+            "needs_review",
+            "historical",
+            "ignored",
+            "derived",
+        }:
+            raise ValueError("不支持的雷达展示状态")
+        if not str(reason).strip():
+            raise ValueError("人工状态覆盖必须填写原因")
+        with self._connection:
+            exists = self._connection.execute(
+                "SELECT 1 FROM events WHERE id = ?", (int(event_id),)
+            ).fetchone()
+            if exists is None:
+                raise ValueError("活动不存在")
+            if status == "derived":
+                self._connection.execute(
+                    "DELETE FROM event_status_overrides WHERE event_id = ?",
+                    (int(event_id),),
+                )
+            else:
+                self._connection.execute(
+                    """INSERT INTO event_status_overrides(
+                        event_id, override_status, actor_id, reason, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        override_status = excluded.override_status,
+                        actor_id = excluded.actor_id, reason = excluded.reason,
+                        updated_at = excluded.updated_at""",
+                    (int(event_id), status, str(actor_id), str(reason).strip(), at, at),
+                )
+            self._connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    "event_status_overridden",
+                    "event",
+                    json.dumps([int(event_id)]),
+                    json.dumps({"status": status, "reason": str(reason).strip()}),
+                    at,
+                ),
+            )
+
+    def apply_event_status_batch(
+        self,
+        event_ids: list[int],
+        expected: dict[int, dict[str, Any]],
+        status: str,
+        *,
+        actor_id: str,
+        reason: str,
+        at: str,
+    ) -> list[int]:
+        """Apply selected Radar overrides in one stale-safe transaction."""
+        allowed = {"current", "needs_review", "historical", "ignored", "auto"}
+        if status not in allowed:
+            raise ValueError("不支持的雷达展示状态")
+        normalized_reason = str(reason or "").strip()
+        if status != "auto" and not normalized_reason:
+            raise ValueError("人工状态覆盖必须填写原因")
+        if len(normalized_reason) > 500:
+            raise ValueError("处理原因不能超过 500 字")
+        ids = list(dict.fromkeys(int(value) for value in event_ids))
+        if not ids or len(ids) > 100:
+            raise ValueError("请选择 1 至 100 条活动")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            for event_id in ids:
+                event = self._connection.execute(
+                    "SELECT raw_content_hash FROM events WHERE id = ?", (event_id,)
+                ).fetchone()
+                row = self._connection.execute(
+                    "SELECT * FROM event_status_overrides WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                actual_override = dict(row) if row else None
+                wanted = expected.get(event_id)
+                if (
+                    event is None
+                    or wanted is None
+                    or str(event["raw_content_hash"]) != wanted.get("source_hash")
+                    or actual_override != wanted.get("override")
+                ):
+                    raise ValueError("活动或人工状态在预览后发生变化，请重新预览")
+            for event_id in ids:
+                if status == "auto":
+                    self._connection.execute(
+                        "DELETE FROM event_status_overrides WHERE event_id = ?",
+                        (event_id,),
+                    )
+                else:
+                    self._connection.execute(
+                        """INSERT INTO event_status_overrides(
+                            event_id, override_status, actor_id, reason, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id) DO UPDATE SET
+                            override_status=excluded.override_status,
+                            actor_id=excluded.actor_id, reason=excluded.reason,
+                            updated_at=excluded.updated_at""",
+                        (event_id, status, str(actor_id), normalized_reason, at, at),
+                    )
+            self._connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    "radar_status_batch",
+                    "radar",
+                    json.dumps(ids),
+                    json.dumps(
+                        {
+                            "status": status,
+                            "reason": normalized_reason,
+                            "count": len(ids),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    at,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return ids
+
+    def record_event_date_review(
+        self,
+        *,
+        event_id: int,
+        event_date_id: int,
+        source_hash: str,
+        evidence_hash: str,
+        evidence_text: str,
+        old_value: dict[str, Any],
+        proposed_value: dict[str, Any],
+        decision: str,
+        actor_id: str,
+        reason: str,
+        at: str,
+    ) -> int:
+        if decision not in {"accepted", "rejected"}:
+            raise ValueError("日期复核决定必须是 accepted 或 rejected")
+        if not str(reason).strip():
+            raise ValueError("日期复核必须填写原因")
+        with self._connection:
+            event = self._connection.execute(
+                "SELECT raw_content_hash FROM events WHERE id = ?",
+                (int(event_id),),
+            ).fetchone()
+            date_row = self._connection.execute(
+                "SELECT * FROM event_dates WHERE id = ? AND event_id = ?",
+                (int(event_date_id), int(event_id)),
+            ).fetchone()
+            if (
+                event is None
+                or date_row is None
+                or str(event["raw_content_hash"]) != str(source_hash)
+                or str(date_row["evidence_text"]) != str(evidence_text)
+            ):
+                raise ValueError("活動來源或日期證據已變化，請重新預覽")
+            old_json = json.dumps(old_value, ensure_ascii=False, sort_keys=True)
+            proposed_json = json.dumps(
+                proposed_value, ensure_ascii=False, sort_keys=True
+            )
+            cursor = self._connection.execute(
+                """INSERT INTO event_date_reviews(
+                    event_id, event_date_id, evidence_hash, evidence_text_snapshot,
+                    old_value_json, proposed_value_json, review_status, actor_id,
+                    reason, created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    int(event_id),
+                    int(event_date_id),
+                    str(evidence_hash),
+                    str(evidence_text),
+                    old_json,
+                    proposed_json,
+                    decision,
+                    str(actor_id),
+                    str(reason).strip(),
+                    at,
+                    at,
+                ),
+            )
+            if decision == "accepted":
+                value = DateTime.fromisoformat(str(proposed_value["datetime"]))
+                self._connection.execute(
+                    "UPDATE event_dates SET datetime = ?, timezone = ? "
+                    "WHERE id = ? AND event_id = ?",
+                    (
+                        value.isoformat(),
+                        str(proposed_value["timezone"]),
+                        int(event_date_id),
+                        int(event_id),
+                    ),
+                )
+            self._connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    "event_date_reviewed",
+                    "event_date",
+                    json.dumps([int(event_id), int(event_date_id)]),
+                    json.dumps({"decision": decision, "reason": str(reason).strip()}),
+                    at,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_event_date_reviews(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._connection.execute(
+            "SELECT * FROM event_date_reviews ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 200)),),
+        ).fetchall()
+        result = []
+        for row in rows:
+            record = dict(row)
+            record["old_value"] = json.loads(record.pop("old_value_json"))
+            record["proposed_value"] = json.loads(record.pop("proposed_value_json"))
+            result.append(record)
+        return result
 
     def get_event_by_key(
         self, source_key: str, source_item_key: str
@@ -1604,6 +1997,360 @@ class SQLiteStorage:
         rows = self._connection.execute(query).fetchall()
         return [_target_from_row(row) for row in rows]
 
+    def dashboard_list_page(
+        self, kind: str, *, page: int, page_size: int
+    ) -> dict[str, Any]:
+        """Page a fixed dashboard allowlist; callers cannot provide SQL names."""
+        definitions = {
+            "daily": ("daily_contents", "1 = 1", "id DESC"),
+            "publications": ("publications", "1 = 1", "id DESC"),
+            "reminders": ("reminders", "1 = 1", "id DESC"),
+            "sources": ("source_runs", "1 = 1", "id DESC"),
+            "reveals": ("scheduled_reveal_jobs", "1 = 1", "id DESC"),
+            "targets": ("publish_targets", "1 = 1", "id DESC"),
+            "cases": (
+                "learning_items",
+                "active = 1 AND item_type = 'case' AND identity = 'official_case'",
+                "updated_at DESC, id DESC",
+            ),
+        }
+        definition = definitions.get(str(kind))
+        if definition is None:
+            raise ValueError("unsupported dashboard page")
+        table, where, order = definition
+        size = int(page_size)
+        offset = (int(page) - 1) * size
+        rows = self._connection.execute(
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+            (size, offset),
+        ).fetchall()
+        total_row = self._connection.execute(
+            f"SELECT COUNT(*) AS total FROM {table} WHERE {where}"
+        ).fetchone()
+        total = int(total_row["total"])
+        return {
+            "items": [dict(row) for row in rows],
+            "page": int(page),
+            "page_size": size,
+            "total": total,
+            "page_count": (total + size - 1) // size,
+        }
+
+    _CLEAR_TABLES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "radar": (
+            "events",
+            "event_dates",
+            "event_revisions",
+            "event_relations",
+            "event_status_overrides",
+            "event_date_reviews",
+            "source_documents",
+            "source_runs",
+            "law_updates",
+            "publications",
+            "reminders",
+            "canonical_publications",
+        ),
+        "library": (
+            "learning_review_items",
+            "structured_blocks",
+            "structured_subquestions",
+            "structured_material_relations",
+            "structured_item_bindings",
+            "structured_materials",
+            "structured_imports",
+            "learning_item_sources",
+            "learning_cases",
+            "learning_questions",
+            "learning_items",
+            "library_sources",
+        ),
+        "verified_questions": ("real_questions",),
+        "delivery_history": (
+            "scheduled_reveal_jobs",
+            "publications",
+            "reminders",
+            "daily_contents",
+            "source_runs",
+        ),
+        "question_sessions": (
+            "scheduled_reveal_jobs",
+            "question_session_events",
+            "question_sessions",
+        ),
+        "daily_plans": ("scheduled_reveal_jobs", "daily_plans"),
+        "targets": (
+            "publications",
+            "reminders",
+            "daily_contents",
+            "daily_plans",
+            "canonical_publications",
+            "publish_targets",
+        ),
+        "all_runtime": (
+            "scheduled_reveal_jobs",
+            "question_session_events",
+            "question_sessions",
+            "structured_blocks",
+            "structured_subquestions",
+            "structured_material_relations",
+            "structured_item_bindings",
+            "structured_materials",
+            "structured_imports",
+            "learning_review_items",
+            "learning_item_sources",
+            "learning_cases",
+            "learning_questions",
+            "learning_items",
+            "library_sources",
+            "real_questions",
+            "publications",
+            "reminders",
+            "daily_contents",
+            "daily_plans",
+            "canonical_publications",
+            "event_date_reviews",
+            "event_status_overrides",
+            "event_relations",
+            "event_revisions",
+            "event_dates",
+            "events",
+            "case_items",
+            "law_updates",
+            "source_documents",
+            "source_runs",
+            "operator_action_audits",
+            "publish_targets",
+        ),
+    }
+
+    def _clear_scope_specs(self, scope: str) -> list[tuple[str, str, tuple[Any, ...]]]:
+        if scope not in {*self._CLEAR_TABLES, "cases"}:
+            raise ValueError("不支持的数据清理范围")
+        if scope == "cases":
+            cases = "SELECT id FROM learning_items WHERE item_type='case' AND identity IN ('official_case','user_case')"
+            bindings = (
+                f"SELECT id FROM structured_item_bindings WHERE item_id IN ({cases})"
+            )
+            subquestions = f"SELECT id FROM structured_subquestions WHERE binding_id IN ({bindings})"
+            return [
+                ("case_items", "1=1", ()),
+                (
+                    "structured_blocks",
+                    f"item_id IN ({cases}) OR subquestion_id IN ({subquestions})",
+                    (),
+                ),
+                ("structured_material_relations", f"binding_id IN ({bindings})", ()),
+                ("structured_subquestions", f"binding_id IN ({bindings})", ()),
+                ("structured_item_bindings", f"item_id IN ({cases})", ()),
+                ("learning_item_sources", f"item_id IN ({cases})", ()),
+                ("learning_cases", f"item_id IN ({cases})", ()),
+                (
+                    "learning_items",
+                    "item_type='case' AND identity IN ('official_case','user_case')",
+                    (),
+                ),
+            ]
+        return [(table, "1=1", ()) for table in self._CLEAR_TABLES[scope]]
+
+    def _clear_row_snapshot(self, scope: str) -> dict[str, list[tuple[Any, ...]]]:
+        result: dict[str, list[tuple[Any, ...]]] = {}
+        for table, where, params in self._clear_scope_specs(scope):
+            columns = self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+            pk_columns = [
+                str(row["name"])
+                for row in sorted(columns, key=lambda row: int(row["pk"]))
+                if int(row["pk"])
+            ]
+            if not pk_columns:
+                raise RuntimeError(f"clear allowlist table lacks primary key: {table}")
+            select = ", ".join(pk_columns)
+            rows = self._connection.execute(
+                f"SELECT {select} FROM {table} WHERE {where} ORDER BY {select}", params
+            ).fetchall()
+            result[table] = [
+                tuple(row[column] for column in pk_columns) for row in rows
+            ]
+        return result
+
+    def prepare_data_clear(self, scope: str) -> dict[str, Any]:
+        snapshot = self._clear_row_snapshot(str(scope))
+        counts = {table: len(keys) for table, keys in snapshot.items()}
+        examples = {
+            table: [list(key) for key in keys[:3]]
+            for table, keys in snapshot.items()
+            if keys
+        }
+        scope_labels = {
+            "radar": "活动雷达数据",
+            "library": "学习资料库与待复核",
+            "verified_questions": "核验真题库存",
+            "cases": "案例库",
+            "delivery_history": "活动、提醒与每日执行历史",
+            "question_sessions": "答题会话历史",
+            "daily_plans": "每日计划与待发送揭晓",
+            "targets": "群目标绑定",
+            "all_runtime": "全部插件运行数据",
+        }
+        delete_descriptions = {
+            "radar": "活动、时间节点、来源抓取记录、法规更新及关联发布/提醒记录",
+            "library": "学习条目、结构化内容块、来源关联、待复核记录及导入记录",
+            "verified_questions": "已核验真题库存记录",
+            "cases": "用户/官方案例学习条目、案例结构和旧版案例记录",
+            "delivery_history": "定时揭晓、发布、提醒、每日执行及来源抓取运行记录",
+            "question_sessions": "答题会话、揭晓作业与会话事件",
+            "daily_plans": "每日计划及尚未执行的答案/解析揭晓作业",
+            "targets": "群绑定及依赖目标的计划、发布和提醒记录；会话诊断保留并解除目标关联",
+            "all_runtime": "所有插件运行期业务数据与操作审计；保留数据库结构和宿主配置",
+        }
+        retained_by_scope = {
+            "radar": ["学习资料/真题/案例库", "群绑定与每日计划", "答题会话"],
+            "library": ["活动雷达与法规更新", "核验真题库存", "群绑定、计划和历史记录"],
+            "verified_questions": [
+                "学习资料候选、活动雷达、案例库",
+                "群绑定、计划和历史记录",
+            ],
+            "cases": ["题目资料与核验真题", "活动雷达、群绑定、计划和历史记录"],
+            "delivery_history": [
+                "活动与学习资料内容",
+                "群绑定与每日计划配置",
+                "核验真题和案例库",
+            ],
+            "question_sessions": [
+                "题库/资料库、活动与案例数据",
+                "群绑定与每日计划配置",
+            ],
+            "daily_plans": ["学习内容、群绑定、已发送历史与答题会话", "插件配置"],
+            "targets": [
+                "学习与活动内容、题库、案例库",
+                "答题会话与揭晓诊断（目标关联置空）",
+            ],
+            "all_runtime": [],
+        }
+        retained = [
+            "SQLite schema 和 schema_meta",
+            "AstrBot 插件配置",
+            *retained_by_scope[scope],
+        ]
+        if scope == "targets":
+            retained.append(
+                "question sessions and scheduled reveal diagnostics；target_id 将置空"
+            )
+        return {
+            "scope": scope,
+            "scope_label": scope_labels[scope],
+            "delete_description": delete_descriptions[scope],
+            "labels": {
+                "events": "活动",
+                "event_dates": "活动时间节点",
+                "event_revisions": "活动内容版本",
+                "event_relations": "活动关联",
+                "event_status_overrides": "活动人工状态",
+                "event_date_reviews": "日期复核记录",
+                "source_documents": "来源文档",
+                "source_runs": "来源抓取运行",
+                "law_updates": "法规更新",
+                "learning_items": "学习资料条目",
+                "learning_review_items": "待复核记录",
+                "learning_cases": "结构化案例",
+                "learning_questions": "结构化题目",
+                "real_questions": "核验真题",
+                "scheduled_reveal_jobs": "待发送揭晓作业",
+                "question_sessions": "答题会话",
+                "question_session_events": "会话事件",
+                "daily_plans": "每日计划",
+                "publish_targets": "群绑定目标",
+                "publications": "发布记录",
+                "reminders": "提醒记录",
+                "daily_contents": "每日任务执行记录",
+                "operator_action_audits": "管理操作审计",
+                "case_items": "旧版案例记录",
+                "library_sources": "资料来源",
+                "learning_item_sources": "条目来源关联",
+                "structured_blocks": "结构化内容块",
+                "structured_materials": "共享材料",
+                "structured_subquestions": "结构化小问",
+                "structured_item_bindings": "结构化条目关联",
+                "structured_material_relations": "材料关联",
+                "structured_imports": "结构化导入记录",
+                "canonical_publications": "规范化发布记录",
+            },
+            "snapshot": snapshot,
+            "counts": counts,
+            "examples": examples,
+            "total": sum(counts.values()),
+            "retained": retained,
+        }
+
+    def confirm_data_clear(
+        self,
+        scope: str,
+        expected_snapshot: dict[str, list[tuple[Any, ...]]],
+        *,
+        typed_confirmation: str | None = None,
+    ) -> dict[str, Any]:
+        if scope == "all_runtime" and typed_confirmation != "清空全部数据":
+            raise ValueError("完整重置必须输入：清空全部数据")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._clear_row_snapshot(scope)
+            if current != expected_snapshot:
+                raise ValueError("数据范围在预览后发生变化，请重新预览")
+            if scope == "targets":
+                self._connection.execute("UPDATE question_sessions SET target_id=NULL")
+                self._connection.execute(
+                    "UPDATE scheduled_reveal_jobs SET target_id=NULL"
+                )
+            remaining = set(expected_snapshot)
+            ordered: list[str] = []
+            while remaining:
+                leaf = next(
+                    (
+                        table
+                        for table in sorted(remaining)
+                        if not any(
+                            str(fk["table"]) == table and child != table
+                            for child in remaining
+                            for fk in self._connection.execute(
+                                f"PRAGMA foreign_key_list({child})"
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if leaf is None:
+                    raise RuntimeError("清理表依赖存在循环，已安全回滚")
+                ordered.append(leaf)
+                remaining.remove(leaf)
+            for table in ordered:
+                columns = self._connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+                pk_columns = [
+                    str(row["name"])
+                    for row in sorted(columns, key=lambda row: int(row["pk"]))
+                    if int(row["pk"])
+                ]
+                for key in expected_snapshot[table]:
+                    predicate = " AND ".join(f"{column}=?" for column in pk_columns)
+                    self._connection.execute(
+                        f"DELETE FROM {table} WHERE {predicate}", tuple(key)
+                    )
+            violations = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("数据清理后 foreign_key_check 失败")
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return {
+            "success": True,
+            "scope": scope,
+            "deleted": {
+                table: len(keys) for table, keys in expected_snapshot.items() if keys
+            },
+        }
+
     def _target_by_umo(self, unified_msg_origin: str) -> dict[str, Any]:
         row = self._connection.execute(
             "SELECT * FROM publish_targets WHERE unified_msg_origin = ?",
@@ -1630,65 +2377,184 @@ class SQLiteStorage:
                     if isinstance(raw, RealQuestion)
                     else RealQuestion.from_mapping(raw)
                 )
-                identity = real_question_identity_key(question)
-                self._connection.execute(
-                    """
-                INSERT INTO real_questions(
-                    identity_key, source_name, exam_name, exam_year, exam_date,
-                    paper, question_number, source_url, source_locator, subject,
-                    question_type, stem, options_json, answer_json, explanation,
-                    answer_source, verification_status, content_hash, metadata_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(identity_key) DO UPDATE SET
-                    source_name = excluded.source_name, exam_name = excluded.exam_name,
-                    exam_year = excluded.exam_year, exam_date = excluded.exam_date,
-                    paper = excluded.paper, question_number = excluded.question_number,
-                    source_url = excluded.source_url, source_locator = excluded.source_locator,
-                    subject = excluded.subject, question_type = excluded.question_type,
-                    stem = excluded.stem, options_json = excluded.options_json,
-                    answer_json = excluded.answer_json, explanation = excluded.explanation,
-                    answer_source = excluded.answer_source,
-                    verification_status = excluded.verification_status,
-                    content_hash = excluded.content_hash, metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
-                    """,
-                    (
-                        identity,
-                        question.source_name,
-                        question.exam_name,
-                        question.exam_year,
-                        question.exam_date,
-                        question.paper,
-                        question.question_number,
-                        question.source_url,
-                        question.source_locator,
-                        question.subject,
-                        question.question_type,
-                        question.stem,
-                        json.dumps(
-                            question.options, ensure_ascii=False, sort_keys=True
-                        ),
-                        json.dumps(question.answer, ensure_ascii=False, sort_keys=True)
-                        if question.answer is not None
-                        else None,
-                        question.explanation,
-                        question.answer_source,
-                        question.verification_status,
-                        question.content_hash,
-                        json.dumps(
-                            question.metadata, ensure_ascii=False, sort_keys=True
-                        ),
-                        now,
-                        now,
-                    ),
-                )
+                self._upsert_real_question_row(question, now)
                 imported += 1
             self._connection.commit()
         except Exception:
             self._connection.rollback()
             raise
         return imported
+
+    def _upsert_real_question_row(self, question: RealQuestion, now: str) -> int:
+        identity = real_question_identity_key(question)
+        self._connection.execute(
+            """
+            INSERT INTO real_questions(
+                identity_key, source_name, exam_name, exam_year, exam_date,
+                paper, question_number, source_url, source_locator, subject,
+                question_type, stem, options_json, answer_json, explanation,
+                answer_source, verification_status, content_hash, metadata_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(identity_key) DO UPDATE SET
+                source_name = excluded.source_name, exam_name = excluded.exam_name,
+                exam_year = excluded.exam_year, exam_date = excluded.exam_date,
+                paper = excluded.paper, question_number = excluded.question_number,
+                source_url = excluded.source_url, source_locator = excluded.source_locator,
+                subject = excluded.subject, question_type = excluded.question_type,
+                stem = excluded.stem, options_json = excluded.options_json,
+                answer_json = excluded.answer_json, explanation = excluded.explanation,
+                answer_source = excluded.answer_source,
+                verification_status = excluded.verification_status,
+                content_hash = excluded.content_hash, metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                identity,
+                question.source_name,
+                question.exam_name,
+                question.exam_year,
+                question.exam_date,
+                question.paper,
+                question.question_number,
+                question.source_url,
+                question.source_locator,
+                question.subject,
+                question.question_type,
+                question.stem,
+                json.dumps(question.options, ensure_ascii=False, sort_keys=True),
+                json.dumps(question.answer, ensure_ascii=False, sort_keys=True)
+                if question.answer is not None
+                else None,
+                question.explanation,
+                question.answer_source,
+                question.verification_status,
+                question.content_hash,
+                json.dumps(question.metadata, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT id FROM real_questions WHERE identity_key = ?", (identity,)
+        ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def promote_candidate_real_question(
+        self,
+        question: RealQuestion,
+        *,
+        item_id: int,
+        actor_id: str,
+        at: str,
+    ) -> dict[str, Any]:
+        """Atomically upsert verified identity, link its candidate, and audit promotion."""
+        normalized = RealQuestion.from_mapping(question.to_mapping())
+        transaction_context = (
+            self._connection if not self._connection.in_transaction else nullcontext()
+        )
+        with transaction_context:
+            item = self._connection.execute(
+                "SELECT identity, active FROM learning_items WHERE id = ?",
+                (int(item_id),),
+            ).fetchone()
+            if (
+                item is None
+                or item["identity"] != "real_question_candidate"
+                or not item["active"]
+            ):
+                raise ValueError("候选题已变化、停用或不再是待核验身份")
+            binding = self._connection.execute(
+                "SELECT id FROM structured_item_bindings WHERE item_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (int(item_id),),
+            ).fetchone()
+            if binding is None:
+                raise ValueError("候选题缺少结构化来源绑定，不能建立核验关联")
+            existing_question = self._connection.execute(
+                "SELECT * FROM real_questions WHERE identity_key = ?",
+                (real_question_identity_key(normalized),),
+            ).fetchone()
+            if existing_question is None:
+                real_question_id = self._upsert_real_question_row(
+                    normalized, _serialize_datetime(DateTime.now(timezone.utc))
+                )
+            else:
+                exact_fields = (
+                    "source_name",
+                    "exam_name",
+                    "exam_year",
+                    "exam_date",
+                    "paper",
+                    "question_number",
+                    "source_url",
+                    "source_locator",
+                    "subject",
+                    "question_type",
+                    "stem",
+                    "options_json",
+                    "answer_json",
+                    "explanation",
+                    "answer_source",
+                )
+                candidate_values = {
+                    "source_name": normalized.source_name,
+                    "exam_name": normalized.exam_name,
+                    "exam_year": normalized.exam_year,
+                    "exam_date": normalized.exam_date,
+                    "paper": normalized.paper,
+                    "question_number": normalized.question_number,
+                    "source_url": normalized.source_url,
+                    "source_locator": normalized.source_locator,
+                    "subject": normalized.subject,
+                    "question_type": normalized.question_type,
+                    "stem": normalized.stem,
+                    "options_json": json.dumps(
+                        normalized.options, ensure_ascii=False, sort_keys=True
+                    ),
+                    "answer_json": json.dumps(
+                        normalized.answer, ensure_ascii=False, sort_keys=True
+                    )
+                    if normalized.answer is not None
+                    else None,
+                    "explanation": normalized.explanation,
+                    "answer_source": normalized.answer_source,
+                }
+                mismatched = [
+                    field
+                    for field in exact_fields
+                    if str(existing_question[field] or "")
+                    != str(candidate_values[field] or "")
+                ]
+                if mismatched:
+                    raise ValueError(
+                        "候选题与已有已核验题目身份冲突：" + ", ".join(mismatched)
+                    )
+                real_question_id = int(existing_question["id"])
+            self._connection.execute(
+                "UPDATE structured_item_bindings SET verified_real_question_id = ?, "
+                "promoted_by = ?, promoted_at = ?, review_status = 'resolved' WHERE id = ?",
+                (real_question_id, str(actor_id), str(at), int(binding["id"])),
+            )
+            self._connection.execute(
+                "UPDATE learning_items SET identity = 'verified_real_question', "
+                "verification_status = 'verified', updated_at = ? WHERE id = ?",
+                (str(at), int(item_id)),
+            )
+            self._connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    "candidate_promoted",
+                    "learning_item",
+                    json.dumps([int(item_id)]),
+                    json.dumps({"real_question_id": real_question_id}, sort_keys=True),
+                    str(at),
+                ),
+            )
+        return {"item_id": int(item_id), "real_question_id": real_question_id}
 
     def list_real_questions(
         self,
@@ -1774,8 +2640,10 @@ class SQLiteStorage:
                 question_origin, question_type, question_type_selection_mode,
                 fixed_question_type, rotation_question_types,
                 question_type_rotation_start_date, question_type_rotation_start_index,
+                question_reveal_mode, answer_reveal_delay_minutes,
+                explanation_reveal_delay_minutes,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO UPDATE SET
                 enabled = excluded.enabled, time = excluded.time,
                 selection_mode = excluded.selection_mode, fixed_subject = excluded.fixed_subject,
@@ -1788,6 +2656,9 @@ class SQLiteStorage:
                 rotation_question_types = excluded.rotation_question_types,
                 question_type_rotation_start_date = excluded.question_type_rotation_start_date,
                 question_type_rotation_start_index = excluded.question_type_rotation_start_index,
+                question_reveal_mode = excluded.question_reveal_mode,
+                answer_reveal_delay_minutes = excluded.answer_reveal_delay_minutes,
+                explanation_reveal_delay_minutes = excluded.explanation_reveal_delay_minutes,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1807,6 +2678,9 @@ class SQLiteStorage:
                 json.dumps(plan.rotation_question_types, ensure_ascii=False),
                 plan.question_type_rotation_start_date,
                 plan.question_type_rotation_start_index,
+                plan.question_reveal_mode,
+                plan.answer_reveal_delay_minutes,
+                plan.explanation_reveal_delay_minutes,
                 now,
             ),
         )
@@ -1989,15 +2863,63 @@ class SQLiteStorage:
         self._connection.commit()
         return cursor.rowcount > 0
 
-    def list_case_items(self, limit: int = 50) -> list[CaseItem]:
+    def list_case_items(
+        self, limit: int = 50, *, include_inactive: bool = False
+    ) -> list[CaseItem]:
+        where = "" if include_inactive else "WHERE active = 1"
         rows = self._connection.execute(
-            """
+            f"""
             SELECT * FROM case_items
+            {where}
             ORDER BY COALESCE(published_at, discovered_at) DESC, id DESC LIMIT ?
             """,
             (max(1, limit),),
         ).fetchall()
         return [_case_from_row(row) for row in rows]
+
+    def soft_delete_case_items(
+        self, item_ids: Iterable[int], *, actor_id: str, at: str
+    ) -> list[int]:
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection:
+            rows = self._connection.execute(
+                f"SELECT id FROM case_items WHERE active = 1 AND id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            changed = [int(row["id"]) for row in rows]
+            if changed:
+                changed_marks = ",".join("?" for _ in changed)
+                self._connection.execute(
+                    f"UPDATE case_items SET active = 0, deleted_at = ?, deleted_by = ? "
+                    f"WHERE id IN ({changed_marks})",
+                    [str(at), str(actor_id), *changed],
+                )
+        return changed
+
+    def restore_case_items(
+        self, item_ids: Iterable[int], *, actor_id: str, at: str
+    ) -> list[int]:
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection:
+            rows = self._connection.execute(
+                f"SELECT id FROM case_items WHERE active = 0 AND id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            changed = [int(row["id"]) for row in rows]
+            if changed:
+                changed_marks = ",".join("?" for _ in changed)
+                self._connection.execute(
+                    f"UPDATE case_items SET active = 1, deleted_at = NULL, deleted_by = NULL "
+                    f"WHERE id IN ({changed_marks})",
+                    changed,
+                )
+        return changed
 
     def get_case_item(self, item_id: int) -> CaseItem | None:
         row = self._connection.execute(
@@ -2018,14 +2940,17 @@ class SQLiteStorage:
         resolved_subject: str | None = None,
         resolved_question_type: str | None = None,
         resolved_origin: str | None = None,
+        intended_local_at: str | None = None,
+        target_label: str = "",
     ) -> int | None:
         cursor = self._connection.execute(
             """
             INSERT OR IGNORE INTO daily_contents(
                 content_date, target_id, content_type, source_item_id,
                 body_json, status, attempted_at, source_kind, source_item_key,
-                resolved_subject, resolved_question_type, resolved_origin
-            ) VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?)
+                resolved_subject, resolved_question_type, resolved_origin,
+                intended_local_at, target_label
+            ) VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 content_date,
@@ -2039,6 +2964,8 @@ class SQLiteStorage:
                 resolved_subject,
                 resolved_question_type,
                 resolved_origin,
+                intended_local_at,
+                str(target_label or ""),
             ),
         )
         self._connection.commit()
@@ -2064,6 +2991,8 @@ class SQLiteStorage:
         subject: str | None = None,
         resolved_question_type: str | None = None,
         resolved_origin: str | None = None,
+        intended_local_at: str | None = None,
+        target_label: str = "",
     ) -> int | None:
         body = {"skipped": True, "reason": reason, "subject": subject}
         return self.claim_daily_content(
@@ -2074,6 +3003,8 @@ class SQLiteStorage:
             resolved_subject=subject,
             resolved_question_type=resolved_question_type,
             resolved_origin=resolved_origin,
+            intended_local_at=intended_local_at,
+            target_label=target_label,
         )
 
     def finish_daily_content(
@@ -2402,6 +3333,9 @@ def _daily_plan_from_row(row: sqlite3.Row) -> DailyPlan:
         question_type_rotation_start_index=int(
             row["question_type_rotation_start_index"]
         ),
+        question_reveal_mode=row["question_reveal_mode"],
+        answer_reveal_delay_minutes=int(row["answer_reveal_delay_minutes"]),
+        explanation_reveal_delay_minutes=int(row["explanation_reveal_delay_minutes"]),
     )
 
 
@@ -2433,6 +3367,9 @@ def _case_from_row(row: sqlite3.Row) -> CaseItem:
         last_seen_at=row["last_seen_at"],
         subjects=tuple(dict.fromkeys((*source_subjects, *manual_subjects))),
         metadata=json.loads(row["metadata_json"]),
+        active=bool(row["active"]),
+        deleted_at=row["deleted_at"],
+        deleted_by=row["deleted_by"],
     )
 
 

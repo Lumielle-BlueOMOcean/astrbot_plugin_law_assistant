@@ -74,6 +74,8 @@ def _item_from_row(row: sqlite3.Row) -> LearningItem:
         created_by=str(row["created_by"]),
         metadata=json.loads(row["metadata_json"]),
         active=bool(row["active"]),
+        deleted_at=row["deleted_at"],
+        deleted_by=row["deleted_by"],
     )
 
 
@@ -208,7 +210,8 @@ class LibraryRepository:
             )
             if not bool(existing["active"]):
                 self.connection.execute(
-                    "UPDATE learning_items SET active = 1 WHERE id = ?",
+                    "UPDATE learning_items SET active = 1, deleted_at = NULL, "
+                    "deleted_by = NULL WHERE id = ?",
                     (int(existing["id"]),),
                 )
             return LibraryArchiveResult(
@@ -272,8 +275,8 @@ class LibraryRepository:
                 INSERT INTO learning_questions(
                     item_id, question_identity, question_type, stem, options_json,
                     answer_json, explanation, exam_name, exam_year, paper,
-                    question_number, answer_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    question_number, answer_source, exam_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
@@ -288,6 +291,7 @@ class LibraryRepository:
                     question.paper,
                     question.question_number,
                     question.answer_source,
+                    question.exam_date,
                 ),
             )
         return LibraryArchiveResult(
@@ -770,6 +774,7 @@ class LibraryRepository:
                 paper=str(question_row["paper"]),
                 question_number=str(question_row["question_number"]),
                 answer_source=str(question_row["answer_source"]),
+                exam_date=str(question_row["exam_date"]),
             )
         structured = self._structured_for_item(item_id)
         return LibraryItemBundle(
@@ -917,6 +922,13 @@ class LibraryRepository:
                 "item_kind": binding["item_kind"],
                 "schema_version": binding["schema_version"],
                 "review_status": binding["review_status"],
+                "verified_real_question_id": (
+                    int(binding["verified_real_question_id"])
+                    if binding["verified_real_question_id"] is not None
+                    else None
+                ),
+                "promoted_by": binding["promoted_by"],
+                "promoted_at": binding["promoted_at"],
                 "original_file_sha256": binding["original_file_sha256"],
                 "structured_json_sha256": binding["structured_json_sha256"],
                 "structured_payload_sha256": binding["structured_payload_sha256"],
@@ -1116,23 +1128,38 @@ class LibraryRepository:
         source_id: int | None = None,
         status: str = "pending",
         limit: int = 100,
+        offset: int = 0,
     ) -> list[LearningReviewItem]:
         clauses = ["status = ?"]
         params: list[Any] = [status]
         if source_id is not None:
             clauses.append("source_id = ?")
             params.append(source_id)
-        params.append(max(1, min(int(limit), 200)))
+        params.extend((max(1, min(int(limit), 200)), max(0, int(offset))))
         rows = self.connection.execute(
             f"""
             SELECT * FROM learning_review_items
             WHERE {" AND ".join(clauses)}
             ORDER BY updated_at DESC, id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
             params,
         ).fetchall()
         return [_review_from_row(row) for row in rows]
+
+    def count_filtered_review_items(
+        self, *, source_id: int | None = None, status: str = "pending"
+    ) -> int:
+        clauses = ["status = ?"]
+        params: list[Any] = [status]
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(int(source_id))
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM learning_review_items WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        return int(row["total"])
 
     def get_review_item(self, review_id: int) -> LearningReviewItem | None:
         row = self.connection.execute(
@@ -1154,6 +1181,65 @@ class LibraryRepository:
             )
         return cursor.rowcount > 0
 
+    def apply_review_status_batch(
+        self,
+        review_ids: list[int],
+        expected: dict[int, dict[str, Any]],
+        status: str,
+        *,
+        actor_id: str,
+        at: str,
+    ) -> list[int]:
+        """Apply a locked review status batch atomically and audit its scope."""
+        if status not in {"pending", "resolved", "superseded"}:
+            raise ValueError("不支持的待复核状态")
+        ids = list(dict.fromkeys(int(value) for value in review_ids))
+        if not ids or len(ids) > 100:
+            raise ValueError("请选择 1 至 100 条复核记录")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            for review_id in ids:
+                row = self.connection.execute(
+                    "SELECT source_id, candidate_key, status, updated_at "
+                    "FROM learning_review_items WHERE id = ?",
+                    (review_id,),
+                ).fetchone()
+                wanted = expected.get(review_id)
+                actual = (
+                    {
+                        "source_id": int(row["source_id"]),
+                        "candidate_key": str(row["candidate_key"]),
+                        "status": str(row["status"]),
+                        "updated_at": str(row["updated_at"]),
+                    }
+                    if row
+                    else None
+                )
+                if actual is None or actual != wanted:
+                    raise ValueError("复核队列在预览后发生变化，请重新预览")
+            for review_id in ids:
+                self.connection.execute(
+                    "UPDATE learning_review_items SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, at, review_id),
+                )
+            self.connection.execute(
+                "INSERT INTO operator_action_audits(actor_id, action, scope, "
+                "target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor_id),
+                    "review_status_batch",
+                    "review",
+                    _json(ids),
+                    _json({"status": status, "count": len(ids)}),
+                    at,
+                ),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return ids
+
     def search(
         self,
         *,
@@ -1163,60 +1249,20 @@ class LibraryRepository:
         subject: str = "",
         limit: int | None = 10,
         include_inactive: bool = False,
+        offset: int = 0,
     ) -> list[LearningItem]:
-        clauses = ["1 = 1"]
-        params: list[Any] = []
-        if not include_inactive:
-            clauses.append("i.active = 1")
-        if item_type:
-            clauses.append("i.item_type = ?")
-            params.append(item_type)
-        if identity:
-            clauses.append("i.identity = ?")
-            params.append(identity)
-        if subject:
-            subjects = subject_filter(subject)
-            if subjects is None:
-                raise ValueError(f"不支持的资料方向：{subject}")
-            subject_clauses = []
-            for candidate in sorted(subjects):
-                subject_clauses.append("i.subjects_json LIKE ?")
-                params.append(f'%"{candidate}"%')
-            clauses.append(f"({' OR '.join(subject_clauses)})")
-        if query:
-            term = f"%{query}%"
-            clauses.append(
-                "((i.item_type = 'question' AND ("
-                "i.title LIKE ? OR q.stem LIKE ? OR q.options_json LIKE ? OR "
-                "EXISTS (SELECT 1 FROM structured_blocks AS qsb "
-                "WHERE qsb.item_id = i.id AND qsb.section IN "
-                "('stem', 'options', 'answer_requirement', 'subquestion_stem', "
-                "'subquestion_answer_requirement') AND qsb.text LIKE ?) OR "
-                "EXISTS (SELECT 1 FROM structured_material_relations AS qsmr "
-                "JOIN structured_item_bindings AS qsib "
-                "ON qsib.id = qsmr.binding_id "
-                "JOIN structured_blocks AS qsmb "
-                "ON qsmb.material_id = qsmr.material_id "
-                "WHERE qsib.item_id = i.id AND qsmb.text LIKE ?))) OR "
-                "(i.item_type <> 'question' AND ("
-                "i.title LIKE ? OR i.source_summary LIKE ? OR "
-                "(COALESCE(s.source_kind, '') NOT IN "
-                "('structured_original', 'structured_json') AND s.raw_text LIKE ?) "
-                "OR c.case_summary LIKE ? OR c.practice_notes_json LIKE ? "
-                "OR q.stem LIKE ? OR q.explanation LIKE ? OR i.metadata_json LIKE ? "
-                "OR EXISTS (SELECT 1 FROM structured_blocks AS sb "
-                "WHERE sb.item_id = i.id AND sb.text LIKE ?) "
-                "OR EXISTS (SELECT 1 FROM structured_material_relations AS smr "
-                "JOIN structured_item_bindings AS sib ON sib.id = smr.binding_id "
-                "JOIN structured_blocks AS smb ON smb.material_id = smr.material_id "
-                "WHERE sib.item_id = i.id AND smb.text LIKE ?))))"
-            )
-            params.extend([term] * 15)
+        clauses, params = self._search_filters(
+            query=query,
+            item_type=item_type,
+            identity=identity,
+            subject=subject,
+            include_inactive=include_inactive,
+        )
         limit_clause = ""
         if limit is not None:
             safe_limit = max(1, min(int(limit), 5000))
-            params.append(safe_limit)
-            limit_clause = " LIMIT ?"
+            params.extend((safe_limit, max(0, int(offset))))
+            limit_clause = " LIMIT ? OFFSET ?"
         rows = self.connection.execute(
             f"""
             SELECT DISTINCT i.* FROM learning_items AS i
@@ -1231,6 +1277,86 @@ class LibraryRepository:
             params,
         ).fetchall()
         return [_item_from_row(row) for row in rows]
+
+    def count_search(
+        self,
+        *,
+        query: str = "",
+        item_type: str = "",
+        identity: str = "",
+        subject: str = "",
+        include_inactive: bool = False,
+    ) -> int:
+        clauses, params = self._search_filters(
+            query=query,
+            item_type=item_type,
+            identity=identity,
+            subject=subject,
+            include_inactive=include_inactive,
+        )
+        row = self.connection.execute(
+            "SELECT COUNT(DISTINCT i.id) AS total FROM learning_items AS i "
+            "LEFT JOIN learning_item_sources AS link ON link.item_id = i.id "
+            "LEFT JOIN library_sources AS s ON s.id = link.source_id "
+            "LEFT JOIN learning_cases AS c ON c.item_id = i.id "
+            "LEFT JOIN learning_questions AS q ON q.item_id = i.id "
+            f"WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        return int(row["total"])
+
+    def _search_filters(
+        self,
+        *,
+        query: str,
+        item_type: str,
+        identity: str,
+        subject: str,
+        include_inactive: bool,
+    ) -> tuple[list[str], list[Any]]:
+        clauses = ["1 = 1"]
+        params: list[Any] = []
+        if not include_inactive:
+            clauses.append("i.active = 1")
+        if item_type:
+            clauses.append("i.item_type = ?")
+            params.append(item_type)
+        if identity:
+            clauses.append("i.identity = ?")
+            params.append(identity)
+        if subject:
+            subjects = subject_filter(subject)
+            if subjects is None:
+                raise ValueError(f"不支持的资料方向：{subject}")
+            clauses.append(
+                "(" + " OR ".join("i.subjects_json LIKE ?" for _ in subjects) + ")"
+            )
+            params.extend(f'%"{candidate}"%' for candidate in sorted(subjects))
+        if query:
+            term = f"%{query}%"
+            clauses.append(
+                "((i.item_type = 'question' AND (i.title LIKE ? OR q.stem LIKE ? "
+                "OR q.options_json LIKE ? OR EXISTS (SELECT 1 FROM structured_blocks qsb "
+                "WHERE qsb.item_id = i.id AND qsb.section IN "
+                "('stem','options','answer_requirement','subquestion_stem',"
+                "'subquestion_answer_requirement') AND qsb.text LIKE ?) OR EXISTS ("
+                "SELECT 1 FROM structured_material_relations qsmr "
+                "JOIN structured_item_bindings qsib ON qsib.id=qsmr.binding_id "
+                "JOIN structured_blocks qsmb ON qsmb.material_id=qsmr.material_id "
+                "WHERE qsib.item_id=i.id AND qsmb.text LIKE ?))) OR "
+                "(i.item_type <> 'question' AND (i.title LIKE ? OR i.source_summary LIKE ? "
+                "OR (COALESCE(s.source_kind,'') NOT IN ('structured_original',"
+                "'structured_json') AND s.raw_text LIKE ?) OR c.case_summary LIKE ? "
+                "OR c.practice_notes_json LIKE ? OR q.stem LIKE ? OR q.explanation LIKE ? "
+                "OR i.metadata_json LIKE ? OR EXISTS (SELECT 1 FROM structured_blocks sb "
+                "WHERE sb.item_id=i.id AND sb.text LIKE ?) OR EXISTS (SELECT 1 FROM "
+                "structured_material_relations smr JOIN structured_item_bindings sib "
+                "ON sib.id=smr.binding_id JOIN structured_blocks smb "
+                "ON smb.material_id=smr.material_id WHERE sib.item_id=i.id "
+                "AND smb.text LIKE ?))))"
+            )
+            params.extend([term] * 15)
+        return clauses, params
 
     def safe_question_summary(self, item_id: int | None) -> str:
         """Return answer-free question text for search results, never legacy summary."""
@@ -1333,3 +1459,327 @@ class LibraryRepository:
                     (str(changes["explanation"]), item_id),
                 )
         return self.get(item_id)
+
+    def update_management(
+        self, item_id: int, changes: dict[str, Any]
+    ) -> LibraryItemBundle | None:
+        """Update allowlisted normalized fields while leaving source bytes immutable."""
+        allowed = {
+            "title",
+            "subjects",
+            "note",
+            "body",
+            "practice_notes",
+            "case_number",
+            "authority",
+            "case_summary",
+            "issues",
+            "reasoning",
+            "result_text",
+            "question_type",
+            "stem",
+            "options",
+            "answer",
+            "explanation",
+            "answer_source",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unsupported management fields: {sorted(unknown)}")
+        with self.connection:
+            bundle = self.get(int(item_id))
+            if bundle is None:
+                return None
+            updates: list[str] = []
+            values: list[Any] = []
+            if "title" in changes:
+                updates.append("title = ?")
+                values.append(str(changes["title"]))
+            if "subjects" in changes:
+                updates.append("subjects_json = ?")
+                values.append(_json(list(changes["subjects"])))
+            metadata_changed = "note" in changes or "body" in changes
+            if metadata_changed:
+                metadata = dict(bundle.item.metadata)
+                for field in ("note", "body"):
+                    if field in changes:
+                        metadata[field] = str(changes[field])
+                updates.append("metadata_json = ?")
+                values.append(_json(metadata))
+            if updates:
+                updates.append("updated_at = ?")
+                values.append(datetime.now().astimezone().isoformat())
+                values.append(int(item_id))
+                self.connection.execute(
+                    f"UPDATE learning_items SET {', '.join(updates)} WHERE id = ?",
+                    values,
+                )
+            if bundle.question is not None:
+                q_fields = {
+                    "question_type": "question_type",
+                    "stem": "stem",
+                    "options": "options_json",
+                    "answer": "answer_json",
+                    "explanation": "explanation",
+                    "answer_source": "answer_source",
+                    "exam_name": "exam_name",
+                    "exam_year": "exam_year",
+                    "exam_date": "exam_date",
+                    "paper": "paper",
+                    "question_number": "question_number",
+                }
+                selected = [
+                    (key, column) for key, column in q_fields.items() if key in changes
+                ]
+                if selected:
+                    assignments = []
+                    q_values = []
+                    for key, column in selected:
+                        value = changes[key]
+                        if key in {"options", "answer"}:
+                            value = _json(value)
+                        assignments.append(f"{column} = ?")
+                        q_values.append(value)
+                    q_values.append(int(item_id))
+                    self.connection.execute(
+                        f"UPDATE learning_questions SET {', '.join(assignments)} WHERE item_id = ?",
+                        q_values,
+                    )
+            if bundle.case is not None:
+                c_fields = {
+                    "case_number": "case_number",
+                    "authority": "authority",
+                    "case_summary": "case_summary",
+                    "issues": "issues_json",
+                    "reasoning": "reasoning",
+                    "result_text": "result_text",
+                    "practice_notes": "practice_notes_json",
+                }
+                selected = [
+                    (key, column) for key, column in c_fields.items() if key in changes
+                ]
+                if selected:
+                    assignments = []
+                    c_values = []
+                    for key, column in selected:
+                        value = (
+                            _json(list(changes[key]))
+                            if key in {"issues", "practice_notes"}
+                            else changes[key]
+                        )
+                        assignments.append(f"{column} = ?")
+                        c_values.append(value)
+                    c_values.append(int(item_id))
+                    self.connection.execute(
+                        f"UPDATE learning_cases SET {', '.join(assignments)} WHERE item_id = ?",
+                        c_values,
+                    )
+        return self.get(int(item_id))
+
+    def soft_delete_items(
+        self, item_ids: list[int], *, actor_id: str, at: str
+    ) -> list[int]:
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connection:
+            rows = self.connection.execute(
+                f"SELECT id FROM learning_items WHERE id IN ({placeholders}) AND active = 1",
+                ids,
+            ).fetchall()
+            changed = [int(row["id"]) for row in rows]
+            if changed:
+                changed_placeholders = ",".join("?" for _ in changed)
+                self.connection.execute(
+                    f"UPDATE learning_items SET active = 0, deleted_at = ?, deleted_by = ? "
+                    f"WHERE id IN ({changed_placeholders})",
+                    [str(at), str(actor_id), *changed],
+                )
+        return changed
+
+    def restore_items(
+        self, item_ids: list[int], *, actor_id: str, at: str
+    ) -> list[int]:
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connection:
+            rows = self.connection.execute(
+                f"SELECT id FROM learning_items WHERE id IN ({placeholders}) AND active = 0",
+                ids,
+            ).fetchall()
+            changed = [int(row["id"]) for row in rows]
+            if changed:
+                changed_placeholders = ",".join("?" for _ in changed)
+                self.connection.execute(
+                    f"UPDATE learning_items SET active = 1, deleted_at = NULL, deleted_by = NULL, "
+                    f"updated_at = ? WHERE id IN ({changed_placeholders})",
+                    [str(at), *changed],
+                )
+        return changed
+
+    def apply_management_batch(
+        self,
+        *,
+        action: str,
+        item_ids: list[int],
+        expected: dict[int, dict[str, Any]],
+        actor_id: str,
+        at: str,
+        changes: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Apply one reviewed homogeneous mutation atomically after fingerprint checks."""
+        if action not in {"edit", "delete", "restore"}:
+            raise ValueError("unsupported management batch action")
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids or len(ids) > 100 or set(ids) != set(expected):
+            raise ValueError("batch item set changed")
+        normalized_changes = changes or {}
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for item_id in ids:
+                    row = self.connection.execute(
+                        "SELECT item_hash, updated_at, active, identity, item_type, metadata_json "
+                        "FROM learning_items WHERE id = ?",
+                        (item_id,),
+                    ).fetchone()
+                    fingerprint = expected[item_id]
+                    if row is None or any(
+                        str(row[key] if row[key] is not None else "")
+                        != str(
+                            fingerprint.get(key, "")
+                            if fingerprint.get(key) is not None
+                            else ""
+                        )
+                        for key in (
+                            "item_hash",
+                            "updated_at",
+                            "active",
+                            "identity",
+                            "item_type",
+                        )
+                    ):
+                        raise ValueError(f"资料 {item_id} 在预览后发生变化")
+                    if action == "delete":
+                        if not int(row["active"]):
+                            raise ValueError(f"资料 {item_id} 已停用")
+                        self.connection.execute(
+                            "UPDATE learning_items SET active=0, deleted_at=?, deleted_by=?, updated_at=? WHERE id=?",
+                            (str(at), str(actor_id), str(at), item_id),
+                        )
+                    elif action == "restore":
+                        if int(row["active"]):
+                            raise ValueError(f"资料 {item_id} 已启用")
+                        self.connection.execute(
+                            "UPDATE learning_items SET active=1, deleted_at=NULL, deleted_by=NULL, updated_at=? WHERE id=?",
+                            (str(at), item_id),
+                        )
+                    else:
+                        metadata = json.loads(row["metadata_json"] or "{}")
+                        for key in ("note", "body"):
+                            if key in normalized_changes:
+                                metadata[key] = str(normalized_changes[key])
+                        item_updates: list[str] = []
+                        item_values: list[Any] = []
+                        if "title" in normalized_changes:
+                            item_updates.append("title=?")
+                            item_values.append(str(normalized_changes["title"]))
+                        if "subjects" in normalized_changes:
+                            item_updates.append("subjects_json=?")
+                            item_values.append(
+                                _json(list(normalized_changes["subjects"]))
+                            )
+                        if "note" in normalized_changes or "body" in normalized_changes:
+                            item_updates.append("metadata_json=?")
+                            item_values.append(_json(metadata))
+                        item_updates.append("updated_at=?")
+                        item_values.extend((str(at), item_id))
+                        self.connection.execute(
+                            f"UPDATE learning_items SET {', '.join(item_updates)} WHERE id=?",
+                            item_values,
+                        )
+                        question_fields = {
+                            "question_type": "question_type",
+                            "stem": "stem",
+                            "options": "options_json",
+                            "answer": "answer_json",
+                            "explanation": "explanation",
+                            "answer_source": "answer_source",
+                            "exam_name": "exam_name",
+                            "exam_year": "exam_year",
+                            "exam_date": "exam_date",
+                            "paper": "paper",
+                            "question_number": "question_number",
+                        }
+                        q_pairs = [
+                            (key, col)
+                            for key, col in question_fields.items()
+                            if key in normalized_changes
+                        ]
+                        if q_pairs:
+                            self.connection.execute(
+                                "UPDATE learning_questions SET "
+                                + ", ".join(f"{col}=?" for _, col in q_pairs)
+                                + " WHERE item_id=?",
+                                [
+                                    (
+                                        _json(normalized_changes[key])
+                                        if key in {"options", "answer"}
+                                        else normalized_changes[key]
+                                    )
+                                    for key, _ in q_pairs
+                                ]
+                                + [item_id],
+                            )
+                        case_fields = {
+                            "case_number": "case_number",
+                            "authority": "authority",
+                            "case_summary": "case_summary",
+                            "issues": "issues_json",
+                            "reasoning": "reasoning",
+                            "result_text": "result_text",
+                            "practice_notes": "practice_notes_json",
+                        }
+                        c_pairs = [
+                            (key, col)
+                            for key, col in case_fields.items()
+                            if key in normalized_changes
+                        ]
+                        if c_pairs:
+                            self.connection.execute(
+                                "UPDATE learning_cases SET "
+                                + ", ".join(f"{col}=?" for _, col in c_pairs)
+                                + " WHERE item_id=?",
+                                [
+                                    (
+                                        _json(list(normalized_changes[key]))
+                                        if key in {"issues", "practice_notes"}
+                                        else normalized_changes[key]
+                                    )
+                                    for key, col in c_pairs
+                                ]
+                                + [item_id],
+                            )
+                self.connection.execute(
+                    "INSERT INTO operator_action_audits(actor_id, action, scope, target_ids_json, outcome_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(actor_id),
+                        f"library_batch_{action}",
+                        "learning_item",
+                        _json(ids),
+                        _json({"count": len(ids)}),
+                        str(at),
+                    ),
+                )
+            except Exception:
+                self.connection.rollback()
+                raise
+        return ids

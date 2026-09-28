@@ -11,6 +11,7 @@ import pytest
 from daily_plans import DailyPlan
 from daily_resolver import resolve_daily_constraints
 from models import CaseItem, SourceDocument
+from question_session_repository import QuestionSessionRepository
 from service import LawAssistantService
 from storage import SQLiteStorage
 from tests.fakes import FakeAdapter, FakeExtractor, RecordingPublisher, make_event
@@ -25,6 +26,64 @@ def document(source_key: str, item_key: str) -> SourceDocument:
         content=f"content:{item_key}",
         fetched_at="2026-09-17T00:00:00+00:00",
     )
+
+
+@pytest.mark.asyncio
+async def test_reveal_history_page_exposes_target_progress_without_snapshot_content(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "reveal-history.sqlite3")
+    service = LawAssistantService(storage)
+    target = await service.bind_target("aiocqhttp:group:reveal-history", "揭晓记录群")
+    session = QuestionSessionRepository(storage.connection).create_session(
+        session_key="reveal-history-session",
+        scope_origin=target["unified_msg_origin"],
+        target_id=target["id"],
+        source_kind="generated_question",
+        source_item_key="synthetic-question",
+        library_item_id=None,
+        real_question_id=None,
+        question_identity="mock_question",
+        snapshot={
+            "prompts": [
+                {
+                    "stem": "合成题干",
+                    "answer_blocks": [{"text": "HIDDEN_ANSWER"}],
+                    "explanation_blocks": [{"text": "HIDDEN_EXPLANATION"}],
+                }
+            ]
+        },
+        created_by="scheduler",
+        created_at="2026-09-29T00:00:00+00:00",
+    )
+    snapshot_hash = storage.connection.execute(
+        "SELECT question_snapshot_hash FROM question_sessions WHERE id = ?",
+        (session["id"],),
+    ).fetchone()[0]
+    service.scheduled_reveals.create_for_session(
+        session_id=session["id"],
+        target_umo=target["unified_msg_origin"],
+        snapshot_hash=snapshot_hash,
+        question_sent_at="2026-09-29T00:00:00+00:00",
+        due_at="2026-09-29T00:20:00+00:00",
+        reveal_kind="answer",
+        created_at="2026-09-29T00:00:00+00:00",
+        prompt_index=0,
+    )
+
+    page = await service.dashboard_page("reveals", page=1, page_size=20)
+
+    assert page["total"] == 1
+    row = page["items"][0]
+    assert row["target_label"] == "揭晓记录群"
+    assert row["target_umo"] == "aiocqhttp:group:reveal-history"
+    assert row["reveal_kind"] == "answer"
+    assert row["status"] == "pending"
+    assert row["page_progress"] == []
+    serialized = str(row)
+    assert "HIDDEN_ANSWER" not in serialized
+    assert "HIDDEN_EXPLANATION" not in serialized
+    storage.close()
 
 
 @pytest.mark.asyncio
@@ -131,6 +190,475 @@ async def test_service_list_and_get_delegate_to_storage(tmp_path) -> None:
 
     assert len(events) == 1
     assert loaded is not None and loaded.id == event_id
+
+
+@pytest.mark.asyncio
+async def test_data_clear_confirmation_is_operator_bound_one_shot_and_scope_exact(
+    tmp_path,
+):
+    now = datetime(2026, 9, 29, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "clear-confirm.sqlite3")
+    event_id = storage.upsert_event(make_event(source_key="clear-radar"))
+    storage.import_real_questions(
+        [
+            {
+                "source_name": "synthetic verified fixture",
+                "exam_name": "synthetic exam",
+                "exam_year": "2024",
+                "question_number": "Q1",
+                "source_locator": "synthetic page 1",
+                "subject": "civil_law",
+                "question_type": "single_choice",
+                "stem": "synthetic question",
+                "options": ["A", "B"],
+                "answer": "A",
+                "answer_source": "official",
+                "verification_status": "verified",
+            }
+        ]
+    )
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+        clock=lambda: now,
+    )
+
+    denied = await service.prepare_data_clear("radar", actor_id="ordinary-user")
+    prepared = await service.prepare_data_clear("radar", actor_id="operator-1")
+    wrong_owner = await service.confirm_data_clear(
+        prepared["token"], actor_id="operator-2"
+    )
+    assert denied["ready"] is False
+    assert wrong_owner["success"] is False
+    assert storage.count_events() == 1
+
+    cleared = await service.confirm_data_clear(prepared["token"], actor_id="operator-1")
+    replay = await service.confirm_data_clear(prepared["token"], actor_id="operator-1")
+    assert cleared["success"] is True
+    assert storage.count_events() == 0
+    assert len(storage.list_real_questions(limit=None)) == 1
+    assert replay["success"] is False
+    assert replay["reason"] == "清理 token 无效或已使用"
+    assert event_id not in {item.id for item in storage.list_events(limit=20)}
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_data_clear_expiry_and_stale_snapshot_never_delete_rows(tmp_path):
+    now = datetime(2026, 9, 29, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "clear-safety.sqlite3")
+    storage.upsert_event(make_event(source_key="clear-radar"))
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+        clock=lambda: now,
+    )
+
+    stale = await service.prepare_data_clear("radar", actor_id="operator-1")
+    storage.upsert_event(make_event(source_key="new-radar"))
+    rejected_stale = await service.confirm_data_clear(
+        stale["token"], actor_id="operator-1"
+    )
+    assert rejected_stale["success"] is False
+    assert "发生变化" in rejected_stale["reason"]
+    assert storage.count_events() == 2
+
+    expired = await service.prepare_data_clear("radar", actor_id="operator-1")
+    now += timedelta(minutes=11)
+    rejected_expired = await service.confirm_data_clear(
+        expired["token"], actor_id="operator-1"
+    )
+    assert rejected_expired["success"] is False
+    assert rejected_expired["reason"] == "清理 token 已过期"
+    assert storage.count_events() == 2
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_promotion_is_explicit_authorized_and_keeps_missing_answers_missing(
+    tmp_path,
+) -> None:
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    imported = await ingestion.confirm(prepared)
+    candidate_id = storage.connection.execute(
+        "SELECT id FROM learning_items WHERE identity = 'real_question_candidate'"
+    ).fetchone()["id"]
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name = '合成考试', answer_json = 'null', "
+        "answer_source = 'not_provided' WHERE item_id = ?",
+        (candidate_id,),
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+
+    denied = await service.prepare_candidate_promotion(
+        [candidate_id], actor_id="ordinary-user"
+    )
+    prepared_promotion = await service.prepare_candidate_promotion(
+        [candidate_id, 999999], actor_id="operator-1"
+    )
+
+    assert imported["archived"] >= 1
+    assert denied["ready"] is False
+    assert prepared_promotion["promotable_count"] == 1
+    assert prepared_promotion["selected_count"] == 2
+    assert len(prepared_promotion["validation_failures"]) == 1
+    assert prepared_promotion["unresolved_answer_count"] == 1
+    assert prepared_promotion["items"][0]["normalized"]["answer"] is None
+    before = storage.list_real_questions(limit=None)
+    assert before == []
+
+    wrong_actor = await service.confirm_candidate_promotion(
+        prepared_promotion["token"], actor_id="other-operator"
+    )
+    confirmed = await service.confirm_candidate_promotion(
+        prepared_promotion["token"], actor_id="operator-1"
+    )
+
+    assert wrong_actor["success"] is False
+    assert confirmed["success"] is False
+    assert confirmed["partial_success"] is True
+    assert len(confirmed["results"]) == 2
+    assert sum(item["success"] for item in confirmed["results"]) == 1
+    promoted = storage.list_real_questions(limit=None)
+    assert len(promoted) == 1
+    assert promoted[0].answer is None
+    assert promoted[0].answer_source == "not_provided"
+    assert storage.connection.execute(
+        "SELECT identity, verification_status FROM learning_items WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()[:] == ("verified_real_question", "verified")
+    assert storage.list_real_questions(limit=None)[0].id == promoted[0].id
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_promotion_does_not_overwrite_verified_identity_collision(
+    tmp_path,
+) -> None:
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    candidate_id = storage.connection.execute(
+        "SELECT id FROM learning_items WHERE identity = 'real_question_candidate'"
+    ).fetchone()["id"]
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name = '合成考试', answer_json = 'null', "
+        "answer_source = 'not_provided' WHERE item_id = ?",
+        (candidate_id,),
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+    preview = await service.prepare_candidate_promotion(
+        [candidate_id], actor_id="operator-1"
+    )
+    candidate_mapping = preview["items"][0]["normalized"]
+    candidate_mapping["stem"] = "已经存在但内容不同的合成题目"
+    candidate_mapping["verification_status"] = "verified"
+    storage.import_real_questions([candidate_mapping])
+    existing = storage.list_real_questions(limit=None)[0]
+
+    outcome = await service.confirm_candidate_promotion(
+        preview["token"], actor_id="operator-1"
+    )
+
+    assert outcome["success"] is False
+    assert outcome["results"][0]["success"] is False
+    assert storage.list_real_questions(limit=None)[0].stem == existing.stem
+    assert (
+        storage.connection.execute(
+            "SELECT identity FROM learning_items WHERE id = ?", (candidate_id,)
+        ).fetchone()["identity"]
+        == "real_question_candidate"
+    )
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_promotion_keeps_structured_answer_unverified_not_official(
+    tmp_path,
+) -> None:
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    candidate_id = storage.connection.execute(
+        "SELECT id FROM learning_items WHERE identity = 'real_question_candidate'"
+    ).fetchone()["id"]
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name = '合成考试' WHERE item_id = ?",
+        (candidate_id,),
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+
+    preview = await service.prepare_candidate_promotion(
+        [candidate_id], actor_id="operator-1"
+    )
+
+    assert preview["promotable_count"] == 1
+    normalized = preview["items"][0]["normalized"]
+    assert normalized["answer"] == "应结合构成要件和证据分析。"
+    assert normalized["answer_source"] == "unverified"
+    confirmed = await service.confirm_candidate_promotion(
+        preview["token"], actor_id="operator-1"
+    )
+    assert confirmed["success"] is True
+    promoted = storage.list_real_questions(limit=None)[0]
+    assert promoted.answer == "应结合构成要件和证据分析。"
+    assert promoted.answer_source == "unverified"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_library_batch_prepare_confirm_is_operator_bound_atomic_and_reversible(
+    tmp_path,
+) -> None:
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    item_id = int(
+        storage.connection.execute(
+            "SELECT id FROM learning_items WHERE identity='real_question_candidate'"
+        ).fetchone()["id"]
+    )
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+
+    denied = await service.prepare_library_batch(
+        "edit", [item_id], actor_id="ordinary", changes={"title": "不应写入"}
+    )
+    prepared_edit = await service.prepare_library_batch(
+        "edit",
+        [item_id],
+        actor_id="operator-1",
+        changes={"title": "批量编辑后的合成题"},
+    )
+    assert denied["ready"] is False
+    assert prepared_edit["ready"] is True
+    before = await service.get_management_learning_item(item_id, actor_id="operator-1")
+    assert before["item"]["title"] != "批量编辑后的合成题"
+    wrong_actor = await service.confirm_library_batch(
+        prepared_edit["token"], actor_id="other"
+    )
+    assert wrong_actor["success"] is False
+    changed = await service.confirm_library_batch(
+        prepared_edit["token"], actor_id="operator-1"
+    )
+    replay = await service.confirm_library_batch(
+        prepared_edit["token"], actor_id="operator-1"
+    )
+    assert changed["success"] is True
+    assert replay["success"] is False
+    edited = await service.get_management_learning_item(item_id, actor_id="operator-1")
+    assert edited["item"]["title"] == "批量编辑后的合成题"
+
+    delete_preview = await service.prepare_library_batch(
+        "delete", [item_id], actor_id="operator-1"
+    )
+    assert (
+        await service.confirm_library_batch(
+            delete_preview["token"], actor_id="operator-1"
+        )
+    )["success"] is True
+    safe_deleted = await service.get_learning_item(item_id)
+    admin_deleted = await service.get_management_learning_item(
+        item_id, actor_id="operator-1"
+    )
+    assert safe_deleted["success"] is False
+    assert admin_deleted["item"]["active"] is False
+    assert len(admin_deleted["sources"]) == 2
+
+    restore_preview = await service.prepare_library_batch(
+        "restore", [item_id], actor_id="operator-1"
+    )
+    assert (
+        await service.confirm_library_batch(
+            restore_preview["token"], actor_id="operator-1"
+        )
+    )["success"] is True
+    restored = await service.get_management_learning_item(
+        item_id, actor_id="operator-1"
+    )
+    assert restored["item"]["active"] is True
+    assert len(restored["sources"]) == 2
+
+    stale = await service.prepare_library_batch(
+        "delete", [item_id], actor_id="operator-1"
+    )
+    storage.connection.execute(
+        "UPDATE learning_items SET item_hash = item_hash || '-changed' WHERE id = ?",
+        (item_id,),
+    )
+    storage.connection.commit()
+    rejected = await service.confirm_library_batch(
+        stale["token"], actor_id="operator-1"
+    )
+    assert rejected["success"] is False
+    assert (
+        storage.connection.execute(
+            "SELECT active FROM learning_items WHERE id = ?", (item_id,)
+        ).fetchone()["active"]
+        == 1
+    )
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_moderation_batches_lock_review_and_radar_ids_and_keep_truth_separate(
+    tmp_path,
+):
+    from datetime import timezone
+
+    from library_models import LibrarySource
+    from library_repository import LibraryRepository
+    from library_service import LibraryService
+
+    now = datetime(2026, 9, 29, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "moderation-batch.sqlite3")
+    first_event = make_event(source_key="radar-1")
+    second_event = make_event(source_key="radar-2")
+    first_id = storage.upsert_event(first_event)
+    second_id = storage.upsert_event(second_event)
+    repository = LibraryRepository(storage.connection)
+    source_id = repository.ensure_source(
+        LibrarySource(
+            source_kind="synthetic_fixture",
+            title="虚构复核来源",
+            raw_text="仅供测试的虚构 evidence",
+            source_url="https://example.test/review",
+            content_hash="synthetic-review-hash",
+            created_at=now.astimezone(timezone.utc),
+            created_by="operator-1",
+            session_origin="private:operator-1",
+        )
+    )
+    review_id = repository.record_review_item(
+        source_id=source_id,
+        candidate_key="synthetic-review-1",
+        material_type="note",
+        locator="fixture:1",
+        raw_fragment="虚构片段",
+        proposed_structure={},
+        review_reason="合成复核项",
+        now=now,
+    )
+    service = LawAssistantService(
+        storage,
+        library_service=LibraryService(repository),
+        config=SimpleNamespace(operator_ids=["operator-1"], timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+
+    review_preview = await service.prepare_moderation_batch(
+        "review", [review_id], {"status": "resolved"}, actor_id="operator-1"
+    )
+    assert review_preview["ready"] is True
+    assert repository.get_review_item(review_id).status == "pending"
+    denied = await service.confirm_moderation_batch(
+        review_preview["token"], actor_id="other"
+    )
+    reviewed = await service.confirm_moderation_batch(
+        review_preview["token"], actor_id="operator-1"
+    )
+    assert denied["success"] is False
+    assert reviewed["success"] is True
+    assert repository.get_review_item(review_id).status == "resolved"
+
+    radar_preview = await service.prepare_moderation_batch(
+        "radar",
+        [first_id],
+        {"status": "ignored", "reason": "合成批量忽略"},
+        actor_id="operator-1",
+    )
+    assert radar_preview["ready"] is True
+    assert storage.get_event_status_override(first_id) is None
+    assert storage.get_event_status_override(second_id) is None
+    changed = await service.confirm_moderation_batch(
+        radar_preview["token"], actor_id="operator-1"
+    )
+    assert changed["success"] is True
+    assert storage.get_event_status_override(first_id)["override_status"] == "ignored"
+    assert storage.get_event_status_override(second_id) is None
+    replay = await service.confirm_moderation_batch(
+        radar_preview["token"], actor_id="operator-1"
+    )
+    assert replay["success"] is False
+
+    clear_preview = await service.prepare_moderation_batch(
+        "radar",
+        [first_id],
+        {"status": "auto", "reason": "恢复自动状态"},
+        actor_id="operator-1",
+    )
+    cleared = await service.confirm_moderation_batch(
+        clear_preview["token"], actor_id="operator-1"
+    )
+    assert cleared["success"] is True, cleared
+    assert storage.get_event_status_override(first_id) is None
+    assert storage.get_event(first_id).raw_content_hash == first_event.raw_content_hash
+    assert (
+        storage.get_event(second_id).raw_content_hash == second_event.raw_content_hash
+    )
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_radar_batch_stale_second_row_rolls_back_first_row(tmp_path):
+
+    now = datetime(2026, 9, 29, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "moderation-batch-stale.sqlite3")
+    first_id = storage.upsert_event(make_event(source_key="batch-stale-1"))
+    second_id = storage.upsert_event(make_event(source_key="batch-stale-2"))
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(operator_ids=["operator-1"], timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    preview = await service.prepare_moderation_batch(
+        "radar",
+        [first_id, second_id],
+        {"status": "historical", "reason": "合成批量复核"},
+        actor_id="operator-1",
+    )
+    assert preview["ready"] is True
+    storage.set_event_status_override(
+        second_id,
+        "ignored",
+        actor_id="operator-1",
+        reason="并发变更",
+        at=now.isoformat(),
+    )
+
+    result = await service.confirm_moderation_batch(
+        preview["token"], actor_id="operator-1"
+    )
+
+    assert result["success"] is False
+    assert storage.get_event_status_override(first_id) is None
+    assert storage.get_event_status_override(second_id)["override_status"] == "ignored"
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    storage.close()
 
 
 @pytest.mark.asyncio
@@ -527,6 +1055,273 @@ async def test_daily_question_uses_independent_subject_and_type_resolver_and_his
     assert history["resolved_subject"] == "economic_law"
     assert history["resolved_question_type"] == "single_choice"
     assert history["resolved_origin"] == "mock"
+
+
+@pytest.mark.asyncio
+async def test_daily_question_schedules_reveals_only_after_successful_prompt(tmp_path):
+    from publisher import PublishOutcome
+
+    now = datetime(2026, 10, 2, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            return {
+                "available": True,
+                "origin": "mock",
+                "subject": "criminal_law",
+                "question_type": "short_answer",
+                "question_id": None,
+                "content": {
+                    "question": "合成题干：甲的行为如何评价？",
+                    "answer": "答案段落。" * 180,
+                    "explanation": "解析段落。" * 180,
+                },
+            }
+
+    class OutcomePublisher:
+        def __init__(self, first):
+            self.outcomes = [first]
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            if self.outcomes:
+                return self.outcomes.pop(0)
+            return PublishOutcome("sent")
+
+    async def build_service(path, first_outcome):
+        storage = SQLiteStorage(path)
+        publisher = OutcomePublisher(first_outcome)
+        service = LawAssistantService(
+            storage,
+            publisher=publisher,
+            learning_service=Learning(),
+            config=SimpleNamespace(
+                timezone="Asia/Shanghai", question_message_max_chars=300
+            ),
+            clock=lambda: now,
+        )
+        target = await service.bind_target("aiocqhttp:group:601", "一群")
+        storage.upsert_daily_plan(
+            DailyPlan.from_mapping(
+                "daily_question",
+                {
+                    "enabled": True,
+                    "time": "08:00",
+                    "question_origin": "mock",
+                    "question_reveal_mode": "delayed",
+                    "answer_reveal_delay_minutes": 20,
+                    "explanation_reveal_delay_minutes": 35,
+                },
+            ),
+            target["id"],
+        )
+        return storage, service, publisher
+
+    failed_storage, failed_service, _failed_publisher = await build_service(
+        tmp_path / "failed-prompt.sqlite3", PublishOutcome("failed", "offline")
+    )
+    failed_result = await failed_service.process_due_work(now=now)
+    assert failed_result["daily_question_sent"] == 0
+    assert (
+        failed_storage.connection.execute(
+            "SELECT COUNT(*) FROM question_sessions"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        failed_storage.connection.execute(
+            "SELECT COUNT(*) FROM scheduled_reveal_jobs"
+        ).fetchone()[0]
+        == 0
+    )
+    failed_storage.close()
+
+    storage, service, publisher = await build_service(
+        tmp_path / "successful-prompt.sqlite3", PublishOutcome("sent")
+    )
+    sent = await service.process_due_work(now=now)
+    assert sent["daily_question_sent"] == 1
+    jobs = storage.connection.execute(
+        "SELECT * FROM scheduled_reveal_jobs ORDER BY reveal_kind"
+    ).fetchall()
+    assert {row["reveal_kind"] for row in jobs} == {"answer", "explanation"}
+    by_kind = {row["reveal_kind"]: row for row in jobs}
+    session = storage.connection.execute("SELECT * FROM question_sessions").fetchone()
+    assert by_kind["answer"]["session_id"] == session["id"]
+    assert by_kind["answer"]["snapshot_hash"] == session["question_snapshot_hash"]
+    assert by_kind["answer"]["target_umo"] == "aiocqhttp:group:601"
+    assert datetime.fromisoformat(
+        by_kind["answer"]["due_at"]
+    ) == datetime.fromisoformat(by_kind["answer"]["question_sent_at"]) + timedelta(
+        minutes=20
+    )
+    assert datetime.fromisoformat(
+        by_kind["explanation"]["due_at"]
+    ) == datetime.fromisoformat(by_kind["explanation"]["question_sent_at"]) + timedelta(
+        minutes=35
+    )
+
+    answer_due = datetime.fromisoformat(by_kind["answer"]["due_at"])
+    reveal_result = await service.process_due_reveals(now=answer_due)
+    answer_job = service.scheduled_reveals.get(by_kind["answer"]["id"])
+    assert reveal_result["sent"] == 1, (
+        reveal_result,
+        service.scheduled_reveals.get(by_kind["answer"]["id"]),
+        publisher.calls,
+    )
+    assert answer_job["status"] == "sent"
+    answer_messages = [text for _, text in publisher.calls[1:]]
+    assert len(answer_messages) > 1
+    assert all(len(text) <= 300 for text in answer_messages)
+    assert all("解析段落。" not in text for text in answer_messages)
+    assert all("答案段落。" in text for text in answer_messages)
+    assert answer_job["page_progress"] == list(range(len(answer_messages)))
+    assert await service.process_due_reveals(now=answer_due) == {
+        "sent": 0,
+        "skipped": 0,
+        "failed": 0,
+        "needs_review": 0,
+    }
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_reveal_skips_pending_job_and_closed_session_is_not_sent(tmp_path):
+
+    now = datetime(2026, 10, 2, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            return {
+                "available": True,
+                "origin": "mock",
+                "subject": "criminal_law",
+                "question_type": "single_choice",
+                "content": {
+                    "question": "合成选择题？",
+                    "options": ["A", "B"],
+                    "answer": "A",
+                    "explanation": "解析。",
+                },
+            }
+
+    storage = SQLiteStorage(tmp_path / "reveal-skip.sqlite3")
+    publisher = RecordingPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    target = await service.bind_target("aiocqhttp:group:602", "二群")
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "enabled": True,
+                "time": "08:00",
+                "question_origin": "mock",
+                "question_reveal_mode": "delayed",
+                "answer_reveal_delay_minutes": 20,
+                "explanation_reveal_delay_minutes": 35,
+            },
+        ),
+        target["id"],
+    )
+    await service.process_due_work(now=now)
+    answer_job = storage.connection.execute(
+        "SELECT * FROM scheduled_reveal_jobs WHERE reveal_kind='answer'"
+    ).fetchone()
+    explanation_job = storage.connection.execute(
+        "SELECT * FROM scheduled_reveal_jobs WHERE reveal_kind='explanation'"
+    ).fetchone()
+    assert answer_job is not None and explanation_job is not None
+    assert answer_job["status"] == explanation_job["status"] == "pending"
+
+    manual = await service.question_session_action(
+        "answer", session_origin="aiocqhttp:group:602", actor_id="42"
+    )
+    assert "A" in manual["text"]
+    assert service.scheduled_reveals.get(answer_job["id"])["status"] == "skipped"
+    assert service.scheduled_reveals.get(explanation_job["id"])["status"] == "pending"
+
+    await service.question_session_action(
+        "close", session_origin="aiocqhttp:group:602", actor_id="42"
+    )
+    before = len(publisher.calls)
+    result = await service.process_due_reveals(
+        now=datetime.fromisoformat(explanation_job["due_at"])
+    )
+    assert result["skipped"] == 1
+    assert len(publisher.calls) == before
+    storage.close()
+
+
+def test_due_scheduler_resolves_earliest_local_plan_and_skips_completed_occurrence(
+    tmp_path,
+):
+    now = datetime(2026, 9, 29, 7, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    storage = SQLiteStorage(tmp_path / "due-plan.sqlite3")
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    target = storage.bind_target("aiocqhttp:group:100", "一群")
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping("daily_case", {"enabled": True, "time": "08:00"}),
+        target["id"],
+    )
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping("daily_question", {"enabled": True, "time": "08:30"}),
+        target["id"],
+    )
+
+    assert service.has_due_scheduler_work() is True
+    assert service.next_due_at().isoformat() == "2026-09-29T08:00:00+08:00"
+    storage.record_daily_skip(
+        content_date="2026-09-29",
+        target_id=target["id"],
+        content_type="daily_case",
+        reason="synthetic no matching case",
+    )
+    assert service.next_due_at().isoformat() == "2026-09-29T08:30:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_plan_change_wakes_scheduler_only_after_persistence(tmp_path):
+    storage = SQLiteStorage(tmp_path / "wake-plan.sqlite3")
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: datetime(2026, 9, 29, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    target = await service.bind_target("aiocqhttp:group:100", "一群")
+    wake_calls = []
+
+    async def wake():
+        wake_calls.append(True)
+
+    service.set_scheduler_wakeup(wake)
+    prepared = await service.prepare_daily_plan_update(
+        target_selectors=["一群"],
+        content_type="daily_question",
+        changes={"enabled": True, "time": "08:00"},
+        actor_id="operator-1",
+    )
+    assert prepared["ready"] is True
+    assert wake_calls == []
+    assert storage.get_daily_plan(target["id"], "daily_question") is None
+
+    confirmed = await service.confirm_daily_plan_update(
+        prepared["token"], actor_id="operator-1"
+    )
+
+    assert confirmed["success"] is True
+    assert storage.get_daily_plan(target["id"], "daily_question").enabled is True
+    assert wake_calls == [True]
 
 
 @pytest.mark.asyncio

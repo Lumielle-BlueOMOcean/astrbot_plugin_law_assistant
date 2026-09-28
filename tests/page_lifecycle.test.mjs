@@ -11,13 +11,42 @@ class FakeElement {
     this.value = "";
     this.files = [];
     this.listeners = {};
+    this.parentElement = null;
     this.classList = { toggle() {} };
   }
 
-  append(...children) { this.children.push(...children.flat().filter(Boolean)); }
-  prepend(...children) { this.children.unshift(...children.flat().filter(Boolean)); }
-  replaceChildren(...children) { this.children = children.flat().filter(Boolean); }
-  remove() { this.removed = true; }
+  append(...children) {
+    const values = children.flat().filter(Boolean);
+    values.forEach((child) => { child.parentElement = this; });
+    this.children.push(...values);
+  }
+  prepend(...children) {
+    const values = children.flat().filter(Boolean);
+    values.forEach((child) => { child.parentElement = this; });
+    this.children.unshift(...values);
+  }
+  replaceChildren(...children) {
+    this.children.forEach((child) => { child.parentElement = null; });
+    this.children = children.flat().filter(Boolean);
+    this.children.forEach((child) => { child.parentElement = this; });
+  }
+  after(...siblings) {
+    if (!this.parentElement) return;
+    const parent = this.parentElement;
+    const index = parent.children.indexOf(this);
+    const values = siblings.flat().filter(Boolean);
+    values.forEach((child) => { child.parentElement = parent; });
+    parent.children.splice(index + 1, 0, ...values);
+  }
+  remove() {
+    if (this.parentElement) {
+      const siblings = this.parentElement.children;
+      const index = siblings.indexOf(this);
+      if (index >= 0) siblings.splice(index, 1);
+      this.parentElement = null;
+    }
+    this.removed = true;
+  }
   addEventListener(name, handler) { this.listeners[name] = handler; }
   setAttribute() {}
 }
@@ -36,6 +65,12 @@ function findElement(root, predicate) {
   return null;
 }
 
+function findElements(root, predicate, found = []) {
+  if (predicate(root)) found.push(root);
+  for (const child of root.children || []) findElements(child, predicate, found);
+  return found;
+}
+
 function labeledInput(root, label) {
   const field = findElement(
     root,
@@ -46,7 +81,7 @@ function labeledInput(root, label) {
 
 async function loadPage() {
   const elements = new Map();
-  for (const id of ["flash", "navigation", "context-badge", "view-overview", "view-library", "view-plans", "view-targets", "view-history"]) {
+  for (const id of ["flash", "navigation", "context-badge", "view-overview", "view-library", "view-plans", "view-targets", "view-history", "view-radar"]) {
     const element = new FakeElement();
     element.id = id;
     elements.set(id, element);
@@ -90,8 +125,8 @@ test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async (
 test("overview renders safe active-session progress from the Bridge payload", async () => {
   const { bridge, elements, page } = await loadPage();
   bridge.apiGet = async () => ({
-    plugin: { version: "0.5.2" },
-    schema_version: 12,
+    plugin: { version: "0.6.0" },
+    schema_version: 13,
     radar: { current: 0 },
     learning: {},
     targets: { count: 1 },
@@ -189,7 +224,7 @@ test("question detail never renders answer, explanation, raw evidence, or metada
   }
 });
 
-test("saving a safe question detail never submits a note field", async () => {
+test("saving an operator question detail never submits a note field", async () => {
   const { bridge, elements, page } = await loadPage();
   const posts = [];
   bridge.apiGet = async () => ({
@@ -225,11 +260,16 @@ test("saving a safe question detail never submits a note field", async () => {
   await save.listeners.click();
 
   assert.equal(posts.length, 1);
-  assert.equal(posts[0].endpoint, "library/update");
+  assert.equal(posts[0].endpoint, "management/library-update");
   assert.equal(posts[0].body.item_id, 73);
   assert.equal(posts[0].body.changes.title, "更新后的题目");
   assert.equal(posts[0].body.changes.subjects, "民法");
-  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["subjects", "title"]);
+  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), [
+    "answer", "answer_source", "exam_date", "exam_name", "exam_year",
+    "explanation", "options", "paper", "question_number", "question_type",
+    "stem", "subjects", "title",
+  ]);
+  assert.equal(posts[0].body.changes.note, undefined);
   assert.equal(labeledInput(elements.get("view-library"), "备注"), null);
 });
 
@@ -268,9 +308,60 @@ test("saving a non-question detail continues to submit its edited note", async (
   await save.listeners.click();
 
   assert.equal(posts.length, 1);
-  assert.equal(posts[0].endpoint, "library/update");
+  assert.equal(posts[0].endpoint, "management/library-update");
   assert.equal(posts[0].body.changes.note, "修改后的备注");
-  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["note", "subjects", "title"]);
+  assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["body", "note", "subjects", "title"]);
+});
+
+test("library detail expands inline, toggles, switches rows, and saves in place", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const updates = [];
+  bridge.apiGet = async (endpoint, params) => {
+    if (endpoint === "management/library-search") {
+      return {
+        items: [
+          { id: 1, item_type: "note", title: "资料甲", subjects: [], active: true },
+          { id: 2, item_type: "note", title: "资料乙", subjects: [], active: true },
+        ],
+        page: params.page, page_size: params.page_size, total: 2, page_count: 1,
+      };
+    }
+    if (endpoint === "library/manage-item") {
+      return { item: { id: Number(params.id), item_type: "note", title: `资料${params.id}`, subjects: [], active: true, metadata: { body: "正文" } }, sources: [] };
+    }
+    throw new Error(`unexpected GET ${endpoint}`);
+  };
+  bridge.apiPost = async (endpoint, body) => {
+    updates.push({ endpoint, body });
+    return { success: true };
+  };
+  page.state.route = "library";
+  page.state.libraryTab = "materials";
+  page.state.renderGeneration = 1;
+  const view = elements.get("view-library");
+  await page.renderMaterials(view);
+  const viewButtons = findElements(view, (element) => element.tagName === "BUTTON" && element.textContent === "查看");
+  assert.equal(viewButtons.length, 2);
+  await viewButtons[0].listeners.click();
+  let detailRows = findElements(view, (element) => element.className === "library-inline-detail-row");
+  assert.equal(detailRows.length, 1);
+  const tableRows = findElements(view, (element) => element.tagName === "TR");
+  assert.equal(tableRows[tableRows.indexOf(detailRows[0]) - 1].children[1].textContent, "1");
+
+  await viewButtons[0].listeners.click();
+  assert.equal(findElements(view, (element) => element.className === "library-inline-detail-row").length, 0);
+  await viewButtons[0].listeners.click();
+  await viewButtons[1].listeners.click();
+  detailRows = findElements(view, (element) => element.className === "library-inline-detail-row");
+  assert.equal(detailRows.length, 1);
+  assert.match(textOf(detailRows[0]), /资料2/);
+
+  const save = findElement(detailRows[0], (element) => element.tagName === "BUTTON" && element.textContent === "保存");
+  await save.listeners.click();
+  await save.listeners.click();
+  assert.equal(updates.length, 2);
+  assert.equal(findElements(view, (element) => element.className === "library-inline-detail-row").length, 1);
+  assert.equal(detailRows[0].children[0].children.filter((child) => child.className === "detail-panel").length, 1);
 });
 
 test("answer-safe question review renders only its allowlisted preview and structure", async () => {
@@ -316,7 +407,7 @@ test("stale asynchronous overview render cannot overwrite the newest generation"
   page.state.route = "overview";
   page.state.renderGeneration = 1;
   const first = page.renderOverview();
-  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 12 });
+  bridge.apiGet = async () => ({ plugin: { version: "new" }, schema_version: 13 });
   page.state.renderGeneration = 2;
   const second = page.renderOverview();
   await second;
@@ -334,7 +425,7 @@ test("stale Targets and Plans responses do not duplicate visible cards", async (
     if (endpoint === "targets") {
       targetsCalls += 1;
       if (targetsCalls === 1) return new Promise((resolve) => { resolveTargets = resolve; });
-      return [{ id: 1, label: "一群", unified_msg_origin: "aiocqhttp:group:1", enabled: true }];
+      return { items: [{ id: 1, label: "一群", unified_msg_origin: "aiocqhttp:group:1", enabled: true }], page: 1, page_size: 20, total: 1, page_count: 1 };
     }
     return {
       global: {
@@ -349,7 +440,7 @@ test("stale Targets and Plans responses do not duplicate visible cards", async (
   const firstTargets = page.renderTargets();
   const secondTargets = page.renderTargets();
   await secondTargets;
-  resolveTargets([{ id: 1, label: "旧一群", unified_msg_origin: "old", enabled: true }]);
+  resolveTargets({ items: [{ id: 1, label: "旧一群", unified_msg_origin: "old", enabled: true }], page: 1, page_size: 20, total: 1, page_count: 1 });
   await firstTargets;
   assert.equal((textOf(elements.get("view-targets")).match(/一群/g) || []).length, 1);
 
@@ -378,11 +469,38 @@ test("stale Targets and Plans responses do not duplicate visible cards", async (
   assert.equal((textOf(elements.get("view-plans")).match(/全局默认/g) || []).length, 2);
 });
 
+test("empty last target page keeps pagination controls to recover after removal", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const requests = [];
+  bridge.apiGet = async (endpoint, params) => {
+    assert.equal(endpoint, "targets");
+    requests.push(params.page);
+    return params.page === 2
+      ? { items: [], page: 2, page_size: 20, total: 21, page_count: 2 }
+      : { items: [{ id: 1, label: "剩余群", unified_msg_origin: "aiocqhttp:group:1", enabled: true }], page: 1, page_size: 20, total: 1, page_count: 1 };
+  };
+
+  page.state.route = "targets";
+  page.state.renderGeneration = 4;
+  page.state.pages.targets = { page: 2, page_size: 20 };
+  await page.renderTargets();
+
+  const previous = findElement(elements.get("view-targets"),
+    (child) => child.tagName === "BUTTON" && child.textContent === "上一页",
+  );
+  assert.ok(previous, "empty result page should retain its pager");
+  await previous.listeners.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(requests, [2, 1]);
+  assert.match(textOf(elements.get("view-targets")), /剩余群/);
+});
+
 test("navigate plus hashchange performs one effective route render", async () => {
   const { bridge, handlers, window, page } = await loadPage();
   let librarySearchCalls = 0;
   bridge.apiGet = async (endpoint) => {
-    if (endpoint === "library/search") {
+    if (endpoint === "management/library-search") {
       librarySearchCalls += 1;
       return { count: 0, items: [] };
     }
@@ -394,6 +512,250 @@ test("navigate plus hashchange performs one effective route render", async () =>
   window.location.hash = "#library";
   await handlers.hashchange();
   assert.equal(librarySearchCalls, 1);
+});
+
+test("management batch preview locks selected page IDs and cancel never confirms", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async () => ({
+    items: [{ id: 7, title: "合成资料", identity: "user_note", subjects: [], active: true }],
+    page: 1, page_size: 20, total: 1, page_count: 1,
+  });
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    if (endpoint === "management/batch-prepare") return { token: "batch-preview", count: 1, items: [{ id: 7, title: "合成资料", identity: "user_note", active: true }] };
+    return { success: true };
+  };
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+  await page.renderMaterials(elements.get("view-library"));
+  const checkbox = findElements(elements.get("view-library"), (element) => element.tagName === "INPUT" && element.type === "checkbox")[1];
+  checkbox.checked = true;
+  await checkbox.listeners.change();
+  const prepare = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "预览软删除");
+  await prepare.listeners.click();
+  assert.equal(posts.length, 1);
+  const preview = findElement(elements.get("view-library"), (element) => element.tagName === "ARTICLE" && textOf(element).includes("批量操作预览"));
+  assert.match(textOf(preview), /合成资料/);
+  assert.equal(posts[0].endpoint, "management/batch-prepare");
+  assert.equal(posts[0].body.action, "delete");
+  assert.deepEqual(Array.from(posts[0].body.item_ids), [7]);
+  assert.deepEqual(Object.keys(posts[0].body.changes), []);
+  const cancel = findElement(preview, (element) => element.tagName === "BUTTON" && element.textContent === "取消");
+  cancel.listeners.click();
+  assert.equal(posts.some((entry) => entry.endpoint === "management/batch-confirm"), false);
+});
+
+test("full data reset requires its exact phrase and stays uncommitted when preview is canceled", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    return { token: "clear-token", scope: "all_runtime", total: 3, counts: { events: 2, daily_plans: 1 }, retained: ["SQLite schema"] };
+  };
+  page.renderDataManagement(elements.get("view-library"));
+  const scope = findElement(elements.get("view-library"), (element) => element.tagName === "SELECT");
+  scope.value = "all_runtime";
+  const prepare = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "预览清理");
+  await prepare.listeners.click();
+  const phrase = findElement(elements.get("view-library"), (element) => element.tagName === "INPUT" && element.placeholder === "输入：清空全部数据");
+  assert.ok(phrase);
+  const confirm = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "确认清理");
+  assert.equal(confirm.disabled, true);
+  phrase.value = "清空全部数据";
+  phrase.listeners.input();
+  assert.equal(confirm.disabled, false);
+  const cancel = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "取消");
+  cancel.listeners.click();
+  assert.deepEqual(posts.map((entry) => entry.endpoint), ["management/clear-prepare"]);
+  assert.equal(posts[0].body.scope, "all_runtime");
+});
+
+test("Review batch selection locks exact IDs and requires explicit confirmation", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async (endpoint) => endpoint === "reviews"
+    ? { items: [{ id: 31, material_type: "question", locator: "fixture:1", status: "pending" }], total: 1, page: 1, page_size: 20, page_count: 1 }
+    : {};
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    if (endpoint.endsWith("prepare")) return { token: "review-batch-token", count: 1, items: [] };
+    return { count: 1 };
+  };
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+  await page.renderReviews(elements.get("view-library"));
+  const selectPage = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "选择本页");
+  await selectPage.listeners.click();
+  const prepare = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "预览批量复核状态");
+  await prepare.listeners.click();
+  const preview = findElement(elements.get("view-library"), (element) => element.className === "confirm-panel");
+  assert.ok(preview);
+  assert.equal(posts[0].endpoint, "management/moderation-batch-prepare");
+  assert.equal(posts[0].body.domain, "review");
+  assert.deepEqual(Array.from(posts[0].body.item_ids), [31]);
+  const confirm = findElement(preview, (element) => element.tagName === "BUTTON" && element.textContent === "确认应用");
+  await confirm.listeners.click();
+  assert.equal(posts[1].endpoint, "management/moderation-batch-confirm");
+  assert.equal(posts[1].body.token, "review-batch-token");
+});
+
+test("Radar batch selection locks exact IDs and sends the reviewed reason", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async () => ({ items: [{ id: 41, title: "合成活动", radar_status: "current" }], total: 1, page: 1, page_size: 20, page_count: 1 });
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    return { token: "radar-batch-token", count: 1, items: [] };
+  };
+  page.state.route = "radar";
+  page.state.renderGeneration = 1;
+  await page.renderRadar();
+  const selects = findElements(elements.get("view-radar"), (element) => element.tagName === "SELECT");
+  selects[1].value = "historical";
+  const reason = findElement(elements.get("view-radar"), (element) => element.tagName === "INPUT" && element.placeholder.includes("批量状态变更原因"));
+  reason.value = "合成复核原因";
+  const selectPage = findElement(elements.get("view-radar"), (element) => element.tagName === "BUTTON" && element.textContent === "选择本页");
+  await selectPage.listeners.click();
+  const prepare = findElement(elements.get("view-radar"), (element) => element.tagName === "BUTTON" && element.textContent === "预览批量状态");
+  await prepare.listeners.click();
+  assert.equal(posts[0].endpoint, "management/moderation-batch-prepare");
+  assert.equal(posts[0].body.domain, "radar");
+  assert.deepEqual(Array.from(posts[0].body.item_ids), [41]);
+  assert.equal(posts[0].body.changes.status, "historical");
+  assert.equal(posts[0].body.changes.reason, "合成复核原因");
+});
+
+test("daily reveal controls are question-only and enter the saved plan preview", async () => {
+  const { elements, page } = await loadPage();
+  const questionPlan = page.planForm("daily_question", {
+    enabled: true, time: "08:00", selection_mode: "random", question_reveal_mode: "manual",
+  }, (changes) => { elements.set("captured-plan", changes); });
+  assert.ok(labeledInput(questionPlan, "答案延迟分钟"));
+  const revealMode = labeledInput(questionPlan, "答案/解析揭晓模式");
+  revealMode.value = "delayed";
+  revealMode.listeners.change();
+  const answerDelay = labeledInput(questionPlan, "答案延迟分钟");
+  answerDelay.value = "15";
+  const explanationDelay = labeledInput(questionPlan, "解析延迟分钟");
+  explanationDelay.value = "45";
+  const preview = findElement(questionPlan, (element) => element.tagName === "BUTTON" && element.textContent === "预览并保存");
+  preview.listeners.click();
+  assert.equal(elements.get("captured-plan").question_reveal_mode, "delayed");
+  assert.equal(elements.get("captured-plan").answer_reveal_delay_minutes, 15);
+  assert.equal(elements.get("captured-plan").explanation_reveal_delay_minutes, 45);
+
+  const casePlan = page.planForm("daily_case", { enabled: true, selection_mode: "random" }, () => {});
+  assert.equal(labeledInput(casePlan, "答案延迟分钟"), null);
+});
+
+test("daily plan UI exposes dependent modes and maps first direction/type without raw indexes", async () => {
+  const { page } = await loadPage();
+  let preview;
+  const form = page.planForm("daily_question", {
+    enabled: true,
+    selection_mode: "random",
+    rotation_subjects: ["civil_law", "economic_law"],
+    rotation_start_index: 1,
+    rotation_start_date: "2026-09-29",
+    question_type_selection_mode: "rotation",
+    rotation_question_types: ["single_choice", "multiple_choice"],
+    question_type_rotation_start_index: 1,
+    question_type_rotation_start_date: "2026-09-29",
+    question_origin: "mock",
+  }, (changes) => { preview = changes; });
+  const labelControl = (label) => labeledInput(form, label);
+  const directionMode = labelControl("方向模式");
+  const questionTypeMode = labelControl("题型模式");
+  const fixedSubject = labelControl("固定方向").parentElement;
+  const rotationField = findElement(form, (element) => element.className === "form-field" && textOf(element).includes("方向顺序"));
+  assert.equal(fixedSubject.hidden, true);
+  assert.equal(rotationField.hidden, true);
+
+  directionMode.value = "fixed";
+  directionMode.listeners.change();
+  assert.equal(fixedSubject.hidden, false);
+  assert.equal(rotationField.hidden, true);
+  directionMode.value = "rotation";
+  directionMode.listeners.change();
+  questionTypeMode.value = "rotation";
+  questionTypeMode.listeners.change();
+  assert.equal(fixedSubject.hidden, true);
+  assert.equal(rotationField.hidden, false);
+  assert.equal(labelControl("首日方向").value, "economic_law");
+  assert.equal(labelControl("首日题型").value, "multiple_choice");
+  assert.equal(labelControl("起始位置"), null);
+  assert.equal(labelControl("题型轮换起始位置"), null);
+
+  labelControl("首日方向").value = "civil_law";
+  labelControl("首日方向").listeners.change();
+  labelControl("首日题型").value = "single_choice";
+  labelControl("首日题型").listeners.change();
+  const previewButton = findElement(form, (element) => element.tagName === "BUTTON" && element.textContent === "预览并保存");
+  previewButton.listeners.click();
+  assert.equal(preview.rotation_start_index, 0);
+  assert.deepEqual(Array.from(preview.rotation_subjects), ["civil_law", "economic_law"]);
+  assert.equal(preview.question_type_rotation_start_index, 0);
+  assert.deepEqual(Array.from(preview.rotation_question_types), ["single_choice", "multiple_choice"]);
+
+  directionMode.value = "random";
+  directionMode.listeners.change();
+  previewButton.listeners.click();
+  assert.equal(preview.fixed_subject, null);
+  assert.deepEqual(Array.from(preview.rotation_subjects), []);
+  assert.equal(preview.rotation_start_date, null);
+});
+
+test("daily plan confirmation renders canonical values with Chinese labels", async () => {
+  const { bridge, elements, page } = await loadPage();
+  bridge.apiGet = async (endpoint) => {
+    assert.equal(endpoint, "plans");
+    return {
+      global: {
+        daily_case: { plan: { enabled: false, selection_mode: "random", time: "08:00" } },
+        daily_question: { plan: { enabled: false, selection_mode: "random", time: "08:00" } },
+      },
+      targets: [],
+    };
+  };
+  bridge.apiPost = async (endpoint) => {
+    assert.equal(endpoint, "plans/prepare");
+    return {
+      token: "plan-token",
+      plans: [{
+        content_type: "daily_question",
+        plan: {
+          enabled: true,
+          time: "08:00",
+          content_type: "daily_question",
+          selection_mode: "rotation",
+          rotation_subjects: ["civil_law", "economic_law"],
+          question_origin: "mock",
+          question_type_selection_mode: "fixed",
+          fixed_question_type: "multiple_choice",
+          question_reveal_mode: "delayed",
+        },
+        preview: [{ date: "2026-09-29", subject: "civil_law", question_type: "multiple_choice", origin: "mock" }],
+      }],
+    };
+  };
+  page.state.route = "plans";
+  page.state.renderGeneration = 1;
+  await page.renderPlans();
+  const previewButtons = findElements(
+    elements.get("view-plans"),
+    (element) => element.tagName === "BUTTON" && element.textContent === "预览并保存",
+  );
+  await previewButtons[1].listeners.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const rendered = textOf(elements.get("view-plans"));
+  assert.match(rendered, /每日一题/);
+  assert.match(rendered, /方向轮换/);
+  assert.match(rendered, /模拟题/);
+  assert.match(rendered, /固定题型/);
+  assert.match(rendered, /定时揭晓/);
+  assert.doesNotMatch(rendered, /\brotation\b|\bmock\b|\bdelayed\b|civil_law|multiple_choice/);
 });
 
 test("structured import preview renders candidate identity and review counts", async () => {
@@ -414,4 +776,36 @@ test("structured import preview renders candidate identity and review counts", a
   assert.match(text, /知识产权简答题/);
   assert.match(text, /合同纠纷案例/);
   assert.match(text, /review 1/);
+});
+
+test("structured import preview exposes structured case evidence and pending identity", async () => {
+  const { elements, page } = await loadPage();
+  page.renderStructuredImportPreview(elements.get("view-library"), {
+    token: "synthetic-token",
+    preview: {
+      counts: { questions: 0, cases: 1, materials: 0, processable: 1 },
+      questions: [],
+      cases: [{
+        id: "case-fixture-1",
+        title: "合成案例标题",
+        authority: "合成声明机关",
+        case_number: "合成案号",
+        subjects: ["civil_commercial"],
+        basic_facts: ["合成案情事实"],
+        issues: ["合成争议焦点"],
+        holding: ["合成裁判要旨"],
+        result: ["合成处理结果"],
+        learning_points: ["合成学习要点"],
+        locators: ["第1页"],
+        review_status: "pending_review",
+        identity_granted: false,
+      }],
+    },
+  });
+  const rendered = textOf(elements.get("view-library"));
+  for (const evidence of [
+    "合成案例标题", "合成声明机关", "合成案号", "合成案情事实",
+    "合成争议焦点", "合成裁判要旨", "合成处理结果", "合成学习要点",
+    "pending_review",
+  ]) assert.match(rendered, new RegExp(evidence));
 });

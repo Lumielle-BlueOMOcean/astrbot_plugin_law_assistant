@@ -44,6 +44,9 @@ class DailyPlan:
     rotation_question_types: tuple[str, ...] = field(default_factory=tuple)
     question_type_rotation_start_date: str | None = None
     question_type_rotation_start_index: int = 0
+    question_reveal_mode: str = "manual"
+    answer_reveal_delay_minutes: int = 0
+    explanation_reveal_delay_minutes: int = 0
 
     def __post_init__(self) -> None:
         if self.content_type not in {"daily_case", "daily_question"}:
@@ -165,6 +168,27 @@ class DailyPlan:
             ) from exc
         if type_start_index < 0:
             raise ValueError("question_type_rotation_start_index 必须是非负整数")
+        reveal_mode = "manual"
+        reveal_delays = {
+            "answer_reveal_delay_minutes": 0,
+            "explanation_reveal_delay_minutes": 0,
+        }
+        if content_type == "daily_question":
+            reveal_mode = str(values.get("question_reveal_mode", "manual") or "manual")
+            reveal_mode = {
+                "manual_only": "manual",
+                "scheduled": "delayed",
+            }.get(reveal_mode, reveal_mode)
+            if reveal_mode not in {"manual", "delayed"}:
+                raise ValueError("question_reveal_mode 必须是 manual 或 delayed")
+            for field_name in reveal_delays:
+                try:
+                    delay = int(values.get(field_name, 0) or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{field_name} 必须是非负分钟数") from exc
+                if delay < 0 or delay > 10080:
+                    raise ValueError(f"{field_name} 必须在 0 到 10080 分钟之间")
+                reveal_delays[field_name] = delay
         return cls(
             content_type=content_type,
             enabled=bool(values.get("enabled", False)),
@@ -181,6 +205,11 @@ class DailyPlan:
             rotation_question_types=tuple(question_types),
             question_type_rotation_start_date=type_start_date,
             question_type_rotation_start_index=type_start_index,
+            question_reveal_mode=reveal_mode,
+            answer_reveal_delay_minutes=reveal_delays["answer_reveal_delay_minutes"],
+            explanation_reveal_delay_minutes=reveal_delays[
+                "explanation_reveal_delay_minutes"
+            ],
         )
 
     def subject_for(self, current_date: date) -> str | None:
@@ -225,7 +254,7 @@ class DailyPlan:
         ]
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        mapping = {
             "content_type": self.content_type,
             "enabled": self.enabled,
             "time": self.time,
@@ -242,6 +271,17 @@ class DailyPlan:
             "question_type_rotation_start_date": self.question_type_rotation_start_date,
             "question_type_rotation_start_index": self.question_type_rotation_start_index,
         }
+        if self.content_type == "daily_question":
+            mapping.update(
+                {
+                    "question_reveal_mode": self.question_reveal_mode,
+                    "answer_reveal_delay_minutes": self.answer_reveal_delay_minutes,
+                    "explanation_reveal_delay_minutes": (
+                        self.explanation_reveal_delay_minutes
+                    ),
+                }
+            )
+        return mapping
 
 
 __all__ = ["SCHOOL_ROTATION_SUBJECTS", "DailyPlan"]

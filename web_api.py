@@ -35,11 +35,96 @@ class LawAssistantWebApi:
         ] = (
             ("overview", self.overview, ["GET"], "Law Assistant dashboard overview"),
             ("radar/events", self.radar_events, ["GET"], "List radar events"),
+            ("cases", self.cases, ["GET"], "List official cases"),
             ("radar/event", self.radar_event, ["GET"], "Get one radar event"),
+            (
+                "radar/status-prepare",
+                self.prepare_radar_status,
+                ["POST"],
+                "Preview radar status override",
+            ),
+            (
+                "radar/status-confirm",
+                self.confirm_radar_status,
+                ["POST"],
+                "Confirm radar status override",
+            ),
+            (
+                "radar/date-review-prepare",
+                self.prepare_radar_date_review,
+                ["POST"],
+                "Preview event date review",
+            ),
+            (
+                "radar/date-review-confirm",
+                self.confirm_radar_date_review,
+                ["POST"],
+                "Confirm event date review",
+            ),
+            (
+                "radar/date-reviews",
+                self.radar_date_reviews,
+                ["GET"],
+                "List event date reviews",
+            ),
             ("radar/scan", self.radar_scan, ["POST"], "Scan registered sources"),
             ("library/search", self.library_search, ["GET"], "Search learning library"),
             ("library/item", self.library_item, ["GET"], "Get learning item"),
+            (
+                "library/manage-item",
+                self.library_manage_item,
+                ["GET"],
+                "Get operator learning item",
+            ),
+            (
+                "management/library-search",
+                self.management_library_search,
+                ["GET"],
+                "Search operator learning items including inactive records",
+            ),
+            (
+                "management/library-update",
+                self.management_library_update,
+                ["POST"],
+                "Update operator learning item",
+            ),
             ("library/update", self.library_update, ["POST"], "Update learning item"),
+            (
+                "management/batch-prepare",
+                self.prepare_library_batch,
+                ["POST"],
+                "Preview library batch operation",
+            ),
+            (
+                "management/batch-confirm",
+                self.confirm_library_batch,
+                ["POST"],
+                "Confirm library batch operation",
+            ),
+            (
+                "management/moderation-batch-prepare",
+                self.prepare_moderation_batch,
+                ["POST"],
+                "Preview exact Review or Radar status batch",
+            ),
+            (
+                "management/moderation-batch-confirm",
+                self.confirm_moderation_batch,
+                ["POST"],
+                "Confirm exact Review or Radar status batch",
+            ),
+            (
+                "management/clear-prepare",
+                self.prepare_data_clear,
+                ["POST"],
+                "Preview fixed-scope data clear",
+            ),
+            (
+                "management/clear-confirm",
+                self.confirm_data_clear,
+                ["POST"],
+                "Confirm fixed-scope data clear",
+            ),
             ("files/stage", self.stage_file, ["POST"], "Stage learning file"),
             (
                 "structured/stage-json",
@@ -112,6 +197,12 @@ class LawAssistantWebApi:
             ),
             ("history/reminders", self.history_reminders, ["GET"], "List reminders"),
             ("history/sources", self.history_sources, ["GET"], "List source runs"),
+            (
+                "history/reveals",
+                self.history_reveals,
+                ["GET"],
+                "List scheduled reveals",
+            ),
         )
         for route, handler, methods, description in routes:
             context.register_web_api(
@@ -138,14 +229,31 @@ class LawAssistantWebApi:
         return _ok(await self.service.dashboard_overview())
 
     async def radar_events(self) -> Any:
-        return _ok(
-            await self.service.dashboard_radar_events(
-                limit=_limit(request.args.get("limit")),
+        try:
+            result = await self.service.dashboard_radar_events_page(
+                page=_int_arg(request.args.get("page", "1"), "page"),
+                page_size=_int_arg(request.args.get("page_size", "20"), "page_size"),
                 radar_status=request.args.get("status", "current"),
                 event_type=request.args.get("event_type") or None,
                 keyword=request.args.get("keyword") or None,
             )
-        )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
+        return _ok(result)
+
+    async def cases(self) -> Any:
+        try:
+            return _ok(
+                await self.service.dashboard_page(
+                    "cases",
+                    page=_int_arg(request.args.get("page", "1"), "page"),
+                    page_size=_int_arg(
+                        request.args.get("page_size", "20"), "page_size"
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
 
     async def radar_event(self) -> Any:
         event_id = _int_arg(request.args.get("id"), "id")
@@ -153,6 +261,51 @@ class LawAssistantWebApi:
         if event is None:
             return _error("not_found", "未找到该活动", 404)
         return _ok(_event_json(event))
+
+    async def prepare_radar_status(self) -> Any:
+        body = await _json_body()
+        result = await self.service.prepare_event_status_override(
+            _int_arg(body.get("event_id"), "event_id"),
+            _bounded_text(body.get("status", ""), 40),
+            _bounded_text(body.get("reason", ""), 500),
+            actor_id="webui",
+        )
+        return _ready_payload(result)
+
+    async def confirm_radar_status(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_event_status_override(
+                body.get("token", ""), actor_id="webui"
+            )
+        )
+
+    async def prepare_radar_date_review(self) -> Any:
+        body = await _json_body()
+        result = await self.service.prepare_event_date_review(
+            _int_arg(body.get("event_id"), "event_id"),
+            _int_arg(body.get("event_date_id"), "event_date_id"),
+            _bounded_text(body.get("proposed_datetime", ""), 80),
+            _bounded_text(body.get("reason", ""), 500),
+            actor_id="webui",
+            decision=_bounded_text(body.get("decision", "accepted"), 20),
+        )
+        return _ready_payload(result)
+
+    async def confirm_radar_date_review(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_event_date_review(
+                body.get("token", ""), actor_id="webui"
+            )
+        )
+
+    async def radar_date_reviews(self) -> Any:
+        return _service_payload(
+            await self.service.list_event_date_reviews(
+                actor_id="webui", limit=_limit(request.args.get("limit"))
+            )
+        )
 
     async def radar_scan(self) -> Any:
         result = await self.service.scan_events(trigger="webui")
@@ -179,6 +332,12 @@ class LawAssistantWebApi:
                 material_type=request.args.get("type", ""),
                 subject=request.args.get("subject", ""),
                 limit=_limit(request.args.get("limit")),
+                page=(
+                    _int_arg(request.args.get("page"), "page")
+                    if request.args.get("page") is not None
+                    else None
+                ),
+                page_size=_int_arg(request.args.get("page_size", "20"), "page_size"),
             )
         )
 
@@ -186,12 +345,122 @@ class LawAssistantWebApi:
         item_id = _int_arg(request.args.get("id"), "id")
         return _service_payload(await self.service.get_learning_item(item_id))
 
+    async def library_manage_item(self) -> Any:
+        item_id = _int_arg(request.args.get("id"), "id")
+        return _service_payload(
+            await self.service.get_management_learning_item(item_id, actor_id="webui")
+        )
+
+    async def management_library_search(self) -> Any:
+        try:
+            result = await self.service.search_management_learning_library(
+                actor_id="webui",
+                query=_bounded_text(request.args.get("query", ""), 200),
+                material_type=request.args.get("type", ""),
+                subject=request.args.get("subject", ""),
+                include_inactive=str(request.args.get("include_inactive", "")).lower()
+                in {"1", "true", "yes"},
+                page=_int_arg(request.args.get("page", "1"), "page"),
+                page_size=_int_arg(request.args.get("page_size", "20"), "page_size"),
+            )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
+        return _service_payload(result)
+
+    async def prepare_library_batch(self) -> Any:
+        body = await _json_body()
+        try:
+            ids = body.get("item_ids", [])
+            if not isinstance(ids, list):
+                raise TypeError("item_ids 必须是数组")
+            result = await self.service.prepare_library_batch(
+                _bounded_text(body.get("action", ""), 30),
+                ids,
+                actor_id="webui",
+                changes=body.get("changes", {}),
+            )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
+        if not result.get("ready"):
+            return _error(
+                result.get("error", "invalid_batch"),
+                result.get("reason", "批量操作准备失败"),
+            )
+        return _ok(result)
+
+    async def confirm_library_batch(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_library_batch(
+                body.get("token", ""), actor_id="webui"
+            )
+        )
+
+    async def prepare_moderation_batch(self) -> Any:
+        body = await _json_body()
+        try:
+            ids = body.get("item_ids", [])
+            changes = body.get("changes", {})
+            if not isinstance(ids, list):
+                raise TypeError("item_ids 必须是数组")
+            if not isinstance(changes, dict):
+                raise TypeError("changes 必须是 JSON 对象")
+            result = await self.service.prepare_moderation_batch(
+                _bounded_text(body.get("domain", ""), 20),
+                ids,
+                changes,
+                actor_id="webui",
+            )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
+        if not result.get("ready"):
+            return _error(
+                result.get("error", "invalid_batch"),
+                result.get("reason", "批量预览失败"),
+            )
+        return _ok(result)
+
+    async def confirm_moderation_batch(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_moderation_batch(
+                body.get("token", ""), actor_id="webui"
+            )
+        )
+
+    async def prepare_data_clear(self) -> Any:
+        body = await _json_body()
+        result = await self.service.prepare_data_clear(
+            _bounded_text(body.get("scope", ""), 40), actor_id="webui"
+        )
+        return _ready_payload(result)
+
+    async def confirm_data_clear(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.confirm_data_clear(
+                body.get("token", ""),
+                actor_id="webui",
+                typed_confirmation=body.get("typed_confirmation"),
+            )
+        )
+
     async def library_update(self) -> Any:
         body = await _json_body()
         return _service_payload(
             await self.service.update_learning_item(
                 _int_arg(body.get("item_id"), "item_id"),
                 body.get("changes", {}),
+            )
+        )
+
+    async def management_library_update(self) -> Any:
+        body = await _json_body()
+        return _service_payload(
+            await self.service.update_management_learning_item(
+                _int_arg(body.get("item_id"), "item_id"),
+                body.get("changes", {}),
+                actor_id="webui",
             )
         )
 
@@ -271,6 +540,12 @@ class LawAssistantWebApi:
                 ),
                 status=request.args.get("status", "pending"),
                 limit=_limit(request.args.get("limit")),
+                page=(
+                    _int_arg(request.args.get("page"), "page")
+                    if request.args.get("page") is not None
+                    else None
+                ),
+                page_size=_int_arg(request.args.get("page_size", "20"), "page_size"),
             )
         )
 
@@ -347,7 +622,18 @@ class LawAssistantWebApi:
         )
 
     async def targets(self) -> Any:
-        return _ok(await self.service.list_targets())
+        try:
+            return _ok(
+                await self.service.dashboard_page(
+                    "targets",
+                    page=_int_arg(request.args.get("page", "1"), "page"),
+                    page_size=_int_arg(
+                        request.args.get("page_size", "20"), "page_size"
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            return _error("invalid_parameter", str(exc))
 
     async def rename_target(self) -> Any:
         body = await _json_body()
@@ -388,9 +674,25 @@ class LawAssistantWebApi:
     async def history_sources(self) -> Any:
         return await _history("sources", self.service, request.args.get("limit"))
 
+    async def history_reveals(self) -> Any:
+        return await _history("reveals", self.service, request.args.get("limit"))
+
 
 async def _history(kind: str, service: Any, raw_limit: str | None) -> Any:
     try:
+        if (
+            request.args.get("page") is not None
+            or request.args.get("page_size") is not None
+        ):
+            return _ok(
+                await service.dashboard_page(
+                    kind,
+                    page=_int_arg(request.args.get("page", "1"), "page"),
+                    page_size=_int_arg(
+                        request.args.get("page_size", "20"), "page_size"
+                    ),
+                )
+            )
         return _ok(await service.dashboard_history(kind, limit=_limit(raw_limit)))
     except (TypeError, ValueError) as exc:
         return _error("invalid_parameter", str(exc))
@@ -478,6 +780,7 @@ def _event_json(event: Any) -> dict[str, Any]:
     if isinstance(data, dict):
         metadata = data.get("metadata") or {}
         data["radar_status"] = metadata.get("radar_status")
+        data["status_override"] = metadata.get("status_override")
         data.pop("metadata", None)
     return data
 

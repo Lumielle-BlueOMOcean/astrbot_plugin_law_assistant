@@ -94,6 +94,14 @@ class QuestionSessionRepository:
             else None
         )
 
+    def get_latest_for_scope(self, scope_origin: str) -> dict[str, Any] | None:
+        """Return the most recent session identity for scoped manual no-repeat."""
+        row = self.connection.execute(
+            "SELECT * FROM question_sessions WHERE scope_origin = ? ORDER BY id DESC LIMIT 1",
+            (str(scope_origin),),
+        ).fetchone()
+        return self._session_dict(row) if row else None
+
     def list_active(self, *, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT * FROM question_sessions WHERE status = 'open' ORDER BY created_at DESC LIMIT ?",
@@ -165,6 +173,45 @@ class QuestionSessionRepository:
                 (kind, kind, at, int(session_id)),
             )
         return self.get(session_id)
+
+    def record_reveal_event(
+        self,
+        session_id: int,
+        kind: str,
+        *,
+        actor_id: str,
+        at: str,
+        prompt_index: int = 0,
+    ) -> bool:
+        """Record delivery without changing the user's interactive cursor."""
+        if kind not in {"answer", "explanation"}:
+            raise ValueError("kind must be answer or explanation")
+        with self.connection:
+            exists = self.connection.execute(
+                "SELECT 1 FROM question_sessions WHERE id = ?",
+                (int(session_id),),
+            ).fetchone()
+            if exists is None:
+                return False
+            event_rows = self.connection.execute(
+                "SELECT metadata_json FROM question_session_events "
+                "WHERE session_id = ? AND event_kind = ?",
+                (int(session_id), f"{kind}_revealed"),
+            ).fetchall()
+            if any(
+                int(json.loads(row["metadata_json"] or "{}").get("prompt_index", 0))
+                == int(prompt_index)
+                for row in event_rows
+            ):
+                return True
+            self._event(
+                int(session_id),
+                f"{kind}_revealed",
+                str(actor_id),
+                str(at),
+                {"prompt_index": int(prompt_index), "delivery": "scheduled"},
+            )
+        return True
 
     def advance(
         self,

@@ -183,6 +183,72 @@ async def test_question_search_detail_and_update_do_not_expose_hidden_evidence(
 
 
 @pytest.mark.asyncio
+async def test_management_detail_and_soft_delete_preserve_truth_boundary(tmp_path):
+    storage, service = _service(tmp_path)
+    archived = await service.archive_learning_material(
+        raw_text="管理界限合成题原文",
+        material_type="mock_question",
+        title="管理前标题",
+        subjects="刑法",
+        source_url="https://example.test/synthetic-question",
+        structured_json={
+            "question_type": "single_choice",
+            "stem": "合成题干？",
+            "options": ["A. 甲", "B. 乙"],
+            "answer": "A",
+            "explanation": "合成解析。",
+        },
+        created_by="42",
+        session_origin="private:42",
+    )
+    public = await service.get_learning_item(archived["item_id"])
+    assert "answer" not in public["question"]
+
+    management_get = getattr(service, "get_management_item", None)
+    management_update = getattr(service, "update_management_item", None)
+    delete_items = getattr(service.repository, "soft_delete_items", None)
+    restore_items = getattr(service.repository, "restore_items", None)
+    assert callable(management_get), "operator detail must be separate from safe detail"
+    assert callable(management_update), (
+        "operator edit must use a controlled field allowlist"
+    )
+    assert callable(delete_items) and callable(restore_items)
+    if not all(
+        map(callable, (management_get, management_update, delete_items, restore_items))
+    ):
+        return
+
+    detailed = await management_get(archived["item_id"])
+    assert detailed["question"]["answer"] == "A"
+    changed = await management_update(
+        archived["item_id"],
+        {"title": "管理后标题", "question_type": "single_choice", "answer": "B"},
+    )
+    assert changed["success"] is True
+    assert changed["question"]["answer"] == "B"
+    assert (
+        "answer"
+        not in (await service.get_learning_item(archived["item_id"]))["question"]
+    )
+
+    assert delete_items(
+        [archived["item_id"]], actor_id="operator-1", at="2026-09-29T00:00:00+00:00"
+    ) == [archived["item_id"]]
+    assert (await service.search_learning_library(query="合成题干"))["items"] == []
+    assert (await service.get_learning_item_for_session(archived["item_id"]))[
+        "success"
+    ] is False
+    assert restore_items(
+        [archived["item_id"]], actor_id="operator-1", at="2026-09-30T00:00:00+00:00"
+    ) == [archived["item_id"]]
+    restored = await service.get_management_item(archived["item_id"])
+    assert restored["item"]["active"] is True
+    assert restored["question"]["answer"] == "B"
+    assert restored["sources"][0]["raw_text"] == "管理界限合成题原文"
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_structured_question_blocks_are_excluded_from_safe_reads_and_search(
     tmp_path,
 ):
