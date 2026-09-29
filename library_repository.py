@@ -28,9 +28,9 @@ else:
         QuestionDetail,
     )
 try:
-    from .content import subject_filter
+    from .content import RealQuestion, real_question_identity_key, subject_filter
 except ImportError:
-    from content import subject_filter
+    from content import RealQuestion, real_question_identity_key, subject_filter
 
 
 def _json(value: Any) -> str:
@@ -430,46 +430,50 @@ class LibraryRepository:
                     structured_payload_sha256,
                 ),
             ).fetchone()
-            if existing is not None:
-                return {
-                    "duplicate": True,
-                    "import_id": int(existing["id"]),
-                    "original_source_id": int(existing["original_source_id"]),
-                    "structured_source_id": int(existing["structured_source_id"]),
-                    "archived": 0,
-                    "failed": 0,
-                    "needs_review": 0,
-                    "items": [],
-                }
-
-            cursor = self.connection.execute(
-                """
-                INSERT INTO structured_imports(
-                    original_source_id, structured_source_id, schema_version,
-                    original_file_sha256, structured_json_sha256,
-                    structured_payload_sha256, preparation_method, payload_json,
-                    created_by, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    original_source_id,
-                    structured_source_id,
-                    schema_version,
-                    original_file_sha256,
-                    structured_json_sha256,
-                    structured_payload_sha256,
-                    preparation_method,
-                    payload_json,
-                    created_by,
-                    created_at.isoformat(),
-                ),
-            )
-            import_id = int(cursor.lastrowid)
+            duplicate_import = existing is not None
+            if existing is None:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO structured_imports(
+                        original_source_id, structured_source_id, schema_version,
+                        original_file_sha256, structured_json_sha256,
+                        structured_payload_sha256, preparation_method, payload_json,
+                        created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        original_source_id,
+                        structured_source_id,
+                        schema_version,
+                        original_file_sha256,
+                        structured_json_sha256,
+                        structured_payload_sha256,
+                        preparation_method,
+                        payload_json,
+                        created_by,
+                        created_at.isoformat(),
+                    ),
+                )
+                import_id = int(cursor.lastrowid)
+            else:
+                import_id = int(existing["id"])
+                original_source_id = int(existing["original_source_id"])
+                structured_source_id = int(existing["structured_source_id"])
             material_ids: dict[str, int] = {}
             material_count = 0
+            existing_materials = {
+                str(row["external_id"]): int(row["id"])
+                for row in self.connection.execute(
+                    "SELECT id, external_id FROM structured_materials WHERE import_id=?",
+                    (import_id,),
+                ).fetchall()
+            }
             for material in materials:
                 external_id = str(material.get("id") or "").strip()
                 if not external_id:
+                    continue
+                if external_id in existing_materials:
+                    material_ids[external_id] = existing_materials[external_id]
                     continue
                 material_cursor = self.connection.execute(
                     """
@@ -506,6 +510,26 @@ class LibraryRepository:
             for record in item_records:
                 payload = dict(record["payload"])
                 item = record["item"]
+                external_id = str(payload.get("id") or "")
+                existing_binding = self.connection.execute(
+                    "SELECT item_id FROM structured_item_bindings "
+                    "WHERE import_id=? AND external_id=?",
+                    (import_id, external_id),
+                ).fetchone()
+                if existing_binding is not None:
+                    duplicates += 1
+                    item_results.append(
+                        {
+                            "item_id": int(existing_binding["item_id"]),
+                            "external_id": payload.get("id"),
+                            "source_number": payload.get("source_number", ""),
+                            "status": "duplicate",
+                            "review_status": record.get(
+                                "review_status", "pending_review"
+                            ),
+                        }
+                    )
+                    continue
                 archive_result = self._archive_inner(
                     original_source,
                     item,
@@ -686,7 +710,7 @@ class LibraryRepository:
                 )
 
             review_items: list[dict[str, Any]] = []
-            for review in review_records:
+            for review in [] if duplicate_import else review_records:
                 review_id = self.record_review_item(
                     source_id=original_source_id,
                     candidate_key=str(review["candidate_key"]),
@@ -701,7 +725,7 @@ class LibraryRepository:
                 review_items.append({"id": review_id, **review})
 
         return {
-            "duplicate": False,
+            "duplicate": duplicate_import,
             "import_id": import_id,
             "original_source_id": original_source_id,
             "structured_source_id": structured_source_id,
@@ -1495,6 +1519,13 @@ class LibraryRepository:
             bundle = self.get(int(item_id))
             if bundle is None:
                 return None
+            linked_real_question_id = (
+                (bundle.structured or {}).get("verified_real_question_id")
+                if bundle.question is not None
+                else None
+            )
+            if linked_real_question_id is not None:
+                self._update_linked_real_question(int(linked_real_question_id), changes)
             updates: list[str] = []
             values: list[Any] = []
             if "title" in changes:
@@ -1581,6 +1612,102 @@ class LibraryRepository:
                     )
         return self.get(int(item_id))
 
+    def _update_linked_real_question(
+        self, real_question_id: int, changes: dict[str, Any]
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT * FROM real_questions WHERE id = ?", (real_question_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("关联的核验真题不存在；请先重新核验候选资料")
+        mapping = {
+            "source_name": row["source_name"],
+            "exam_name": row["exam_name"],
+            "exam_year": row["exam_year"],
+            "exam_date": row["exam_date"],
+            "paper": row["paper"],
+            "question_number": row["question_number"],
+            "source_url": row["source_url"],
+            "source_locator": row["source_locator"],
+            "subject": row["subject"],
+            "question_type": row["question_type"],
+            "stem": row["stem"],
+            "options": json.loads(row["options_json"]),
+            "answer": json.loads(row["answer_json"])
+            if row["answer_json"] is not None
+            else None,
+            "explanation": row["explanation"],
+            "answer_source": row["answer_source"],
+            "verification_status": row["verification_status"],
+            "metadata": json.loads(row["metadata_json"]),
+        }
+        question_fields = {
+            "source_name",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+            "source_url",
+            "source_locator",
+            "question_type",
+            "stem",
+            "options",
+            "answer",
+            "explanation",
+            "answer_source",
+        }
+        for key in question_fields & changes.keys():
+            mapping[key] = changes[key]
+        if "subjects" in changes:
+            subjects = list(changes["subjects"])
+            if len(subjects) != 1:
+                raise ValueError("已核验真题必须对应且仅对应一个规范方向")
+            mapping["subject"] = subjects[0]
+
+        normalized = RealQuestion.from_mapping(mapping)
+        identity_key = real_question_identity_key(normalized)
+        collision = self.connection.execute(
+            "SELECT id FROM real_questions WHERE identity_key = ? AND id <> ?",
+            (identity_key, real_question_id),
+        ).fetchone()
+        if collision is not None:
+            raise ValueError("修改后的题目身份与另一条核验真题冲突，未保存任何更改")
+
+        self.connection.execute(
+            """
+            UPDATE real_questions SET identity_key = ?, source_name = ?, exam_name = ?,
+                exam_year = ?, exam_date = ?, paper = ?, question_number = ?,
+                source_url = ?, source_locator = ?, subject = ?, question_type = ?,
+                stem = ?, options_json = ?, answer_json = ?, explanation = ?,
+                answer_source = ?, verification_status = ?, content_hash = ?,
+                metadata_json = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                identity_key,
+                normalized.source_name,
+                normalized.exam_name,
+                normalized.exam_year,
+                normalized.exam_date,
+                normalized.paper,
+                normalized.question_number,
+                normalized.source_url,
+                normalized.source_locator,
+                normalized.subject,
+                normalized.question_type,
+                normalized.stem,
+                _json(normalized.options),
+                _json(normalized.answer) if normalized.answer is not None else None,
+                normalized.explanation,
+                normalized.answer_source,
+                normalized.verification_status,
+                normalized.content_hash,
+                _json(normalized.metadata),
+                datetime.now().astimezone().isoformat(),
+                real_question_id,
+            ),
+        )
+
     def soft_delete_items(
         self, item_ids: list[int], *, actor_id: str, at: str
     ) -> list[int]:
@@ -1636,39 +1763,66 @@ class LibraryRepository:
         changes: dict[str, Any] | None = None,
     ) -> list[int]:
         """Apply one reviewed homogeneous mutation atomically after fingerprint checks."""
-        if action not in {"edit", "delete", "restore"}:
+        if action not in {"edit", "delete", "restore", "verify_case"}:
             raise ValueError("unsupported management batch action")
         ids = list(dict.fromkeys(int(value) for value in item_ids))
         if not ids or len(ids) > 100 or set(ids) != set(expected):
             raise ValueError("batch item set changed")
         normalized_changes = changes or {}
+        if action == "verify_case" and (
+            set(normalized_changes) != {"verification_status"}
+            or normalized_changes.get("verification_status")
+            not in {"unverified", "user_verified"}
+        ):
+            raise ValueError("unsupported user-case verification status")
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 for item_id in ids:
                     row = self.connection.execute(
-                        "SELECT item_hash, updated_at, active, identity, item_type, metadata_json "
+                        "SELECT item_hash, updated_at, active, identity, item_type, verification_status, metadata_json "
                         "FROM learning_items WHERE id = ?",
                         (item_id,),
                     ).fetchone()
                     fingerprint = expected[item_id]
-                    if row is None or any(
-                        str(row[key] if row[key] is not None else "")
-                        != str(
-                            fingerprint.get(key, "")
-                            if fingerprint.get(key) is not None
-                            else ""
+                    if (
+                        row is None
+                        or any(
+                            str(row[key] if row[key] is not None else "")
+                            != str(
+                                fingerprint.get(key, "")
+                                if fingerprint.get(key) is not None
+                                else ""
+                            )
+                            for key in (
+                                "item_hash",
+                                "updated_at",
+                                "active",
+                                "identity",
+                                "item_type",
+                            )
                         )
-                        for key in (
-                            "item_hash",
-                            "updated_at",
-                            "active",
-                            "identity",
-                            "item_type",
+                        or (
+                            "verification_status" in fingerprint
+                            and str(row["verification_status"] or "")
+                            != str(fingerprint["verification_status"] or "")
                         )
                     ):
                         raise ValueError(f"资料 {item_id} 在预览后发生变化")
-                    if action == "delete":
+                    if action == "verify_case":
+                        if row["item_type"] != "case" or row["identity"] != "user_case":
+                            raise ValueError("批量核验只支持 user_case")
+                        if not int(row["active"]):
+                            raise ValueError("停用的用户案例不能核验")
+                        self.connection.execute(
+                            "UPDATE learning_items SET verification_status=?, updated_at=? WHERE id=?",
+                            (
+                                str(normalized_changes["verification_status"]),
+                                str(at),
+                                item_id,
+                            ),
+                        )
+                    elif action == "delete":
                         if not int(row["active"]):
                             raise ValueError(f"资料 {item_id} 已停用")
                         self.connection.execute(
@@ -1775,7 +1929,20 @@ class LibraryRepository:
                         f"library_batch_{action}",
                         "learning_item",
                         _json(ids),
-                        _json({"count": len(ids)}),
+                        _json(
+                            {
+                                "count": len(ids),
+                                **(
+                                    {
+                                        "verification_status": normalized_changes[
+                                            "verification_status"
+                                        ]
+                                    }
+                                    if action == "verify_case"
+                                    else {}
+                                ),
+                            }
+                        ),
                         str(at),
                     ),
                 )

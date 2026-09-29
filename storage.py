@@ -1737,11 +1737,12 @@ class SQLiteStorage:
             if decision == "accepted":
                 value = DateTime.fromisoformat(str(proposed_value["datetime"]))
                 self._connection.execute(
-                    "UPDATE event_dates SET datetime = ?, timezone = ? "
+                    "UPDATE event_dates SET datetime = ?, timezone = ?, confirmed = ? "
                     "WHERE id = ? AND event_id = ?",
                     (
                         value.isoformat(),
                         str(proposed_value["timezone"]),
+                        int(bool(proposed_value.get("confirmed", False))),
                         int(event_date_id),
                         int(event_id),
                     ),
@@ -1754,7 +1755,16 @@ class SQLiteStorage:
                     "event_date_reviewed",
                     "event_date",
                     json.dumps([int(event_id), int(event_date_id)]),
-                    json.dumps({"decision": decision, "reason": str(reason).strip()}),
+                    json.dumps(
+                        {
+                            "decision": decision,
+                            "reason": str(reason).strip(),
+                            "confirmed": bool(proposed_value.get("confirmed", False)),
+                            "evidence_hash": str(evidence_hash),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     at,
                 ),
             )
@@ -2044,9 +2054,6 @@ class SQLiteStorage:
             "event_relations",
             "event_status_overrides",
             "event_date_reviews",
-            "source_documents",
-            "source_runs",
-            "law_updates",
             "publications",
             "reminders",
             "canonical_publications",
@@ -2071,7 +2078,6 @@ class SQLiteStorage:
             "publications",
             "reminders",
             "daily_contents",
-            "source_runs",
         ),
         "question_sessions": (
             "scheduled_reveal_jobs",
@@ -2127,6 +2133,15 @@ class SQLiteStorage:
     def _clear_scope_specs(self, scope: str) -> list[tuple[str, str, tuple[Any, ...]]]:
         if scope not in {*self._CLEAR_TABLES, "cases"}:
             raise ValueError("不支持的数据清理范围")
+        if scope == "radar":
+            radar_source_keys = (
+                "source_key IN (SELECT source_key FROM source_runs "
+                "WHERE source_type='event' UNION SELECT source_key FROM events)"
+            )
+            return [(table, "1=1", ()) for table in self._CLEAR_TABLES[scope]] + [
+                ("source_documents", radar_source_keys, ()),
+                ("source_runs", "source_type='event'", ()),
+            ]
         if scope == "cases":
             cases = "SELECT id FROM learning_items WHERE item_type='case' AND identity IN ('official_case','user_case')"
             bindings = (
@@ -2193,18 +2208,23 @@ class SQLiteStorage:
             "all_runtime": "全部插件运行数据",
         }
         delete_descriptions = {
-            "radar": "活动、时间节点、来源抓取记录、法规更新及关联发布/提醒记录",
+            "radar": "活动、时间节点、活动来源抓取记录及关联发布/提醒记录",
             "library": "学习条目、结构化内容块、来源关联、待复核记录及导入记录",
             "verified_questions": "已核验真题库存记录",
             "cases": "用户/官方案例学习条目、案例结构和旧版案例记录",
-            "delivery_history": "定时揭晓、发布、提醒、每日执行及来源抓取运行记录",
+            "delivery_history": "定时揭晓、发布、提醒与每日执行记录",
             "question_sessions": "答题会话、揭晓作业与会话事件",
             "daily_plans": "每日计划及尚未执行的答案/解析揭晓作业",
             "targets": "群绑定及依赖目标的计划、发布和提醒记录；会话诊断保留并解除目标关联",
             "all_runtime": "所有插件运行期业务数据与操作审计；保留数据库结构和宿主配置",
         }
         retained_by_scope = {
-            "radar": ["学习资料/真题/案例库", "群绑定与每日计划", "答题会话"],
+            "radar": [
+                "学习资料/真题/案例库和法规更新",
+                "案例与法规来源抓取状态",
+                "群绑定与每日计划",
+                "答题会话",
+            ],
             "library": ["活动雷达与法规更新", "核验真题库存", "群绑定、计划和历史记录"],
             "verified_questions": [
                 "学习资料候选、活动雷达、案例库",
@@ -2215,6 +2235,7 @@ class SQLiteStorage:
                 "活动与学习资料内容",
                 "群绑定与每日计划配置",
                 "核验真题和案例库",
+                "活动、案例与法规来源抓取状态",
             ],
             "question_sessions": [
                 "题库/资料库、活动与案例数据",
@@ -2296,11 +2317,42 @@ class SQLiteStorage:
             current = self._clear_row_snapshot(scope)
             if current != expected_snapshot:
                 raise ValueError("数据范围在预览后发生变化，请重新预览")
+            if scope == "cases":
+                self._invalidate_cleared_case_sources(expected_snapshot)
             if scope == "targets":
                 self._connection.execute("UPDATE question_sessions SET target_id=NULL")
                 self._connection.execute(
                     "UPDATE scheduled_reveal_jobs SET target_id=NULL"
                 )
+            if scope == "verified_questions":
+                question_ids = [
+                    int(key[0]) for key in expected_snapshot.get("real_questions", [])
+                ]
+                if question_ids:
+                    placeholders = ",".join("?" for _ in question_ids)
+                    linked_items = self._connection.execute(
+                        f"SELECT DISTINCT item_id FROM structured_item_bindings "
+                        f"WHERE verified_real_question_id IN ({placeholders})",
+                        question_ids,
+                    ).fetchall()
+                    item_ids = [int(row["item_id"]) for row in linked_items]
+                    if item_ids:
+                        item_placeholders = ",".join("?" for _ in item_ids)
+                        cleared_at = _serialize_datetime(DateTime.now(timezone.utc))
+                        self._connection.execute(
+                            f"UPDATE structured_item_bindings SET "
+                            f"verified_real_question_id=NULL, promoted_by=NULL, "
+                            f"promoted_at=NULL, review_status='pending_review' "
+                            f"WHERE item_id IN ({item_placeholders}) "
+                            f"AND verified_real_question_id IN ({placeholders})",
+                            [*item_ids, *question_ids],
+                        )
+                        self._connection.execute(
+                            f"UPDATE learning_items SET identity='real_question_candidate', "
+                            f"verification_status='unverified', updated_at=? "
+                            f"WHERE id IN ({item_placeholders})",
+                            [cleared_at, *item_ids],
+                        )
             remaining = set(expected_snapshot)
             ordered: list[str] = []
             while remaining:
@@ -2350,6 +2402,62 @@ class SQLiteStorage:
                 table: len(keys) for table, keys in expected_snapshot.items() if keys
             },
         }
+
+    def _invalidate_cleared_case_sources(
+        self, expected_snapshot: dict[str, list[tuple[Any, ...]]]
+    ) -> None:
+        """Allow cleared official cases to be rebuilt from unchanged source docs."""
+        item_ids = [int(key[0]) for key in expected_snapshot.get("learning_items", [])]
+        if not item_ids:
+            return
+        placeholders = ",".join("?" for _ in item_ids)
+        sources = self._connection.execute(
+            f"""
+            SELECT DISTINCT s.metadata_json
+            FROM library_sources AS s
+            JOIN learning_item_sources AS links ON links.source_id = s.id
+            WHERE links.item_id IN ({placeholders})
+              AND s.source_kind = 'official_article'
+            """,
+            item_ids,
+        ).fetchall()
+        source_keys: set[tuple[str, str]] = set()
+        for row in sources:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            source_key = str(metadata.get("adapter_key") or "").strip()
+            source_item_key = str(metadata.get("source_item_key") or "").strip()
+            if source_key and source_item_key:
+                source_keys.add((source_key, source_item_key))
+        for source_key, source_item_key in source_keys:
+            row = self._connection.execute(
+                "SELECT metadata_json FROM source_documents "
+                "WHERE source_key=? AND source_item_key=?",
+                (source_key, source_item_key),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not any(
+                key in metadata
+                for key in ("case_segmentation_version", "case_processing_status")
+            ):
+                continue
+            metadata["case_processing_status"] = "cleared"
+            self._connection.execute(
+                "UPDATE source_documents SET metadata_json=? "
+                "WHERE source_key=? AND source_item_key=?",
+                (
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    source_key,
+                    source_item_key,
+                ),
+            )
 
     def _target_by_umo(self, unified_msg_origin: str) -> dict[str, Any]:
         row = self._connection.execute(
@@ -2568,6 +2676,14 @@ class SQLiteStorage:
     ) -> list[RealQuestion]:
         requested_subjects = subject_filter(subject)
         clauses = ["verification_status IN ('verified', 'official', 'user_verified')"]
+        clauses.append(
+            "(NOT EXISTS (SELECT 1 FROM structured_item_bindings AS binding "
+            "WHERE binding.verified_real_question_id = real_questions.id) "
+            "OR EXISTS (SELECT 1 FROM structured_item_bindings AS binding "
+            "JOIN learning_items AS item ON item.id = binding.item_id "
+            "WHERE binding.verified_real_question_id = real_questions.id "
+            "AND item.active = 1))"
+        )
         params: list[Any] = []
         if requested_subjects is not None:
             placeholders = ", ".join("?" for _ in requested_subjects)
@@ -2596,6 +2712,175 @@ class SQLiteStorage:
             params,
         ).fetchall()
         return [_real_question_from_row(row) for row in rows]
+
+    def list_managed_real_questions(self) -> list[dict[str, Any]]:
+        """Return full verified-inventory records for an authorized management view."""
+        rows = self._connection.execute(
+            "SELECT * FROM real_questions ORDER BY id"
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._managed_real_question_dict(row)
+            result.append(record)
+        return result
+
+    def get_managed_real_question(self, question_id: int) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM real_questions WHERE id = ?", (int(question_id),)
+        ).fetchone()
+        return self._managed_real_question_dict(row) if row else None
+
+    def _managed_real_question_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        question = _real_question_from_row(row).to_mapping()
+        links = self._connection.execute(
+            "SELECT b.item_id, i.active FROM structured_item_bindings AS b "
+            "JOIN learning_items AS i ON i.id = b.item_id "
+            "WHERE b.verified_real_question_id = ? ORDER BY b.item_id",
+            (int(row["id"]),),
+        ).fetchall()
+        status_active = row["verification_status"] in {
+            "verified",
+            "official",
+            "user_verified",
+        }
+        has_active_projection = any(bool(link["active"]) for link in links)
+        question["linked_item_ids"] = [int(link["item_id"]) for link in links]
+        question["selectable"] = bool(
+            status_active and (not links or has_active_projection)
+        )
+        question["management_mode"] = "linked" if links else "independent"
+        return question
+
+    def update_independent_real_question(
+        self, question_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        allowed = {
+            "source_name",
+            "exam_name",
+            "exam_year",
+            "exam_date",
+            "paper",
+            "question_number",
+            "source_url",
+            "source_locator",
+            "subject",
+            "question_type",
+            "stem",
+            "options",
+            "answer",
+            "explanation",
+            "answer_source",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"不允许修改真题字段：{sorted(unknown)}")
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM real_questions WHERE id = ?", (int(question_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"未找到核验真题：{question_id}")
+            self._assert_independent_real_question(int(question_id))
+            if row["verification_status"] not in {
+                "verified",
+                "official",
+                "user_verified",
+            }:
+                raise ValueError("该真题已停用；请先恢复并重新核验")
+            mapping = _real_question_from_row(row).to_mapping()
+            mapping.update(changes)
+            normalized = RealQuestion.from_mapping(mapping)
+            identity_key = real_question_identity_key(normalized)
+            collision = self._connection.execute(
+                "SELECT id FROM real_questions WHERE identity_key = ? AND id <> ?",
+                (identity_key, int(question_id)),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError("修改后的题目身份与另一条核验真题冲突，未保存任何更改")
+            self._write_real_question_update(int(question_id), identity_key, normalized)
+        result = self.get_managed_real_question(int(question_id))
+        assert result is not None
+        return result
+
+    def set_independent_real_question_active(
+        self, question_id: int, *, active: bool
+    ) -> dict[str, Any]:
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM real_questions WHERE id = ?", (int(question_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"未找到核验真题：{question_id}")
+            self._assert_independent_real_question(int(question_id))
+            current = str(row["verification_status"])
+            if active:
+                if current in {"verified", "official", "user_verified"}:
+                    raise ValueError("该真题已处于可用状态")
+                mapping = _real_question_from_row(row).to_mapping()
+                mapping["verification_status"] = "user_verified"
+                normalized = RealQuestion.from_mapping(mapping)
+            else:
+                if current not in {"verified", "official", "user_verified"}:
+                    raise ValueError("该真题已经停用")
+                mapping = _real_question_from_row(row).to_mapping()
+                mapping["verification_status"] = "unverified"
+                normalized = RealQuestion(**mapping)
+            self._write_real_question_update(
+                int(question_id), str(row["identity_key"]), normalized
+            )
+        result = self.get_managed_real_question(int(question_id))
+        assert result is not None
+        return result
+
+    def _assert_independent_real_question(self, question_id: int) -> None:
+        linked = self._connection.execute(
+            "SELECT item_id FROM structured_item_bindings "
+            "WHERE verified_real_question_id = ? LIMIT 1",
+            (int(question_id),),
+        ).fetchone()
+        if linked is not None:
+            raise ValueError(
+                f"该真题关联学习资料 {int(linked['item_id'])}；请从资料库管理关联条目"
+            )
+
+    def _write_real_question_update(
+        self, question_id: int, identity_key: str, question: RealQuestion
+    ) -> None:
+        self._connection.execute(
+            """
+            UPDATE real_questions SET identity_key = ?, source_name = ?, exam_name = ?,
+                exam_year = ?, exam_date = ?, paper = ?, question_number = ?,
+                source_url = ?, source_locator = ?, subject = ?, question_type = ?,
+                stem = ?, options_json = ?, answer_json = ?, explanation = ?,
+                answer_source = ?, verification_status = ?, content_hash = ?,
+                metadata_json = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                identity_key,
+                question.source_name,
+                question.exam_name,
+                question.exam_year,
+                question.exam_date,
+                question.paper,
+                question.question_number,
+                question.source_url,
+                question.source_locator,
+                question.subject,
+                question.question_type,
+                question.stem,
+                json.dumps(question.options, ensure_ascii=False, sort_keys=True),
+                json.dumps(question.answer, ensure_ascii=False, sort_keys=True)
+                if question.answer is not None
+                else None,
+                question.explanation,
+                question.answer_source,
+                question.verification_status,
+                question.content_hash,
+                json.dumps(question.metadata, ensure_ascii=False, sort_keys=True),
+                _serialize_datetime(DateTime.now(timezone.utc)),
+                int(question_id),
+            ),
+        )
 
     def count_real_questions(
         self, *, subject: Any = None, question_type: str | None = None

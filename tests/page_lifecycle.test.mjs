@@ -313,6 +313,55 @@ test("saving a non-question detail continues to submit its edited note", async (
   assert.deepEqual(Object.keys(posts[0].body.changes).sort(), ["body", "note", "subjects", "title"]);
 });
 
+test("independent verified-question inventory supports edit and confirmed disable", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  let disabled = false;
+  const question = {
+    id: 17, source_name: "合成题库", exam_name: "合成考试", exam_year: "2098",
+    exam_date: "", paper: "合成卷", question_number: "第1题",
+    source_url: "", source_locator: "fixture:17", subject: "criminal_law",
+    question_type: "single_choice", stem: "初始题干？", options: ["A. 甲", "B. 乙"],
+    answer: "A", answer_source: "user_verified", explanation: "合成解析。",
+    verification_status: "user_verified", management_mode: "independent", linked_item_ids: [],
+  };
+  bridge.apiGet = async (endpoint) => {
+    if (endpoint === "management/real-questions") {
+      return { items: [{ ...question, selectable: !disabled }] };
+    }
+    if (endpoint === "management/real-question") {
+      return { question: { ...question, selectable: !disabled } };
+    }
+    if (endpoint === "overview") return { plugin: { version: "0.6.0" } };
+    throw new Error(`unexpected GET ${endpoint}`);
+  };
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    if (endpoint === "management/real-question-update") Object.assign(question, body.changes);
+    if (endpoint === "management/real-question-status") disabled = !body.active;
+    return { success: true, question: { ...question, selectable: !disabled } };
+  };
+  page.state.route = "library";
+  page.state.libraryTab = "real-questions";
+  page.state.renderGeneration = 1;
+  const view = elements.get("view-library");
+  await page.renderRealQuestions(view, 1, "library");
+  await findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "查看 / 管理").listeners.click();
+  labeledInput(view, "stem").value = "复核后的题干？";
+  const save = findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "保存并重新校验");
+  await save.listeners.click();
+  assert.equal(posts[0].endpoint, "management/real-question-update");
+  assert.equal(posts[0].body.changes.stem, "复核后的题干？");
+  assert.deepEqual(Array.from(posts[0].body.changes.options), ["A. 甲", "B. 乙"]);
+
+  await findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "查看 / 管理").listeners.click();
+  await findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "预览停用真题").listeners.click();
+  assert.match(textOf(view), /确认将该条目从真题检索库存停用/);
+  await findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "确认").listeners.click();
+  assert.equal(posts[1].endpoint, "management/real-question-status");
+  assert.equal(posts[1].body.active, false);
+});
+
 test("library detail expands inline, toggles, switches rows, and saves in place", async () => {
   const { bridge, elements, page } = await loadPage();
   const updates = [];
@@ -612,6 +661,7 @@ test("Radar batch selection locks exact IDs and sends the reviewed reason", asyn
   page.state.renderGeneration = 1;
   await page.renderRadar();
   const selects = findElements(elements.get("view-radar"), (element) => element.tagName === "SELECT");
+  assert.ok(selects[1].children.some((option) => /删除\/移除（可恢复）/.test(option.textContent)));
   selects[1].value = "historical";
   const reason = findElement(elements.get("view-radar"), (element) => element.tagName === "INPUT" && element.placeholder.includes("批量状态变更原因"));
   reason.value = "合成复核原因";
@@ -626,6 +676,67 @@ test("Radar batch selection locks exact IDs and sends the reviewed reason", asyn
   assert.equal(posts[0].body.changes.reason, "合成复核原因");
 });
 
+test("user-case verification is a bounded batch action and keeps the case identity", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const posts = [];
+  bridge.apiGet = async () => ({
+    items: [{ id: 22, item_type: "case", identity: "user_case", title: "合成用户案例", verification_status: "pending_review" }],
+    total: 1, page: 1, page_size: 20, page_count: 1,
+  });
+  bridge.apiPost = async (endpoint, body) => {
+    posts.push({ endpoint, body });
+    if (endpoint === "management/batch-prepare") {
+      return {
+        token: "case-verify-token", count: 1,
+        items: [{ id: 22, title: "合成用户案例", identity: "user_case", verification_before: "pending_review", verification_after: "user_verified" }],
+      };
+    }
+    return { count: 1, changed_ids: [22] };
+  };
+  page.state.route = "library";
+  page.state.renderGeneration = 1;
+  await page.renderMaterials(elements.get("view-library"));
+
+  const selectPage = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "选择本页");
+  await selectPage.listeners.click();
+  const status = labeledInput(elements.get("view-library"), "用户案例核验状态");
+  assert.ok(status);
+  assert.ok(status.children.some((option) => option.value === "user_verified"));
+  assert.ok(status.children.some((option) => option.value === "unverified"));
+  status.value = "user_verified";
+  const prepare = findElement(elements.get("view-library"), (element) => element.tagName === "BUTTON" && element.textContent === "预览用户案例核验");
+  await prepare.listeners.click();
+  assert.equal(posts[0].body.action, "verify_case");
+  assert.deepEqual(Array.from(posts[0].body.item_ids), [22]);
+  assert.equal(posts[0].body.changes.verification_status, "user_verified");
+  const preview = findElement(elements.get("view-library"), (element) => element.className === "confirm-panel");
+  assert.match(textOf(preview), /user_case/);
+  assert.match(textOf(preview), /user_verified/);
+  const confirm = findElement(preview, (element) => element.tagName === "BUTTON" && element.textContent === "确认应用");
+  await confirm.listeners.click();
+  assert.equal(posts[1].body.token, "case-verify-token");
+});
+
+test("single-event Radar moderation can choose the ignored display status", async () => {
+  const { bridge, elements, page } = await loadPage();
+  bridge.apiGet = async (endpoint) => endpoint === "radar/event"
+    ? {
+      id: 41, title: "合成活动", radar_status: "current", dates: [],
+      status_override: null, source_url: "https://example.test/event",
+    }
+    : { items: [{ id: 41, title: "合成活动", radar_status: "current" }], total: 1, page: 1, page_size: 20, page_count: 1 };
+  page.state.route = "radar";
+  page.state.renderGeneration = 1;
+  await page.renderRadar();
+  const view = findElement(elements.get("view-radar"), (element) => element.tagName === "BUTTON" && element.textContent === "查看");
+  await view.listeners.click();
+
+  const statusLabel = findElement(elements.get("view-radar"), (element) =>
+    element.tagName === "LABEL" && element.children?.[0]?.textContent === "人工展示状态");
+  assert.ok(statusLabel);
+  assert.ok(statusLabel.children[1].children.some((option) => option.value === "ignored"));
+});
+
 test("daily reveal controls are question-only and enter the saved plan preview", async () => {
   const { elements, page } = await loadPage();
   const questionPlan = page.planForm("daily_question", {
@@ -636,10 +747,15 @@ test("daily reveal controls are question-only and enter the saved plan preview",
   revealMode.value = "delayed";
   revealMode.listeners.change();
   const answerDelay = labeledInput(questionPlan, "答案延迟分钟");
-  answerDelay.value = "15";
   const explanationDelay = labeledInput(questionPlan, "解析延迟分钟");
-  explanationDelay.value = "45";
+  assert.equal(Number(answerDelay.value), 15);
+  assert.equal(Number(explanationDelay.value), 30);
   const preview = findElement(questionPlan, (element) => element.tagName === "BUTTON" && element.textContent === "预览并保存");
+  explanationDelay.value = "10";
+  preview.listeners.click();
+  assert.equal(elements.get("captured-plan"), undefined);
+  assert.match(textOf(questionPlan), /解析延迟不能早于答案/);
+  explanationDelay.value = "45";
   preview.listeners.click();
   assert.equal(elements.get("captured-plan").question_reveal_mode, "delayed");
   assert.equal(elements.get("captured-plan").answer_reveal_delay_minutes, 15);
@@ -808,4 +924,61 @@ test("structured import preview exposes structured case evidence and pending ide
     "合成争议焦点", "合成裁判要旨", "合成处理结果", "合成学习要点",
     "pending_review",
   ]) assert.match(rendered, new RegExp(evidence));
+});
+
+test("Radar date review explicitly previews and submits human confirmation state", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const requests = [];
+  bridge.apiGet = async () => ({
+    id: 17,
+    title: "合成活动",
+    event_type: "competition",
+    radar_status: "needs_review",
+    organizer: "合成主办方",
+    eligibility: "合成参赛对象",
+    dates: [{
+      id: 81,
+      kind: "registration_deadline",
+      datetime: "2026-10-01T00:00:00+08:00",
+      label: "报名截止",
+      evidence_text: "报名截止：10月1日",
+      confirmed: false,
+    }],
+    status_override: null,
+    source_url: "https://example.test/synthetic-event",
+  });
+  bridge.apiPost = async (path, body) => {
+    requests.push({ path, body });
+    if (path === "radar/date-review-prepare") {
+      return {
+        token: "date-review-token",
+        old_value: { datetime: "2026-10-01T00:00:00+08:00", confirmed: false },
+        proposed_value: { datetime: "2026-10-02T00:00:00+08:00", confirmed: body.proposed_confirmed },
+        decision: body.decision,
+        reason: body.reason,
+      };
+    }
+    return { success: true };
+  };
+  page.state.route = "radar";
+  page.state.renderGeneration = 1;
+
+  await page.renderRadarDetail(elements.get("view-radar"), 17, 1, "radar");
+  const checkbox = labeledInput(elements.get("view-radar"), "明确确认此日期证据可用于截止与提醒");
+  assert.ok(checkbox, "human confirmation checkbox must be visible");
+  checkbox.checked = true;
+  labeledInput(elements.get("view-radar"), "日期节点").value = "81";
+  labeledInput(elements.get("view-radar"), "决定").value = "accepted";
+  const previewButton = findElement(
+    elements.get("view-radar"),
+    (element) => element.tagName === "BUTTON" && element.textContent === "预览日期复核",
+  );
+  await previewButton.listeners.click();
+
+  const prepare = requests.find((request) => request.path === "radar/date-review-prepare");
+  assert.equal(prepare.body.proposed_confirmed, true);
+  const rendered = textOf(elements.get("view-radar"));
+  assert.match(rendered, /当前已确认/);
+  assert.match(rendered, /操作后已确认/);
+  assert.match(rendered, /报名截止：10月1日/);
 });

@@ -8,8 +8,7 @@ import pytest
 
 import storage as storage_module
 from daily_plans import DailyPlan
-from library_repository import LibraryRepository
-from library_service import LibraryService
+from models import LawUpdate, SourceDocument
 from question_session_repository import QuestionSessionRepository
 from scheduled_reveals import ScheduledRevealRepository
 from storage import SCHEMA_VERSION, SQLiteStorage
@@ -172,6 +171,182 @@ def test_data_clear_failure_rolls_back_prior_child_deletions(tmp_path):
     storage.close()
 
 
+def test_radar_clear_preserves_case_and_law_source_state_atomically(tmp_path):
+    storage = SQLiteStorage(tmp_path / "radar-domain-clear.sqlite3")
+    storage.upsert_event(make_event(source_key="radar-source"))
+    documents = [
+        SourceDocument(
+            source_key="radar-source",
+            source_item_key="event-doc",
+            url="https://events.example/item",
+            title="合成活动来源",
+            content="合成活动正文",
+            fetched_at="2026-09-30T00:00:00+00:00",
+        ),
+        SourceDocument(
+            source_key="court_cases",
+            source_item_key="case-doc",
+            url="https://court.example/item",
+            title="合成案例来源",
+            content="合成案例正文",
+            fetched_at="2026-09-30T00:00:00+00:00",
+            metadata={
+                "case_segmentation_version": "2",
+                "case_processing_status": "success",
+            },
+        ),
+        SourceDocument(
+            source_key="law-source",
+            source_item_key="law-doc",
+            url="https://laws.example/item",
+            title="合成法规来源",
+            content="合成法规正文",
+            fetched_at="2026-09-30T00:00:00+00:00",
+        ),
+    ]
+    for source_document in documents:
+        storage.upsert_source_document(source_document)
+    for source_key, source_type in (
+        ("radar-source", "event"),
+        ("court_cases", "case"),
+        ("law-source", "law_update"),
+    ):
+        storage.record_source_run(
+            source_key=source_key,
+            started_at="2026-09-30T00:00:00+00:00",
+            finished_at="2026-09-30T00:01:00+00:00",
+            success=True,
+            discovered_count=1,
+            source_type=source_type,
+        )
+    storage.upsert_law_update(
+        LawUpdate(
+            source_key="law-source",
+            source_item_key="law-doc",
+            title="合成法规更新",
+            category="司法解释",
+            source_url="https://laws.example/item",
+            status="current",
+            content_hash="synthetic-law-hash",
+            raw_text="合成法规正文",
+        )
+    )
+
+    preview = storage.prepare_data_clear("radar")
+    assert preview["counts"]["source_documents"] == 1
+    assert preview["counts"]["source_runs"] == 1
+    assert "law_updates" not in preview["snapshot"]
+    storage.connection.execute(
+        "CREATE TRIGGER reject_radar_clear BEFORE DELETE ON events "
+        "BEGIN SELECT RAISE(ABORT, 'injected radar clear failure'); END"
+    )
+    storage.connection.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="injected radar clear failure"):
+        storage.confirm_data_clear("radar", preview["snapshot"])
+    assert storage.count_events() == 1
+    assert storage.get_source_document("radar-source", "event-doc") is not None
+    assert storage.get_source_document("court_cases", "case-doc") is not None
+    assert storage.get_source_document("law-source", "law-doc") is not None
+    assert len(storage.list_source_runs(10)) == 3
+    assert len(storage.list_law_updates()) == 1
+    storage.connection.execute("DROP TRIGGER reject_radar_clear")
+    storage.connection.commit()
+
+    cleared = storage.confirm_data_clear("radar", preview["snapshot"])
+    assert cleared["success"] is True
+    assert storage.count_events() == 0
+    assert storage.get_source_document("radar-source", "event-doc") is None
+    assert storage.get_source_document("court_cases", "case-doc") is not None
+    assert storage.get_source_document("law-source", "law-doc") is not None
+    remaining_runs = storage.list_source_runs(10)
+    assert {row["source_type"] for row in remaining_runs} == {"case", "law_update"}
+    assert len(storage.list_law_updates()) == 1
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    repeated = storage.prepare_data_clear("radar")
+    storage.confirm_data_clear("radar", repeated["snapshot"])
+    storage.close()
+
+    reopened = SQLiteStorage(tmp_path / "radar-domain-clear.sqlite3")
+    assert reopened.schema_version == 13
+    assert reopened.get_source_document("court_cases", "case-doc") is not None
+    assert reopened.get_source_document("law-source", "law-doc") is not None
+    assert len(reopened.list_law_updates()) == 1
+    assert reopened.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    reopened.close()
+
+
+def test_delivery_history_clear_preserves_source_domains_and_law_updates(tmp_path):
+    storage = SQLiteStorage(tmp_path / "delivery-source-preservation.sqlite3")
+    for source_key, source_type in (
+        ("radar-source", "event"),
+        ("court_cases", "case"),
+        ("law-source", "law_update"),
+    ):
+        storage.upsert_source_document(
+            SourceDocument(
+                source_key=source_key,
+                source_item_key="item-1",
+                url=f"https://{source_key}.example/item-1",
+                title=f"合成{source_type}来源",
+                content=f"合成{source_type}正文",
+                fetched_at="2026-09-30T00:00:00+00:00",
+            )
+        )
+        storage.record_source_run(
+            source_key=source_key,
+            source_type=source_type,
+            started_at="2026-09-30T00:00:00+00:00",
+            finished_at="2026-09-30T00:01:00+00:00",
+            success=True,
+            discovered_count=1,
+        )
+    storage.upsert_law_update(
+        LawUpdate(
+            source_key="law-source",
+            source_item_key="item-1",
+            title="合成法规更新",
+            category="司法解释",
+            source_url="https://law-source.example/item-1",
+            status="current",
+            content_hash="synthetic-law-content",
+            raw_text="合成法规正文",
+        )
+    )
+    target = storage.bind_target("aiocqhttp:group:delivery-clear", "执行历史群")
+    storage.claim_daily_content(
+        content_date="2026-09-30",
+        target_id=target["id"],
+        content_type="daily_question",
+        body={"prompt": "合成题面"},
+    )
+
+    preview = storage.prepare_data_clear("delivery_history")
+    storage.confirm_data_clear("delivery_history", preview["snapshot"])
+
+    assert storage.list_daily_contents() == []
+    assert len(storage.list_source_runs(10)) == 3
+    assert {row["source_type"] for row in storage.list_source_runs(10)} == {
+        "event",
+        "case",
+        "law_update",
+    }
+    assert all(
+        storage.get_source_document(source_key, "item-1") is not None
+        for source_key in ("radar-source", "court_cases", "law-source")
+    )
+    assert len(storage.list_law_updates()) == 1
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    storage.close()
+
+    reopened = SQLiteStorage(tmp_path / "delivery-source-preservation.sqlite3")
+    assert reopened.schema_version == 13
+    assert len(reopened.list_source_runs(10)) == 3
+    assert len(reopened.list_law_updates()) == 1
+    assert reopened.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    reopened.close()
+
+
 def test_target_clear_keeps_session_content_but_nulls_target_and_removes_target_data(
     tmp_path,
 ):
@@ -221,23 +396,100 @@ def test_target_clear_keeps_session_content_but_nulls_target_and_removes_target_
         "expected",
     ),
     [
-        ("radar", (0, 1, 2, 1, 1, 1, 1, 1)),
-        ("library", (1, 1, 0, 1, 1, 1, 1, 1)),
-        ("verified_questions", (1, 0, 2, 1, 1, 1, 1, 1)),
-        ("cases", (1, 1, 1, 1, 1, 1, 1, 1)),
-        ("delivery_history", (1, 1, 2, 1, 1, 0, 1, 0)),
-        ("question_sessions", (1, 1, 2, 1, 1, 1, 0, 0)),
-        ("daily_plans", (1, 1, 2, 1, 0, 1, 1, 0)),
-        ("targets", (1, 1, 2, 0, 0, 0, 1, 1)),
+        ("radar", (0, 2, 4, 1, 1, 1, 1, 1)),
+        ("library", (1, 2, 0, 1, 1, 1, 1, 1)),
+        ("verified_questions", (1, 0, 4, 1, 1, 1, 1, 1)),
+        ("cases", (1, 2, 2, 1, 1, 1, 1, 1)),
+        ("delivery_history", (1, 2, 4, 1, 1, 0, 1, 0)),
+        ("question_sessions", (1, 2, 4, 1, 1, 1, 0, 0)),
+        ("daily_plans", (1, 2, 4, 1, 0, 1, 1, 0)),
+        ("targets", (1, 2, 4, 0, 0, 0, 1, 1)),
         ("all_runtime", (0, 0, 0, 0, 0, 0, 0, 0)),
     ],
 )
 async def test_data_clear_scopes_preserve_unrelated_seeded_domains_and_reopen(
     scope, expected, tmp_path
 ):
-    storage = SQLiteStorage(tmp_path / f"clear-integration-{scope}.sqlite3")
-    storage.upsert_event(make_event())
-    library = LibraryService(LibraryRepository(storage.connection))
+    from types import SimpleNamespace
+
+    from service import LawAssistantService
+    from tests.test_structured_ingestion import _prepare_service
+
+    seed_dir = tmp_path / f"clear-integration-{scope}"
+    seed_dir.mkdir()
+    storage, ingestion, prepared_import, _payload = await _prepare_service(seed_dir)
+    await ingestion.confirm(prepared_import)
+    promoted_item_id = int(
+        storage.connection.execute(
+            "SELECT id FROM learning_items WHERE item_type='question'"
+        ).fetchone()[0]
+    )
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name='合成考试' WHERE item_id=?",
+        (promoted_item_id,),
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+    promotion = await service.prepare_candidate_promotion(
+        [promoted_item_id], actor_id="operator-1"
+    )
+    assert promotion["promotable_count"] == 1
+    assert (
+        await service.confirm_candidate_promotion(
+            promotion["token"], actor_id="operator-1"
+        )
+    )["success"] is True
+
+    storage.upsert_event(make_event(source_key="radar-source"))
+    for source_key, source_type in (
+        ("radar-source", "event"),
+        ("court_cases", "case"),
+        ("law-source", "law_update"),
+    ):
+        storage.upsert_source_document(
+            SourceDocument(
+                source_key=source_key,
+                source_item_key="item-1",
+                url=f"https://{source_key}.example/item-1",
+                title=f"合成{source_type}来源",
+                content=f"合成{source_type}正文",
+                fetched_at="2026-09-30T00:00:00+00:00",
+                metadata=(
+                    {
+                        "case_segmentation_version": "2",
+                        "case_processing_status": "success",
+                    }
+                    if source_type == "case"
+                    else {}
+                ),
+            )
+        )
+        storage.record_source_run(
+            source_key=source_key,
+            source_type=source_type,
+            started_at="2026-09-30T00:00:00+00:00",
+            finished_at="2026-09-30T00:01:00+00:00",
+            success=True,
+            discovered_count=1,
+        )
+    storage.upsert_law_update(
+        LawUpdate(
+            source_key="law-source",
+            source_item_key="item-1",
+            title="合成法规更新",
+            category="司法解释",
+            source_url="https://law-source.example/item-1",
+            status="current",
+            content_hash="synthetic-law-content",
+            raw_text="合成法规正文",
+        )
+    )
+
+    library = ingestion.library_service
     note = await library.archive_learning_material(
         raw_text="用于跨范围保留断言的合成笔记",
         material_type="note",
@@ -330,6 +582,25 @@ async def test_data_clear_scopes_preserve_unrelated_seeded_domains_and_reopen(
         "(SELECT COUNT(*) FROM scheduled_reveal_jobs)"
     ).fetchone()
     assert tuple(row) == expected
+    expected_source_state = {
+        "radar": (2, 2, 1),
+        "library": (3, 3, 1),
+        "verified_questions": (3, 3, 1),
+        "cases": (3, 3, 1),
+        "delivery_history": (3, 3, 1),
+        "question_sessions": (3, 3, 1),
+        "daily_plans": (3, 3, 1),
+        "targets": (3, 3, 1),
+        "all_runtime": (0, 0, 0),
+    }
+    source_state = (
+        storage.connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[
+            0
+        ],
+        storage.connection.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0],
+        len(storage.list_law_updates()),
+    )
+    assert source_state == expected_source_state[scope]
     assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
     if scope == "targets":
         assert (
@@ -347,13 +618,124 @@ async def test_data_clear_scopes_preserve_unrelated_seeded_domains_and_reopen(
         )
     if scope == "all_runtime":
         assert storage.count_events() == 0
+
+    # Each scope's primary data can be rebuilt through its ordinary write path.
+    if scope in {"radar", "all_runtime"}:
+        storage.upsert_event(
+            replace(
+                make_event(source_key=f"rebuilt-{scope}"), source_item_key="rebuilt"
+            )
+        )
+        assert storage.get_event_by_key(f"rebuilt-{scope}", "rebuilt") is not None
+    elif scope == "verified_questions":
+        candidate = library.repository.get(promoted_item_id)
+        assert candidate.item.identity == "real_question_candidate"
+        assert candidate.structured["verified_real_question_id"] is None
+        reproposal = await service.prepare_candidate_promotion(
+            [promoted_item_id], actor_id="operator-1"
+        )
+        assert reproposal["promotable_count"] == 1
+        repromoted = await service.confirm_candidate_promotion(
+            reproposal["token"], actor_id="operator-1"
+        )
+        assert repromoted["success"] is True
+        assert storage.count_real_questions() == 1
+    elif scope in {"cases", "library"}:
+        duplicate = await ingestion.prepare(
+            "verified.pdf",
+            prepared_import.structured_path.relative_to(
+                ingestion.import_dir
+            ).as_posix(),
+            created_by="operator-1",
+            session_origin="private:operator-1",
+        )
+        rebuilt = await ingestion.confirm(duplicate)
+        assert rebuilt["archived"] >= 1
+        assert (
+            storage.connection.execute(
+                "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+            ).fetchone()[0]
+            >= 1
+        )
+        if scope == "cases":
+            assert rebuilt["duplicate"] is True
+            assert (
+                storage.connection.execute(
+                    "SELECT COUNT(*) FROM learning_items WHERE item_type='question'"
+                ).fetchone()[0]
+                == 1
+            )
+    elif scope == "delivery_history":
+        rebuilt = storage.claim_daily_content(
+            content_date="2026-09-30",
+            target_id=target["id"],
+            content_type="daily_question",
+            body={"prompt": "重建的合成题面"},
+        )
+        assert rebuilt is not None
+    elif scope == "question_sessions":
+        rebuilt = QuestionSessionRepository(storage.connection).create_session(
+            session_key=f"rebuilt-session-{scope}",
+            scope_origin=target["unified_msg_origin"],
+            target_id=target["id"],
+            source_kind="generated_question",
+            source_item_key="rebuilt-synthetic",
+            library_item_id=None,
+            real_question_id=None,
+            question_identity="mock_question",
+            snapshot={"prompts": [{"stem": "重建会话"}]},
+            created_by="scheduler",
+            created_at="2026-09-30T00:00:00+00:00",
+        )
+        assert rebuilt["status"] == "open"
+    elif scope == "daily_plans":
+        storage.upsert_daily_plan(
+            DailyPlan("daily_question", enabled=True, question_origin="mock"),
+            target["id"],
+        )
+        assert storage.get_daily_plan(target["id"], "daily_question") is not None
+    elif scope == "targets":
+        rebuilt = storage.bind_target("aiocqhttp:group:clear-integration", "重建测试群")
+        assert rebuilt["enabled"] is True
+
     storage.close()
 
-    reopened = SQLiteStorage(tmp_path / f"clear-integration-{scope}.sqlite3")
+    reopened = SQLiteStorage(seed_dir / "runtime.sqlite3")
     assert reopened.schema_version == 13
     assert reopened.connection.execute("PRAGMA foreign_key_check").fetchall() == []
-    reopened.upsert_event(replace(make_event(), source_key=f"post-clear-{scope}"))
-    assert reopened.get_event_by_key(f"post-clear-{scope}", "item-1") is not None
+    reopened_source_state = (
+        reopened.connection.execute("SELECT COUNT(*) FROM source_documents").fetchone()[
+            0
+        ],
+        reopened.connection.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0],
+        len(reopened.list_law_updates()),
+    )
+    assert reopened_source_state == expected_source_state[scope]
+    if scope in {"radar", "all_runtime"}:
+        assert reopened.get_event_by_key(f"rebuilt-{scope}", "rebuilt") is not None
+    if scope in {"library", "cases"}:
+        assert (
+            reopened.connection.execute(
+                "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+            ).fetchone()[0]
+            >= 1
+        )
+    if scope == "verified_questions":
+        assert reopened.count_real_questions() == 1
+    if scope == "delivery_history":
+        assert len(reopened.list_daily_contents()) == 1
+    if scope == "question_sessions":
+        assert (
+            reopened.connection.execute(
+                "SELECT COUNT(*) FROM question_sessions WHERE session_key = ?",
+                (f"rebuilt-session-{scope}",),
+            ).fetchone()[0]
+            == 1
+        )
+    if scope == "daily_plans":
+        assert reopened.get_daily_plan(target["id"], "daily_question") is not None
+    if scope == "targets":
+        assert reopened.get_target(rebuilt["id"])["label"] == "重建测试群"
     reopened.close()
 
 
@@ -382,7 +764,7 @@ def test_data_clear_scope_names_are_fixed_allowlist(scope, tmp_path):
     if scope == "daily_plans":
         assert "scheduled_reveal_jobs" in preview["snapshot"]
     if scope == "delivery_history":
-        assert "source_runs" in preview["snapshot"]
+        assert "source_runs" not in preview["snapshot"]
     with pytest.raises(ValueError, match="不支持"):
         storage.prepare_data_clear("events; DROP TABLE events")
     storage.confirm_data_clear(

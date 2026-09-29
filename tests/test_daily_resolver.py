@@ -160,6 +160,16 @@ def test_daily_question_reveal_policy_is_validated_and_round_trips():
         {"question_reveal_mode": "automatic-ish"},
         {"answer_reveal_delay_minutes": -1},
         {"explanation_reveal_delay_minutes": 10081},
+        {
+            "question_reveal_mode": "delayed",
+            "answer_reveal_delay_minutes": 240,
+            "explanation_reveal_delay_minutes": 10,
+        },
+        {
+            "question_reveal_mode": "delayed",
+            "answer_reveal_delay_minutes": 0,
+            "explanation_reveal_delay_minutes": 10,
+        },
     ):
         try:
             DailyPlan.from_mapping("daily_question", changes)
@@ -167,6 +177,20 @@ def test_daily_question_reveal_policy_is_validated_and_round_trips():
             pass
         else:
             raise AssertionError(f"invalid reveal policy accepted: {changes!r}")
+
+
+def test_manual_question_reveal_ignores_configured_delays():
+    plan = DailyPlan.from_mapping(
+        "daily_question",
+        {
+            "question_reveal_mode": "manual",
+            "answer_reveal_delay_minutes": 240,
+            "explanation_reveal_delay_minutes": 10,
+        },
+    )
+
+    assert plan.answer_reveal_delay_minutes == 0
+    assert plan.explanation_reveal_delay_minutes == 0
 
 
 def test_due_time_resolver_uses_local_wall_time_and_handles_dst_gap_and_fold():

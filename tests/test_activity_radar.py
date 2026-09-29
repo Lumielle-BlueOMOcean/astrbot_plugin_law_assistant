@@ -214,6 +214,138 @@ async def test_radar_override_and_date_review_are_confirmed_audited_and_evidence
 
 
 @pytest.mark.asyncio
+async def test_status_override_does_not_confirm_deadline_but_explicit_date_review_does(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    now = datetime(2026, 9, 20, 9, 0, tzinfo=ZONE)
+    storage = SQLiteStorage(tmp_path / "radar-explicit-date-confirmation.sqlite3")
+    inferred = replace(
+        _event(deadline=datetime(2026, 9, 30, tzinfo=ZONE)),
+        dates=(
+            EventDate(
+                kind="registration_deadline",
+                datetime=datetime(2026, 9, 30, tzinfo=ZONE),
+                timezone="Asia/Shanghai",
+                label="报名截止",
+                evidence_text="报名截止：9月30日",
+                confirmed=False,
+                precision="date",
+            ),
+        ),
+    )
+    event_id = storage.upsert_event(inferred)
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai", operator_ids=["operator-1"]),
+        clock=lambda: now,
+    )
+    event = storage.get_event(event_id)
+
+    status = await service.prepare_event_status_override(
+        event_id, "current", "只调整展示状态", actor_id="operator-1"
+    )
+    assert status["ready"] is True
+    assert (
+        await service.confirm_event_status_override(
+            status["token"], actor_id="operator-1"
+        )
+    )["success"] is True
+    assert storage.list_deadlines(now=now) == []
+
+    accepted = await service.prepare_event_date_review(
+        event_id,
+        event.dates[0].id,
+        "2026-10-01",
+        "人工核实并确认截止日期证据",
+        actor_id="operator-1",
+        proposed_confirmed=True,
+    )
+    assert accepted["ready"] is True
+    assert accepted["old_value"]["confirmed"] is False
+    assert accepted["proposed_value"]["confirmed"] is True
+    assert storage.list_deadlines(now=now) == []
+    confirmed = await service.confirm_event_date_review(
+        accepted["token"], actor_id="operator-1"
+    )
+    assert confirmed["success"] is True
+    assert storage.get_event(event_id).dates[0].confirmed is True
+    assert len(storage.list_deadlines(now=now)) == 1
+    audit = storage.list_event_date_reviews()[0]
+    assert audit["proposed_value"]["confirmed"] is True
+    assert audit["actor_id"] == "operator-1"
+    assert audit["reason"] == "人工核实并确认截止日期证据"
+
+    rejected_event = replace(
+        inferred,
+        source_key="synthetic-rejected",
+        source_item_key="event-rejected",
+    )
+    rejected_id = storage.upsert_event(rejected_event)
+    rejected = await service.prepare_event_date_review(
+        rejected_id,
+        storage.get_event(rejected_id).dates[0].id,
+        "2026-10-02",
+        "拒绝推断日期",
+        actor_id="operator-1",
+        decision="rejected",
+        proposed_confirmed=True,
+    )
+    assert rejected["ready"] is True
+    assert rejected["proposed_value"]["confirmed"] is False
+    rejection = await service.confirm_event_date_review(
+        rejected["token"], actor_id="operator-1"
+    )
+    assert rejection["success"] is True
+    assert storage.get_event(rejected_id).dates[0].confirmed is False
+    assert len(storage.list_deadlines(now=now)) == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_ignored_radar_override_is_counted_filtered_and_clears_to_derived(
+    tmp_path,
+):
+    now = datetime(2026, 9, 20, 9, 0, tzinfo=ZONE)
+    storage = SQLiteStorage(tmp_path / "ignored-radar.sqlite3")
+    event_id = storage.upsert_event(
+        _event(deadline=datetime(2026, 9, 30, 18, tzinfo=ZONE))
+    )
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="Asia/Shanghai", operator_ids=["operator-1"]),
+        clock=lambda: now,
+    )
+
+    prepared = await service.prepare_event_status_override(
+        event_id, "ignored", "重复归档", actor_id="operator-1"
+    )
+    applied = await service.confirm_event_status_override(
+        prepared["token"], actor_id="operator-1"
+    )
+    assert applied["success"] is True
+
+    overview = await service.dashboard_overview()
+    assert overview["radar"]["current"] == 0
+    assert overview["radar"]["ignored"] == 1
+    ignored = await service.list_events(radar_status="ignored")
+    assert [event.id for event in ignored] == [event_id]
+
+    clear = await service.prepare_event_status_override(
+        event_id, "derived", "恢复证据推导", actor_id="operator-1"
+    )
+    cleared = await service.confirm_event_status_override(
+        clear["token"], actor_id="operator-1"
+    )
+    assert cleared["success"] is True
+    assert storage.get_event_status_override(event_id) is None
+    assert (await service.get_event(event_id)).metadata["radar_status"] == "current"
+    assert [event.id for event in await service.list_events()] == [event_id]
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_scan_skips_sources_with_discovery_disabled_and_reports_them(tmp_path):
     disabled = FakeAdapter(
         "extra:disabled",

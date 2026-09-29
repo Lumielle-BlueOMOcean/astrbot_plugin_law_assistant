@@ -325,6 +325,91 @@ async def test_structured_import_is_hash_bound_and_duplicate_is_idempotent(tmp_p
     storage.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_only", [False, True], ids=["mixed", "case-only"])
+async def test_duplicate_structured_import_rebuilds_cleared_cases_without_duplicate_questions(
+    tmp_path, case_only
+):
+    storage, ingestion, prepared, payload = await _prepare_service(tmp_path)
+    if case_only:
+        payload["questions"] = []
+        prepared.structured_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        prepared = await ingestion.prepare(
+            "verified.pdf",
+            prepared.structured_path.relative_to(ingestion.import_dir).as_posix(),
+            created_by="operator-1",
+            session_origin="private:operator-1",
+        )
+
+    first = await ingestion.confirm(prepared)
+    assert first["archived"] == (1 if case_only else 2)
+    before_question_ids = {
+        int(row[0])
+        for row in storage.connection.execute(
+            "SELECT id FROM learning_items WHERE item_type='question'"
+        ).fetchall()
+    }
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+        ).fetchone()[0]
+        == 1
+    )
+
+    clear = storage.prepare_data_clear("cases")
+    storage.confirm_data_clear("cases", clear["snapshot"])
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+        ).fetchone()[0]
+        == 0
+    )
+
+    duplicate_prepared = await ingestion.prepare(
+        "verified.pdf",
+        prepared.structured_path.relative_to(ingestion.import_dir).as_posix(),
+        created_by="operator-1",
+        session_origin="private:operator-1",
+    )
+    rebuilt = await ingestion.confirm(duplicate_prepared)
+
+    assert rebuilt["duplicate"] is True
+    assert rebuilt["archived"] == 1
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+        ).fetchone()[0]
+        == 1
+    )
+    after_question_ids = {
+        int(row[0])
+        for row in storage.connection.execute(
+            "SELECT id FROM learning_items WHERE item_type='question'"
+        ).fetchall()
+    }
+    assert after_question_ids == before_question_ids
+    assert (
+        storage.connection.execute(
+            "SELECT COUNT(*) FROM structured_imports"
+        ).fetchone()[0]
+        == 1
+    )
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    storage.close()
+
+    reopened = SQLiteStorage(tmp_path / "runtime.sqlite3")
+    assert (
+        reopened.connection.execute(
+            "SELECT COUNT(*) FROM learning_items WHERE item_type='case'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert reopened.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    reopened.close()
+
+
 def test_structured_validator_keeps_identity_as_candidate_only():
     pdf_bytes = _text_pdf_bytes()
     validation = validate_structured_material(_payload(pdf_bytes))

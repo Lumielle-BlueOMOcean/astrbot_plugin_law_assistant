@@ -1049,8 +1049,8 @@ class LawAssistant(Star):
             "法务 真题 [方向] [题型]、法务 模拟题 [方向] [题型]、法务 案例 [方向]、"
             "法务 当前、法务 下一页、法务 下一题、法务 答案、法务 解析、法务 结束、"
             "法务 计划、法务 群计划、法务 绑定 <别名>、法务 帮助。"
-            "管理与维护：/law scan、/law import、/law question-import、/law review、"
-            "/law review-status、/law bind-umo、/law rename、/law publish、/law confirm。"
+            "管理与维护：law scan、law import、law question-import、law review、"
+            "law review-status、law bind-umo、law rename、law publish、law confirm。"
         )
 
 

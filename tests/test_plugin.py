@@ -123,6 +123,10 @@ def test_question_command_parser_accepts_indefinite_choice_alias(plugin_module):
     )
 
 
+def test_help_text_does_not_show_slash_prefixed_law_commands(plugin_module):
+    assert "/law" not in plugin_module.LawAssistant._help_text()
+
+
 @pytest.mark.asyncio
 async def test_command_requires_private_admin_or_operator_and_delegates(plugin_module):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
@@ -798,8 +802,10 @@ async def test_confirming_daily_plan_wakes_initially_disabled_plugin_scheduler(
     plugin_module,
 ):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
-    await plugin.service.bind_target("aiocqhttp:group:100", "一群")
     assert plugin.scheduler.enabled is False
+    await plugin.service.bind_target("aiocqhttp:group:100", "一群")
+    assert plugin.scheduler.due_task is None
+    assert plugin.scheduler.due_enabled is False
 
     event = FakeEvent(private=True, sender_id="42")
     preview = json.loads(

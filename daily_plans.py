@@ -189,6 +189,19 @@ class DailyPlan:
                 if delay < 0 or delay > 10080:
                     raise ValueError(f"{field_name} 必须在 0 到 10080 分钟之间")
                 reveal_delays[field_name] = delay
+            if reveal_mode == "delayed":
+                if reveal_delays["answer_reveal_delay_minutes"] <= 0:
+                    raise ValueError("定时揭晓时答案延迟必须大于 0 分钟")
+                if (
+                    reveal_delays["explanation_reveal_delay_minutes"]
+                    < reveal_delays["answer_reveal_delay_minutes"]
+                ):
+                    raise ValueError("解析延迟不能早于答案揭晓")
+            else:
+                reveal_delays = {
+                    "answer_reveal_delay_minutes": 0,
+                    "explanation_reveal_delay_minutes": 0,
+                }
         return cls(
             content_type=content_type,
             enabled=bool(values.get("enabled", False)),

@@ -327,14 +327,109 @@ async function renderLibrary() {
   view.replaceChildren(sectionTitle(t("page.nav.library", "资料库"), t("page.library.description", "搜索资料、查看证据、修改允许字段并处理待复核条目。")));
   view.append(tabBar([
     ["materials", t("page.library.materials", "资料")],
+    ["real-questions", "核验真题库存"],
     ["imports", t("page.library.imports", "文件导入")],
     ["reviews", t("page.library.reviews", "待复核")],
   ], state.libraryTab, (value) => { state.libraryTab = value; renderLibrary(); }));
   if (!isCurrent(generation, route)) return;
-  if (state.libraryTab === "imports") await renderImports(view);
+  if (state.libraryTab === "real-questions") await renderRealQuestions(view, generation, route);
+  else if (state.libraryTab === "imports") await renderImports(view);
   else if (state.libraryTab === "reviews") await renderReviews(view);
   else await renderMaterials(view);
   if (isCurrent(generation, route)) renderDataManagement(view);
+}
+
+async function renderRealQuestions(view, generation = state.renderGeneration, route = state.route) {
+  const result = node("div");
+  view.append(sectionTitle("核验真题库存", "独立导入的真题可在此查看、修订校验、停用或恢复；关联结构化候选请从资料条目管理，以保持两侧一致。"), result);
+  try {
+    const data = await apiGet("management/real-questions");
+    if (!isCurrent(generation, route)) return;
+    const items = data.items || [];
+    result.append(node("p", `库存记录 ${items.length} 条；当前可用于真题检索 ${items.filter((item) => item.selectable).length} 条。`, "muted"));
+    result.append(table(items, [
+      ["id", "ID"], ["source_name", "来源"], ["exam_name", "考试"], ["exam_year", "年份"],
+      ["subject", "方向", (row) => node("span", subjectLabel(row.subject))],
+      ["question_type", "题型", (row) => node("span", questionTypeLabel(row.question_type))],
+      ["selectable", "可检索", (row) => node("span", row.selectable ? "是" : "否")],
+      ["management_mode", "管理路径", (row) => node("span", row.management_mode === "linked" ? `关联资料 ${row.linked_item_ids.join(", ")}` : "独立真题")],
+    ], (row) => button("查看 / 管理", async () => {
+      const panel = node("article", undefined, "library-inline-detail-row");
+      await renderRealQuestionDetail(panel, row.id, generation, route);
+      result.append(panel);
+    })));
+  } catch (error) {
+    if (isCurrent(generation, route)) result.append(node("p", error.message, "error-text"));
+  }
+}
+
+async function renderRealQuestionDetail(container, questionId, generation, route) {
+  const data = await apiGet("management/real-question", { id: questionId });
+  if (!isCurrent(generation, route)) return;
+  const question = data.question;
+  const panel = node("section", undefined, "form-card");
+  panel.append(node("h3", `核验真题 #${question.id}`));
+  if (question.management_mode === "linked") {
+    panel.append(node("p", `此真题关联资料条目 ${question.linked_item_ids.join(", ")}。请在资料库打开关联条目进行修改或停用，避免真题库存与资料视图分离。`));
+    container.append(panel);
+    return;
+  }
+  const subject = selectControl(SUBJECTS, question.subject);
+  const questionType = selectControl(QUESTION_TYPES, question.question_type);
+  const answerSource = selectControl([
+    ["not_provided", "未提供"], ["official", "官方答案"],
+    ["third_party", "第三方参考答案"], ["user_verified", "用户核验"], ["unverified", "未核验"],
+  ], question.answer_source);
+  const fields = {
+    source_name: textInput(question.source_name), exam_name: textInput(question.exam_name),
+    exam_year: textInput(question.exam_year), exam_date: textInput(question.exam_date, "date"),
+    paper: textInput(question.paper), question_number: textInput(question.question_number),
+    source_url: textInput(question.source_url), source_locator: textInput(question.source_locator),
+    stem: textArea(question.stem), options: textArea(JSON.stringify(question.options, null, 2)),
+    answer: textArea(question.answer == null ? "" : JSON.stringify(question.answer, null, 2)),
+    explanation: textArea(question.explanation),
+  };
+  panel.append(
+    labeled("方向", subject), labeled("题型", questionType),
+    ...Object.entries(fields).map(([key, control]) => labeled(key, control)),
+    labeled("答案来源身份", answerSource),
+  );
+  const save = button("保存并重新校验", async () => {
+    try {
+      const changes = Object.fromEntries(Object.entries(fields).map(([key, control]) => [key, control.value]));
+      changes.subject = subject.value;
+      changes.question_type = questionType.value;
+      changes.answer_source = answerSource.value;
+      for (const key of ["options", "answer"]) {
+        try { changes[key] = JSON.parse(changes[key]); }
+        catch { throw new Error(`${key} 必须是有效 JSON`); }
+      }
+      const outcome = await apiPost("management/real-question-update", { question_id: question.id, changes });
+      if (outcome.success === false) throw new Error(outcome.message || "真题更新失败");
+      setFlash("真题已重新校验并保存");
+      await renderLibrary();
+    } catch (error) { setFlash(error.message, true); }
+  }, "primary");
+  panel.append(save);
+  const activeButton = button(question.selectable ? "预览停用真题" : "预览恢复并重新核验", () => {
+    const nextActive = !question.selectable;
+    const confirmation = node("article", undefined, "confirm-panel");
+    confirmation.append(
+      node("p", nextActive ? "确认将该条目恢复为用户已核验，并重新加入真题检索库存？" : "确认将该条目从真题检索库存停用？记录仍会保留，可恢复。"),
+      button("确认", async () => {
+        try {
+          const outcome = await apiPost("management/real-question-status", { question_id: question.id, active: nextActive });
+          if (outcome.success === false) throw new Error(outcome.message || "状态更新失败");
+          setFlash(nextActive ? "真题已恢复并重新核验" : "真题已停用，可恢复");
+          await renderLibrary();
+        } catch (error) { setFlash(error.message, true); }
+      }, "primary"),
+      button(t("page.actions.cancel", "取消"), () => confirmation.remove()),
+    );
+    panel.append(confirmation);
+  }, "secondary");
+  panel.append(activeButton);
+  container.append(panel);
 }
 
 function renderDataManagement(view) {
@@ -422,7 +517,12 @@ async function renderMaterials(view) {
   const prepareDelete = button(t("page.management.previewDelete", "预览软删除"), () => prepareBatch("delete"), "secondary");
   const prepareRestore = button(t("page.management.previewRestore", "预览恢复"), () => prepareBatch("restore"), "secondary");
   const preparePromote = button(t("page.management.previewPromote", "预览核验身份升格"), () => prepareBatch("promote"), "secondary");
-  batchControls.append(selectionSummary, selectPage, editTitle, editSubjects, prepareEdit, prepareDelete, prepareRestore, preparePromote);
+  const caseVerificationStatus = selectControl([
+    ["user_verified", "标记为用户已核验"],
+    ["unverified", "撤销用户核验"],
+  ]);
+  const prepareCaseVerification = button(t("page.management.previewCaseVerification", "预览用户案例核验"), () => prepareBatch("verify_case", { verification_status: caseVerificationStatus.value }), "secondary");
+  batchControls.append(selectionSummary, selectPage, editTitle, editSubjects, prepareEdit, prepareDelete, prepareRestore, preparePromote, labeled(t("page.management.caseVerificationStatus", "用户案例核验状态"), caseVerificationStatus), prepareCaseVerification);
   const result = node("div");
   view.append(controls, batchControls, result);
   let currentRows = [];
@@ -495,12 +595,13 @@ async function prepareBatch(action, changes = {}) {
       const prepared = await apiPost("management/batch-prepare", { action, item_ids: itemIds, changes });
       const panel = node("article", undefined, "confirm-panel");
       panel.append(node("h3", `批量操作预览：${action}`), node("p", `将作用于 ${prepared.count} 条，ID 已锁定。`));
+      if (action === "verify_case") panel.append(node("p", "仅更新 user_case 核验状态，不会创建或授予 official_case 身份。"));
       if (action === "promote") {
         panel.append(node("p", `可核验 ${prepared.promotable_count || 0} 条；已关联 ${prepared.already_linked_count || 0} 条；待补充答案 ${prepared.unresolved_answer_count || 0} 条；将更新已有库存 ${prepared.upsert_count || 0} 条。`));
         if (prepared.validation_failures?.length) panel.append(table(prepared.validation_failures, [["item_id", "ID"], ["reason", "校验失败"]]));
       }
       const previewItems = (prepared.items || []).map((item) => ({ ...item, id: item.id ?? item.item_id }));
-      panel.append(table(previewItems, [["id", "ID"], ["title", "标题"], ["identity", "身份"], ["eligible", "可处理"], ["reason", "说明"], ["normalized", "规范化核验预览"], ["active", "启用"]]));
+      panel.append(table(previewItems, [["id", "ID"], ["title", "标题"], ["identity", "身份"], ["verification_before", "当前核验状态"], ["verification_after", "操作后核验状态"], ["eligible", "可处理"], ["reason", "说明"], ["normalized", "规范化核验预览"], ["active", "启用"]]));
       const confirm = button(t("page.actions.confirm", "确认应用"), async () => {
         confirm.disabled = true;
         try {
@@ -528,7 +629,7 @@ async function prepareModerationBatch(domain, itemIds, changes, container, refre
     });
     const panel = node("article", undefined, "confirm-panel");
     panel.append(
-      node("h3", domain === "radar" ? "活动批量状态预览" : "复核状态批量预览"),
+      node("h3", domain === "radar" && changes.status === "ignored" ? "活动批量删除/移除（可恢复）预览" : domain === "radar" ? "活动批量状态预览" : "复核状态批量预览"),
       node("p", `将处理 ${prepared.count} 条，所选 ID 已锁定；确认前不会写入。`),
       table(prepared.items || [], [
         ["id", "ID"], ["title", "活动/条目"], ["material_type", "资料类型"],
@@ -536,6 +637,7 @@ async function prepareModerationBatch(domain, itemIds, changes, container, refre
         ["review_reason", "复核原因"], ["action", "操作"],
       ]),
     );
+    if (domain === "radar" && changes.status === "ignored") panel.append(node("p", "仅标记为已忽略；可通过“清除人工状态”恢复，不会删除活动记录。", "muted"));
     const confirm = button(t("page.actions.confirm", "确认应用"), async () => {
       confirm.disabled = true;
       try {
@@ -886,10 +988,10 @@ async function renderRadar() {
   const view = document.getElementById("view-radar");
   view.replaceChildren(sectionTitle(t("page.nav.radar", "活动雷达"), "查看活动证据、时间节点与来源状态。"));
   const controls = node("div", undefined, "toolbar");
-  const status = selectControl([["current", "当前"], ["needs_review", "待复核"], ["historical", "历史"], ["all", "全部"]]);
+  const status = selectControl([["current", "当前"], ["needs_review", "待复核"], ["historical", "历史"], ["ignored", "已忽略"], ["all", "全部"]]);
   const bulkStatus = selectControl([
     ["current", "标记当前"], ["needs_review", "标记待复核"],
-    ["historical", "标记历史"], ["ignored", "忽略"], ["auto", "清除人工状态"],
+    ["historical", "标记历史"], ["ignored", "删除/移除（可恢复）"], ["auto", "清除人工状态"],
   ]);
   const reason = textInput(); reason.placeholder = "批量状态变更原因（清除时可留空）";
   const result = node("div");
@@ -951,7 +1053,7 @@ async function renderRadarDetail(container, eventId, parentGeneration = state.re
     panel.append(keyValueRows({ 活动类型: event.event_type, 雷达状态: event.radar_status, 主办方: event.organizer, 参赛对象: event.eligibility, 报名方式: event.registration_method, 来源发布时间: event.source_published_at, 修订版: event.revision }));
     panel.append(detailBlock("摘要", event.summary), detailBlock("时间节点与 evidence", (event.dates || []).map((date) => `${date.kind} ${date.datetime || ""} ${date.label}\n${date.evidence_text}`)), detailBlock("来源 URL", safeLink(event.source_url, event.source_url)));
     const statusControls = node("div", undefined, "form-grid");
-    const status = selectControl([["current", "当前"], ["needs_review", "待复核"], ["historical", "历史"], ["derived", "恢复证据推导状态"]], event.status_override?.override_status || "derived");
+    const status = selectControl([["current", "当前"], ["needs_review", "待复核"], ["historical", "历史"], ["ignored", "已忽略"], ["derived", "恢复证据推导状态"]], event.status_override?.override_status || "derived");
     const statusReason = textInput(event.status_override?.reason || "");
     statusControls.append(labeled(t("page.radarReview.status", "人工展示状态"), status), labeled(t("page.radarReview.reason", "变更原因"), statusReason));
     statusControls.append(button(t("page.radarReview.previewStatus", "预览状态变更"), async () => {
@@ -968,29 +1070,33 @@ async function renderRadarDetail(container, eventId, parentGeneration = state.re
         panel.append(preview);
       } catch (error) { setFlash(error.message, true); }
     }, "secondary"));
-    panel.append(sectionTitle(t("page.radarReview.dateSection", "日期证据复核"), t("page.radarReview.dateDescription", "复核只记录人工判断与原因；不会改写来源原文。")), statusControls);
+    panel.append(sectionTitle(t("page.radarReview.dateSection", "日期证据复核"), t("page.radarReview.dateDescription", "日期确认独立于活动展示状态；只有明确确认的证据才可驱动截止提醒。复核不会改写来源原文。")), statusControls);
     if ((event.dates || []).length) {
       const dateId = selectControl((event.dates || []).map((date) => [String(date.id), String(date.kind) + " · " + String(date.datetime || "未解析")]));
       const selectedDate = () => (event.dates || []).find((date) => String(date.id) === dateId.value);
       const proposedDate = textInput(event.dates[0].datetime ? String(event.dates[0].datetime).replace(/Z$/, "+00:00") : "");
       const reviewReason = textInput();
+      const proposedConfirmed = document.createElement("input");
+      proposedConfirmed.type = "checkbox";
+      proposedConfirmed.checked = Boolean(event.dates[0].confirmed);
       const decision = selectControl([["accepted", t("page.radarReview.accept", "接受建议日期")], ["rejected", t("page.radarReview.reject", "拒绝并保留原值")]]);
       dateId.addEventListener("change", () => {
         const current = selectedDate();
         proposedDate.value = current?.datetime ? String(current.datetime).replace(/Z$/, "+00:00") : "";
+        proposedConfirmed.checked = Boolean(current?.confirmed);
       });
       const reviewControls = node("div", undefined, "form-grid");
-      reviewControls.append(labeled(t("page.radarReview.dateNode", "日期节点"), dateId), labeled(t("page.radarReview.proposedDate", "建议日期（ISO）"), proposedDate), labeled(t("page.radarReview.reason", "复核原因"), reviewReason), labeled(t("page.radarReview.decision", "决定"), decision));
+      reviewControls.append(labeled(t("page.radarReview.dateNode", "日期节点"), dateId), labeled(t("page.radarReview.proposedDate", "建议日期（ISO）"), proposedDate), labeled(t("page.radarReview.reason", "复核原因"), reviewReason), labeled(t("page.radarReview.decision", "决定"), decision), labeled(t("page.radarReview.confirmEvidence", "明确确认此日期证据可用于截止与提醒"), proposedConfirmed, "checkbox-field"));
       reviewControls.append(button(t("page.radarReview.previewDate", "预览日期复核"), async () => {
         const current = selectedDate();
         if (!current) return setFlash("请选择日期节点", true);
         try {
           const prepared = await apiPost("radar/date-review-prepare", {
             event_id: event.id, event_date_id: current.id, proposed_datetime: proposedDate.value,
-            reason: reviewReason.value, decision: decision.value,
+            reason: reviewReason.value, decision: decision.value, proposed_confirmed: proposedConfirmed.checked,
           });
           const preview = node("article", undefined, "confirm-panel");
-          preview.append(node("h3", "日期复核预览"), keyValueRows({ "来源 evidence": current.evidence_text, 当前日期: prepared.old_value.datetime, 建议日期: prepared.proposed_value.datetime, 决定: prepared.decision, 原因: prepared.reason }));
+          preview.append(node("h3", "日期复核预览"), keyValueRows({ "来源 evidence": current.evidence_text, 当前日期: prepared.old_value.datetime, 建议日期: prepared.proposed_value.datetime, 当前已确认: prepared.old_value.confirmed ? "是" : "否", 操作后已确认: prepared.proposed_value.confirmed ? "是" : "否", 决定: prepared.decision, 原因: prepared.reason }));
           const confirm = button(t("page.radarReview.confirmDate", "确认日期复核"), async () => {
             confirm.disabled = true;
             try { await apiPost("radar/date-review-confirm", { token: prepared.token }); preview.remove(); setFlash("日期复核已记录"); await renderRadarDetail(container, event.id, parentGeneration, parentRoute); }
@@ -1077,7 +1183,7 @@ function planForm(contentType, plan, onPreview, draftKey = contentType) {
   const subjectStartDateField = labeled("轮换起始日期", startDate);
   const subjectRotationField = node("div", undefined, "form-field"); subjectRotationField.append(subjectRotation);
   fields.append(labeled("启用", enabled, "checkbox-field"), labeled("发送时间", time), labeled("方向模式", mode), fixedSubjectField, subjectStartDateField, subjectRotationField);
-  let fixedTypeField; let typeStartDateField; let typeRotationField; let revealDelayFields;
+  let fixedTypeField; let typeStartDateField; let typeRotationField; let revealDelayFields; let revealError;
   if (origin) {
     fixedTypeField = labeled("固定题型", fixedType);
     typeStartDateField = labeled("题型轮换起始日期", typeStartDate);
@@ -1085,6 +1191,9 @@ function planForm(contentType, plan, onPreview, draftKey = contentType) {
     typeRotationField.append(typeRotation);
     revealDelayFields = node("div", undefined, "form-grid");
     revealDelayFields.append(labeled(t("page.plans.revealMode", "答案/解析揭晓模式"), revealMode), labeled(t("page.plans.answerDelay", "答案延迟分钟"), answerDelay), labeled(t("page.plans.explanationDelay", "解析延迟分钟"), explanationDelay));
+    revealError = node("p", "", "error-text");
+    revealError.hidden = true;
+    revealDelayFields.append(revealError);
     fields.append(labeled("题目来源", origin), labeled("题型模式", typeMode), fixedTypeField, typeStartDateField, typeRotationField, revealDelayFields);
   }
   const updateDependencies = () => {
@@ -1100,10 +1209,39 @@ function planForm(contentType, plan, onPreview, draftKey = contentType) {
   };
   mode.addEventListener("change", updateDependencies);
   typeMode?.addEventListener("change", updateDependencies);
-  revealMode?.addEventListener("change", updateDependencies);
+  revealMode?.addEventListener("change", () => {
+    if (revealMode.value === "delayed") {
+      const answer = Number(answerDelay.value || 0);
+      if (answer <= 0) answerDelay.value = "15";
+      if (Number(explanationDelay.value || 0) < Number(answerDelay.value)) {
+        explanationDelay.value = String(Math.min(Number(answerDelay.value) + 15, 10080));
+      }
+    } else {
+      answerDelay.value = "0";
+      explanationDelay.value = "0";
+    }
+    updateDependencies();
+    remember();
+  });
   updateDependencies();
   const preview = button(t("page.actions.preview", "预览并保存"), () => {
     remember();
+    if (revealMode?.value === "delayed") {
+      const answerMinutes = Number(answerDelay.value);
+      const explanationMinutes = Number(explanationDelay.value);
+      if (!Number.isInteger(answerMinutes) || answerMinutes <= 0 || answerMinutes > 10080) {
+        revealError.textContent = t("page.plans.answerDelayError", "定时揭晓时，答案延迟必须是 1–10080 分钟。");
+        revealError.hidden = false;
+        return;
+      }
+      if (!Number.isInteger(explanationMinutes) || explanationMinutes < answerMinutes || explanationMinutes > 10080) {
+        revealError.textContent = t("page.plans.explanationDelayError", "解析延迟不能早于答案揭晓，且不得超过 10080 分钟。");
+        revealError.hidden = false;
+        return;
+      }
+      revealError.textContent = "";
+      revealError.hidden = true;
+    }
     const changes = {
       enabled: enabled.checked,
       time: time.value,
@@ -1343,6 +1481,8 @@ if (globalThis.__LAW_ASSISTANT_TEST__) {
     navigate,
     renderOverview,
     renderMaterials,
+    renderRealQuestions,
+    renderRealQuestionDetail,
     renderLibraryDetail,
     renderDataManagement,
     renderReviewDetail,

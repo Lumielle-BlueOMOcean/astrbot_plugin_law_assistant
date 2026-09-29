@@ -88,6 +88,30 @@ class LawAssistantWebApi:
                 ["POST"],
                 "Update operator learning item",
             ),
+            (
+                "management/real-questions",
+                self.management_real_questions,
+                ["GET"],
+                "List verified real questions for management",
+            ),
+            (
+                "management/real-question",
+                self.management_real_question,
+                ["GET"],
+                "Get one verified real question for management",
+            ),
+            (
+                "management/real-question-update",
+                self.management_real_question_update,
+                ["POST"],
+                "Update an independent verified real question",
+            ),
+            (
+                "management/real-question-status",
+                self.management_real_question_status,
+                ["POST"],
+                "Disable or re-verify an independent verified real question",
+            ),
             ("library/update", self.library_update, ["POST"], "Update learning item"),
             (
                 "management/batch-prepare",
@@ -289,6 +313,7 @@ class LawAssistantWebApi:
             _bounded_text(body.get("reason", ""), 500),
             actor_id="webui",
             decision=_bounded_text(body.get("decision", "accepted"), 20),
+            proposed_confirmed=body.get("proposed_confirmed"),
         )
         return _ready_payload(result)
 
@@ -460,6 +485,45 @@ class LawAssistantWebApi:
             await self.service.update_management_learning_item(
                 _int_arg(body.get("item_id"), "item_id"),
                 body.get("changes", {}),
+                actor_id="webui",
+            )
+        )
+
+    async def management_real_questions(self) -> Any:
+        return _service_payload(
+            await self.service.list_management_real_questions(actor_id="webui")
+        )
+
+    async def management_real_question(self) -> Any:
+        question_id = _int_arg(request.args.get("id"), "id")
+        return _service_payload(
+            await self.service.get_management_real_question(
+                question_id, actor_id="webui"
+            )
+        )
+
+    async def management_real_question_update(self) -> Any:
+        body = await _json_body()
+        changes = body.get("changes", {})
+        if not isinstance(changes, dict):
+            return _error("invalid_parameter", "changes 必须是 JSON 对象")
+        return _service_payload(
+            await self.service.update_management_real_question(
+                _int_arg(body.get("question_id"), "question_id"),
+                changes,
+                actor_id="webui",
+            )
+        )
+
+    async def management_real_question_status(self) -> Any:
+        body = await _json_body()
+        active = body.get("active")
+        if not isinstance(active, bool):
+            return _error("invalid_parameter", "active 必须是布尔值")
+        return _service_payload(
+            await self.service.set_management_real_question_active(
+                _int_arg(body.get("question_id"), "question_id"),
+                active=active,
                 actor_id="webui",
             )
         )

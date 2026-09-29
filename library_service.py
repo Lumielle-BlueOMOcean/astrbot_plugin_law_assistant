@@ -1065,6 +1065,9 @@ class LibraryService:
             "answer",
             "explanation",
             "answer_source",
+            "source_name",
+            "source_url",
+            "source_locator",
             "exam_name",
             "exam_year",
             "exam_date",
@@ -1086,6 +1089,24 @@ class LibraryService:
         if "subjects" in normalized:
             normalized["subjects"] = _subjects(normalized["subjects"])
         if bundle.question is not None:
+            linked_real_question_id = (bundle.structured or {}).get(
+                "verified_real_question_id"
+            )
+            source_identity_fields = {"source_name", "source_url", "source_locator"}
+            if (
+                source_identity_fields & normalized.keys()
+                and not linked_real_question_id
+            ):
+                raise ValueError("仅关联核验真题支持修改真题来源身份字段")
+            for field_name in source_identity_fields | {
+                "exam_name",
+                "exam_year",
+                "exam_date",
+                "paper",
+                "question_number",
+            }:
+                if field_name in normalized:
+                    normalized[field_name] = _as_text(normalized[field_name])
             if "question_type" in normalized:
                 parsed = parse_question_type(normalized["question_type"])
                 if parsed is None:
@@ -1128,6 +1149,9 @@ class LibraryService:
                 "answer",
                 "explanation",
                 "answer_source",
+                "source_name",
+                "source_url",
+                "source_locator",
                 "exam_name",
                 "exam_year",
                 "exam_date",
@@ -1171,6 +1195,9 @@ class LibraryService:
             "answer",
             "explanation",
             "answer_source",
+            "source_name",
+            "source_url",
+            "source_locator",
             "exam_name",
             "exam_year",
             "exam_date",
@@ -1193,6 +1220,24 @@ class LibraryService:
             if "subjects" in normalized:
                 normalized["subjects"] = _subjects(normalized["subjects"])
             if bundle.question is not None:
+                linked_real_question_id = (bundle.structured or {}).get(
+                    "verified_real_question_id"
+                )
+                source_identity_fields = {"source_name", "source_url", "source_locator"}
+                if (
+                    source_identity_fields & normalized.keys()
+                    and not linked_real_question_id
+                ):
+                    raise ValueError("仅关联核验真题支持修改真题来源身份字段")
+                for field_name in source_identity_fields | {
+                    "exam_name",
+                    "exam_year",
+                    "exam_date",
+                    "paper",
+                    "question_number",
+                }:
+                    if field_name in normalized:
+                        normalized[field_name] = _as_text(normalized[field_name])
                 if "question_type" in normalized:
                     parsed = parse_question_type(normalized["question_type"])
                     if parsed is None:

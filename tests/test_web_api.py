@@ -75,6 +75,10 @@ def test_web_api_routes_use_plugin_namespace():
         ("/astrbot_plugin_law_assistant/plans/prepare", "POST"),
         ("/astrbot_plugin_law_assistant/management/library-search", "GET"),
         ("/astrbot_plugin_law_assistant/management/library-update", "POST"),
+        ("/astrbot_plugin_law_assistant/management/real-questions", "GET"),
+        ("/astrbot_plugin_law_assistant/management/real-question", "GET"),
+        ("/astrbot_plugin_law_assistant/management/real-question-update", "POST"),
+        ("/astrbot_plugin_law_assistant/management/real-question-status", "POST"),
         ("/astrbot_plugin_law_assistant/management/batch-prepare", "POST"),
         ("/astrbot_plugin_law_assistant/management/clear-prepare", "POST"),
     }
@@ -339,6 +343,129 @@ async def test_web_plan_reset_preview_returns_current_and_global_plans(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_web_date_review_requires_explicit_boolean_confirmation(tmp_path):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from models import EventDate
+    from tests.fakes import make_event
+
+    storage = SQLiteStorage(tmp_path / "web-date-review.sqlite3")
+    event = make_event()
+    event = replace(
+        event,
+        dates=(
+            EventDate(
+                kind="registration_deadline",
+                datetime=datetime(2026, 10, 10, tzinfo=timezone.utc),
+                timezone="UTC",
+                label="报名截止",
+                evidence_text="报名截止：10月10日",
+                confirmed=False,
+                precision="date",
+            ),
+        ),
+    )
+    event_id = storage.upsert_event(event)
+    stored_date_id = storage.get_event(event_id).dates[0].id
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(timezone="UTC", operator_ids=["webui"]),
+    )
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        prepared = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/radar/date-review-prepare",
+            json={
+                "event_id": event_id,
+                "event_date_id": stored_date_id,
+                "proposed_datetime": "2026-10-11",
+                "reason": "人工确认合成测试证据",
+                "decision": "accepted",
+                "proposed_confirmed": True,
+            },
+        )
+        payload = await prepared.get_json()
+        assert payload["success"] is True
+        assert payload["data"]["old_value"]["confirmed"] is False
+        assert payload["data"]["proposed_value"]["confirmed"] is True
+
+        invalid = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/radar/date-review-prepare",
+            json={
+                "event_id": event_id,
+                "event_date_id": stored_date_id,
+                "proposed_datetime": "2026-10-11",
+                "reason": "拒绝字符串布尔值",
+                "decision": "accepted",
+                "proposed_confirmed": "yes",
+            },
+        )
+        invalid_payload = await invalid.get_json()
+        assert invalid_payload["success"] is False
+
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_batch_user_case_verification_rejects_official_identity_assignment(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    case_id = int(
+        storage.connection.execute(
+            "SELECT id FROM learning_items WHERE item_type='case'"
+        ).fetchone()[0]
+    )
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=[]),
+    )
+    app = _app_for(LawAssistantWebApi(service))
+
+    async with app.test_client() as client:
+        prepared_response = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/management/batch-prepare",
+            json={
+                "action": "verify_case",
+                "item_ids": [case_id],
+                "changes": {"verification_status": "user_verified"},
+            },
+        )
+        preview = await prepared_response.get_json()
+        assert preview["success"] is True
+        assert preview["data"]["items"][0]["identity"] == "user_case"
+        assert preview["data"]["items"][0]["verification_after"] == "user_verified"
+        confirmed = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/management/batch-confirm",
+            json={"token": preview["data"]["token"]},
+        )
+        assert (await confirmed.get_json())["success"] is True
+        malicious = await client.post(
+            "/api/plug/astrbot_plugin_law_assistant/management/batch-prepare",
+            json={
+                "action": "verify_case",
+                "item_ids": [case_id],
+                "changes": {"verification_status": "official_case"},
+            },
+        )
+        assert (await malicious.get_json())["success"] is False
+
+    stored = await ingestion.library_service.get_management_item(case_id)
+    assert stored["item"]["identity"] == "user_case"
+    assert stored["item"]["verification_status"] == "user_verified"
+    assert storage.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_web_api_rejects_invalid_library_update(tmp_path):
     service = _service(tmp_path)
     app = _app_for(LawAssistantWebApi(service))
@@ -353,6 +480,67 @@ async def test_web_api_rejects_invalid_library_update(tmp_path):
     assert response.status_code == 400
     assert payload["success"] is False
     assert payload["error"] == "invalid_update_field"
+    service.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_web_management_routes_control_independent_real_question_inventory(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    service.storage.import_real_questions(
+        [
+            {
+                "source_name": "Web 合成题库",
+                "exam_name": "Web 合成考试",
+                "subject": "criminal_law",
+                "question_type": "single_choice",
+                "stem": "Web 合成题干？",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "A",
+                "answer_source": "user_verified",
+                "verification_status": "user_verified",
+                "source_locator": "web-fixture:1",
+            }
+        ]
+    )
+    question_id = service.storage.list_real_questions(limit=None)[0].id
+    app = _app_for(LawAssistantWebApi(service))
+    base = "/api/plug/astrbot_plugin_law_assistant/management"
+
+    async with app.test_client() as client:
+        listed = await client.get(f"{base}/real-questions")
+        assert (await listed.get_json())["data"]["items"][0]["selectable"] is True
+        detail = await client.get(f"{base}/real-question?id={question_id}")
+        assert (await detail.get_json())["data"]["question"]["answer"] == "A"
+        changed = await client.post(
+            f"{base}/real-question-update",
+            json={
+                "question_id": question_id,
+                "changes": {"stem": "Web 合成题干已修订？"},
+            },
+        )
+        assert (await changed.get_json())["success"] is True
+        disabled = await client.post(
+            f"{base}/real-question-status",
+            json={"question_id": question_id, "active": False},
+        )
+        assert (await disabled.get_json())["data"]["question"]["selectable"] is False
+        invalid = await client.post(
+            f"{base}/real-question-status",
+            json={"question_id": question_id, "active": "false"},
+        )
+        assert invalid.status_code == 400
+        restored = await client.post(
+            f"{base}/real-question-status",
+            json={"question_id": question_id, "active": True},
+        )
+        assert (await restored.get_json())["data"]["question"]["selectable"] is True
+
+    assert (
+        service.storage.list_real_questions(limit=None)[0].stem
+        == "Web 合成题干已修订？"
+    )
     service.storage.close()
 
 

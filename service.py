@@ -825,7 +825,9 @@ class LawAssistantService:
     async def dashboard_overview(self) -> dict[str, Any]:
         """Build the bounded read model used by the embedded management page."""
         events = await self.list_events(limit=1000, radar_status="all")
-        radar_counts = {key: 0 for key in ("current", "needs_review", "historical")}
+        radar_counts = {
+            key: 0 for key in ("current", "needs_review", "historical", "ignored")
+        }
         for event in events:
             radar_counts[self._radar_status(event)] += 1
         learning = (
@@ -1375,9 +1377,15 @@ class LawAssistantService:
         event_type: str | None = None,
         keyword: str | None = None,
     ) -> list[LegalEvent]:
-        if radar_status not in {"current", "needs_review", "historical", "all"}:
+        if radar_status not in {
+            "current",
+            "needs_review",
+            "historical",
+            "ignored",
+            "all",
+        }:
             raise ValueError(
-                "radar_status 必须是 current、needs_review、historical 或 all"
+                "radar_status 必须是 current、needs_review、historical、ignored 或 all"
             )
         candidates = self.storage.list_events(limit=1000)
         result: list[LegalEvent] = []
@@ -1545,6 +1553,7 @@ class LawAssistantService:
         *,
         actor_id: str,
         decision: str = "accepted",
+        proposed_confirmed: bool | None = None,
     ) -> dict[str, Any]:
         if not self._management_actor_allowed(actor_id):
             return {
@@ -1555,6 +1564,8 @@ class LawAssistantService:
         normalized_decision = str(decision or "accepted").strip().lower()
         if normalized_decision not in {"accepted", "rejected"}:
             return {"ready": False, "reason": "复核决定必须是 accepted 或 rejected"}
+        if proposed_confirmed is not None and not isinstance(proposed_confirmed, bool):
+            return {"ready": False, "reason": "日期确认状态必须是布尔值"}
         normalized_reason = str(reason or "").strip()
         if not normalized_reason or len(normalized_reason) > 500:
             return {"ready": False, "reason": "请填写不超过 500 字的复核原因"}
@@ -1589,6 +1600,11 @@ class LawAssistantService:
             "datetime": parsed.isoformat(),
             "timezone": event_date.timezone,
             "label": event_date.label,
+            "confirmed": (
+                bool(proposed_confirmed)
+                if normalized_decision == "accepted" and proposed_confirmed is not None
+                else event_date.confirmed
+            ),
         }
         evidence_hash = hashlib.sha256(
             "\0".join(
@@ -1750,7 +1766,10 @@ class LawAssistantService:
     async def bind_target(
         self, unified_msg_origin: str, label: str = ""
     ) -> dict[str, Any]:
-        return self.storage.bind_target(unified_msg_origin, label)
+        target = self.storage.bind_target(unified_msg_origin, label)
+        if target.get("enabled"):
+            await self._wake_scheduler()
+        return target
 
     async def rename_target(self, selector: str, label: str) -> dict[str, Any]:
         needle = str(selector or "").strip()
@@ -1776,7 +1795,10 @@ class LawAssistantService:
         return self.storage.rename_target(matches[0]["id"], new_label)
 
     async def unbind_target(self, unified_msg_origin: str) -> bool:
-        return self.storage.unbind_target(unified_msg_origin)
+        unbound = self.storage.unbind_target(unified_msg_origin)
+        if unbound:
+            await self._wake_scheduler()
+        return unbound
 
     async def prepare_unbind_target(
         self, selector: str, *, actor_id: str | None = None
@@ -3062,6 +3084,78 @@ class LawAssistantService:
         kwargs["include_inactive"] = bool(kwargs.get("include_inactive", False))
         return await self.library_service.search_learning_library(**kwargs)
 
+    async def list_management_real_questions(self, *, actor_id: str) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        return {"success": True, "items": self.storage.list_managed_real_questions()}
+
+    async def get_management_real_question(
+        self, question_id: int, *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        question = self.storage.get_managed_real_question(int(question_id))
+        if question is None:
+            return {"success": False, "error": "not_found", "message": "未找到核验真题"}
+        return {"success": True, "question": question}
+
+    async def update_management_real_question(
+        self, question_id: int, changes: dict[str, Any], *, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        try:
+            question = self.storage.update_independent_real_question(
+                int(question_id), changes
+            )
+        except (TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": "invalid_real_question",
+                "message": str(exc),
+            }
+        self._audit_operator_action(
+            actor_id, "real_question_updated", [int(question_id)], scope="real_question"
+        )
+        return {"success": True, "question": question}
+
+    async def set_management_real_question_active(
+        self, question_id: int, *, active: bool, actor_id: str
+    ) -> dict[str, Any]:
+        if not self._management_actor_allowed(actor_id):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "需要 operator/Admin 权限",
+            }
+        try:
+            question = self.storage.set_independent_real_question_active(
+                int(question_id), active=bool(active)
+            )
+        except (TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": "invalid_real_question",
+                "message": str(exc),
+            }
+        action = "real_question_restored" if active else "real_question_disabled"
+        self._audit_operator_action(
+            actor_id, action, [int(question_id)], scope="real_question"
+        )
+        return {"success": True, "question": question}
+
     async def get_learning_item(self, item_id: int) -> dict[str, Any]:
         if self.library_service is None:
             return {
@@ -3174,10 +3268,23 @@ class LawAssistantService:
                 "validation_failures", []
             )
             changes_value: dict[str, Any] = {}
-        elif normalized_action in {"edit", "delete", "restore"}:
-            changes_value = dict(changes or {}) if normalized_action == "edit" else {}
+        elif normalized_action in {"edit", "delete", "restore", "verify_case"}:
+            changes_value = (
+                dict(changes or {})
+                if normalized_action in {"edit", "verify_case"}
+                else {}
+            )
             if normalized_action == "edit" and not changes_value:
                 return {"ready": False, "reason": "编辑操作需要至少一个字段"}
+            if normalized_action == "verify_case" and (
+                set(changes_value) != {"verification_status"}
+                or changes_value.get("verification_status")
+                not in {"unverified", "user_verified"}
+            ):
+                return {
+                    "ready": False,
+                    "reason": "用户案例状态必须选择 unverified 或 user_verified",
+                }
             expected: dict[int, dict[str, Any]] = {}
             preview_list: list[dict[str, Any]] = []
             normalized_changes: list[dict[str, Any]] = []
@@ -3187,6 +3294,15 @@ class LawAssistantService:
                 if bundle is None:
                     return {"ready": False, "reason": f"未找到资料 {item_id}"}
                 item = bundle.item
+                if normalized_action == "verify_case" and (
+                    item.item_type != "case" or item.identity != "user_case"
+                ):
+                    return {
+                        "ready": False,
+                        "reason": "批量核验只支持 user_case，不能手动设置 official_case",
+                    }
+                if normalized_action == "verify_case" and not item.active:
+                    return {"ready": False, "reason": f"用户案例 {item_id} 已停用"}
                 if normalized_action == "delete" and not item.active:
                     return {"ready": False, "reason": f"资料 {item_id} 已停用"}
                 if normalized_action == "restore" and item.active:
@@ -3208,12 +3324,24 @@ class LawAssistantService:
                     "identity": item.identity,
                     "item_type": item.item_type,
                 }
+                if normalized_action == "verify_case":
+                    expected[item_id]["verification_status"] = item.verification_status
                 preview_list.append(
                     {
                         "id": item_id,
                         "title": item.title,
                         "identity": item.identity,
                         "active": item.active,
+                        **(
+                            {
+                                "verification_before": item.verification_status,
+                                "verification_after": changes_value[
+                                    "verification_status"
+                                ],
+                            }
+                            if normalized_action == "verify_case"
+                            else {}
+                        ),
                     }
                 )
             if normalized_action == "edit":
@@ -3621,7 +3749,12 @@ class LawAssistantService:
         return {"success": True, "changed_ids": changed, "count": len(changed)}
 
     def _audit_operator_action(
-        self, actor_id: str, action: str, ids: list[int]
+        self,
+        actor_id: str,
+        action: str,
+        ids: list[int],
+        *,
+        scope: str = "learning_item",
     ) -> None:
         with self.storage.connection:
             self.storage.connection.execute(
@@ -3630,7 +3763,7 @@ class LawAssistantService:
                 (
                     str(actor_id),
                     action,
-                    "learning_item",
+                    str(scope),
                     json.dumps(ids),
                     json.dumps({"count": len(ids)}),
                     self._now_utc().isoformat(),
