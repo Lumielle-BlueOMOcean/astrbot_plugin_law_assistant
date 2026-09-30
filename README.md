@@ -4,7 +4,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 插件版本 | 0.6.0（发布候选代码；本轮不创建 tag/Release） |
+| 插件版本 | 0.6.0（正式发布） |
 | 数据库 schema | 13 |
 | 仓库 | [Lumielle-BlueOMOcean/astrbot_plugin_law_assistant](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant) |
 | AstrBot | >=4.22.0,<5；嵌入式 Plugin Page 需 >=4.25.0 |
@@ -520,7 +520,7 @@ AstrBot 4.25 还可执行：
 
     python scripts/build_release.py --output dist
 
-ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、缓存、SQLite、日志、虚拟环境和常见凭据文件。当前 CI workflow 在 main push 与 pull request 运行 5 个 required jobs：Quality / Unit、AstrBot compatibility (4.22.0)、AstrBot compatibility (4.25.0)、Release package smoke (4.22.0)、Release package smoke (4.25.0)。release jobs 从最终提交构建/解压 ZIP 并执行包内编译和 loader smoke；4.25 还执行 Page discovery/API route smoke，生成名为 astrbot_plugin_law_assistant-0.6.0 的 artifact。具体运行结果需以该 commit 的 Actions 页面为准；本轮不创建 tag 或 GitHub Release。
+ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、缓存、SQLite、日志、虚拟环境和常见凭据文件。当前 CI workflow 在 main push 与 pull request 运行 5 个 required jobs：Quality / Unit、AstrBot compatibility (4.22.0)、AstrBot compatibility (4.25.0)、Release package smoke (4.22.0)、Release package smoke (4.25.0)。release jobs 从最终提交构建/解压 ZIP 并执行包内编译和 loader smoke；4.25 还执行 Page discovery/API route smoke，生成名为 astrbot_plugin_law_assistant-0.6.0 的 artifact。正式发布以通过 exact-SHA CI 的提交创建 v0.6.0 tag 与 GitHub Release，并使用该提交对应 CI 产物作为发布包；具体运行结果以该 commit 的 Actions 页面为准。
 
 回归 fixture 不得包含真实题库正文、凭据或生产数据库。真实 QQ/NapCat、真实模型自然语言稳定性、Windows 本机 AstrBot 部署、官网当前实时可用性、用户真题版权及逐题内容质量，需要分别在有授权的实际环境验收；上述本地/CI 测试不能代替它们。
 
@@ -537,9 +537,9 @@ ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、
 | 0.5.0 | d45ace225b5229194cff3d936a7dfac78d8dc906 |
 | 0.5.1 | cfbb5817cf8bd26a7afe263acfb8f7509f9ecfe4 |
 | 0.5.2 | d4b2ddf3f1fdab76043144b7acdf44a82ad5733c |
-| 0.6.0 | 本轮发布候选实现提交；未创建 tag/Release |
+| 0.6.0 | 3c3c70077fc0901883b0f156d7f743ab85ec89d1 |
 
-### 0.6.0 — Release Candidate
+### 0.6.0 — 2026-09-30
 
 **新增**
 
@@ -569,7 +569,7 @@ ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、
 
 - schema 12 → 13，保留 v12 已有数据；升级前备份数据库及 WAL/SHM。
 - AstrBot CI 兼容目标保持 4.22.0 与 4.25.0；Plugin Page 仍仅由 4.25+ 宿主提供。
-- 本地测试/CI 不等同于真实 QQ/NapCat、Windows 主机、真实 LLM provider 或官网持续可用验收；本版本未创建 tag/Release。
+- 本地测试/CI 不等同于真实 QQ/NapCat、Windows 主机、真实 LLM provider 或官网持续可用验收；正式发布以 `v0.6.0` tag/GitHub Release 固定通过 exact-SHA 审查与 CI 的发布提交。
 
 ### 0.5.2 — 2026-09-27
 
