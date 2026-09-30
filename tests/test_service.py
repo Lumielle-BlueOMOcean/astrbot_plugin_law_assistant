@@ -1736,6 +1736,288 @@ async def test_verified_linked_question_identity_collision_rolls_back_both_views
 
 
 @pytest.mark.asyncio
+async def test_linked_question_batch_subject_edit_updates_verified_inventory(tmp_path):
+    storage, service, item_id, provider = await _promoted_synthetic_question(tmp_path)
+    preview = await service.prepare_library_batch(
+        "edit",
+        [item_id],
+        actor_id="operator-1",
+        changes={"subjects": ["criminal_law"]},
+    )
+    assert preview["ready"] is True
+    result = await service.confirm_library_batch(
+        preview["token"], actor_id="operator-1"
+    )
+    assert result["success"] is True
+    selected = await provider.select_question(origin="real", subject="criminal_law")
+    assert selected["available"] is True
+    assert (
+        storage.list_real_questions(subject="criminal_law", limit=None)[0].subject
+        == "criminal_law"
+    )
+    assert (
+        await provider.select_question(origin="real", subject="intellectual_property")
+    )["available"] is False
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_linked_question_update_synchronizes_subject_and_explanation(
+    tmp_path,
+):
+    storage, service, item_id, provider = await _promoted_synthetic_question(tmp_path)
+    result = await service.update_learning_item(
+        item_id,
+        {"subjects": ["criminal_law"], "explanation": "统一更新的合成解析。"},
+    )
+    assert result["success"] is True
+    selected = await provider.select_question(origin="real", subject="criminal_law")
+    assert selected["available"] is True
+    assert selected["content"]["explanation"] == "统一更新的合成解析。"
+    assert (
+        await provider.select_question(origin="real", subject="intellectual_property")
+    )["available"] is False
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_linked_question_edit_updates_all_normalized_projections_atomically(
+    tmp_path,
+):
+    storage, service, first_id, provider = await _promoted_synthetic_question(tmp_path)
+    first_binding = storage.connection.execute(
+        "SELECT * FROM structured_item_bindings WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+        (first_id,),
+    ).fetchone()
+    second = await service.library_service.archive_learning_material(
+        raw_text="第二份合成来源中的同一真题。",
+        material_type="real_question_candidate",
+        title="第二投影",
+        subjects=["intellectual_property"],
+        structured_json={
+            "question_type": "single_choice",
+            "stem": service.library_service.repository.get(first_id).question.stem,
+            "options": list(
+                service.library_service.repository.get(first_id).question.options
+            ),
+            "answer": service.library_service.repository.get(first_id).question.answer,
+            "answer_source": "user_verified",
+            "exam_name": "合成考试",
+            "exam_year": service.library_service.repository.get(
+                first_id
+            ).question.exam_year,
+            "paper": service.library_service.repository.get(first_id).question.paper,
+            "question_number": service.library_service.repository.get(
+                first_id
+            ).question.question_number,
+        },
+        created_by="operator-1",
+        session_origin="private:operator-1",
+    )
+    second_id = second["item_id"]
+    storage.connection.execute(
+        "UPDATE learning_items SET identity='verified_real_question', verification_status='verified' WHERE id=?",
+        (second_id,),
+    )
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name='合成考试', exam_year=?, paper=?, question_number=? WHERE item_id=?",
+        (
+            service.library_service.repository.get(first_id).question.exam_year,
+            service.library_service.repository.get(first_id).question.paper,
+            service.library_service.repository.get(first_id).question.question_number,
+            second_id,
+        ),
+    )
+    storage.connection.execute(
+        "INSERT INTO structured_item_bindings(import_id,item_id,external_id,source_number,item_kind,structure_version,review_status,payload_json,metadata_json,verified_real_question_id,promoted_by,promoted_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            first_binding["import_id"],
+            second_id,
+            "second-projection",
+            "Q2",
+            "question",
+            first_binding["structure_version"],
+            "resolved",
+            first_binding["payload_json"],
+            first_binding["metadata_json"],
+            first_binding["verified_real_question_id"],
+            "operator-1",
+            "2026-09-30T00:00:00+00:00",
+        ),
+    )
+    storage.connection.commit()
+    original_binding_payload = storage.connection.execute(
+        "SELECT payload_json FROM structured_item_bindings WHERE item_id=?",
+        (first_id,),
+    ).fetchone()[0]
+    original_source_rows = [
+        tuple(row)
+        for row in storage.connection.execute(
+            "SELECT s.id,s.raw_text,s.source_url,s.content_hash FROM library_sources s "
+            "JOIN learning_item_sources x ON x.source_id=s.id WHERE x.item_id=? ORDER BY s.id",
+            (first_id,),
+        ).fetchall()
+    ]
+
+    updated = await service.update_management_learning_item(
+        first_id,
+        {"subjects": ["criminal_law"], "stem": "两个投影共同更新的题干？"},
+        actor_id="operator-1",
+    )
+    assert updated["success"] is True
+    first = service.library_service.repository.get(first_id)
+    second = service.library_service.repository.get(second_id)
+    assert first.question.stem == second.question.stem == "两个投影共同更新的题干？"
+    assert first.item.subjects == second.item.subjects == ("criminal_law",)
+    assert (
+        storage.connection.execute(
+            "SELECT payload_json FROM structured_item_bindings WHERE item_id=? ORDER BY id DESC LIMIT 1",
+            (first_id,),
+        ).fetchone()[0]
+        == original_binding_payload
+    )
+    assert [
+        tuple(row)
+        for row in storage.connection.execute(
+            "SELECT s.id,s.raw_text,s.source_url,s.content_hash FROM library_sources s "
+            "JOIN learning_item_sources x ON x.source_id=s.id WHERE x.item_id=? ORDER BY s.id",
+            (first_id,),
+        ).fetchall()
+    ] == original_source_rows
+    selected = await provider.select_question(origin="real", subject="criminal_law")
+    assert selected["content"]["question"] == "两个投影共同更新的题干？"
+
+    current_real = storage.list_real_questions(limit=None)[0]
+    collision = current_real.to_mapping()
+    collision.update(
+        {
+            "exam_year": "2099",
+            "paper": "共享投影冲突卷",
+            "question_number": "99",
+        }
+    )
+    storage.import_real_questions([collision])
+    before_first = service.library_service.repository.get(first_id)
+    before_second = service.library_service.repository.get(second_id)
+    rejected = await service.update_management_learning_item(
+        first_id,
+        {
+            "exam_year": "2099",
+            "paper": "共享投影冲突卷",
+            "question_number": "99",
+        },
+        actor_id="operator-1",
+    )
+    assert rejected["success"] is False
+    assert "冲突" in rejected["message"] or "已存在" in rejected["message"]
+    after_first = service.library_service.repository.get(first_id)
+    after_second = service.library_service.repository.get(second_id)
+    assert after_first.question == before_first.question
+    assert after_second.question == before_second.question
+    assert after_first.item.subjects == before_first.item.subjects
+    assert after_second.item.subjects == before_second.item.subjects
+    unchanged_real = next(
+        question
+        for question in storage.list_real_questions(limit=None)
+        if question.id == current_real.id
+    )
+    assert unchanged_real.exam_year == current_real.exam_year
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_promotion_rejects_truth_edit_after_preview_and_repreview_succeeds(
+    tmp_path,
+):
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    item_id = int(
+        storage.connection.execute(
+            "SELECT id FROM learning_items WHERE identity='real_question_candidate'"
+        ).fetchone()[0]
+    )
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name='合成考试' WHERE item_id=?", (item_id,)
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+    original_updated_at = service.library_service.repository.get(
+        item_id
+    ).item.updated_at
+    stale = await service.prepare_candidate_promotion([item_id], actor_id="operator-1")
+    edited = await service.update_management_learning_item(
+        item_id,
+        {"stem": "复核后修订的新合成题干？", "explanation": "新解释"},
+        actor_id="operator-1",
+    )
+    assert edited["success"] is True
+    assert (
+        service.library_service.repository.get(item_id).item.updated_at
+        > original_updated_at
+    )
+    rejected = await service.confirm_candidate_promotion(
+        stale["token"], actor_id="operator-1"
+    )
+    assert rejected["success"] is False
+    assert storage.list_real_questions(limit=None) == []
+    fresh = await service.prepare_candidate_promotion([item_id], actor_id="operator-1")
+    accepted = await service.confirm_candidate_promotion(
+        fresh["token"], actor_id="operator-1"
+    )
+    assert accepted["success"] is True
+    assert storage.list_real_questions(limit=None)[0].stem == "复核后修订的新合成题干？"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_promotion_truth_fingerprint_catches_normalized_row_change(
+    tmp_path,
+):
+    from tests.test_structured_ingestion import _prepare_service
+
+    storage, ingestion, prepared, _ = await _prepare_service(tmp_path)
+    await ingestion.confirm(prepared)
+    item_id = int(
+        storage.connection.execute(
+            "SELECT id FROM learning_items WHERE identity='real_question_candidate'"
+        ).fetchone()[0]
+    )
+    storage.connection.execute(
+        "UPDATE learning_questions SET exam_name='合成考试' WHERE item_id=?", (item_id,)
+    )
+    storage.connection.commit()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+    )
+    preview = await service.prepare_candidate_promotion(
+        [item_id],
+        actor_id="operator-1",
+        overrides_by_id={str(item_id): {"stem": "预览时覆盖的合成题干？"}},
+    )
+    storage.connection.execute(
+        "UPDATE learning_questions SET explanation='直接变更的合成解析' WHERE item_id=?",
+        (item_id,),
+    )
+    storage.connection.commit()
+    result = await service.confirm_candidate_promotion(
+        preview["token"], actor_id="operator-1"
+    )
+    assert result["success"] is False
+    assert "规范化真题内容" in result["results"][0]["reason"]
+    assert storage.list_real_questions(limit=None) == []
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_independent_real_question_has_authorized_edit_disable_and_restore_path(
     tmp_path,
 ):

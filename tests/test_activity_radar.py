@@ -214,6 +214,52 @@ async def test_radar_override_and_date_review_are_confirmed_audited_and_evidence
 
 
 @pytest.mark.asyncio
+async def test_second_date_review_token_is_rejected_after_first_changes_old_value(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "radar-double-review.sqlite3")
+    event = _event()
+    event.dates = (
+        EventDate(
+            kind="registration_deadline",
+            datetime=datetime(2026, 9, 30, tzinfo=ZONE),
+            timezone="Asia/Shanghai",
+            label="报名截止",
+            evidence_text="报名截止：9月30日",
+            confirmed=False,
+            precision="date",
+        ),
+    )
+    event_id = storage.upsert_event(event)
+    service = LawAssistantService(
+        storage,
+        config=SimpleNamespace(operator_ids=["operator-1"]),
+        clock=lambda: datetime(2026, 9, 20, tzinfo=ZONE),
+    )
+    date_id = storage.get_event(event_id).dates[0].id
+    first = await service.prepare_event_date_review(
+        event_id, date_id, "2026-10-01", "合成复核 A", actor_id="operator-1"
+    )
+    second = await service.prepare_event_date_review(
+        event_id, date_id, "2026-10-02", "合成复核 B", actor_id="operator-1"
+    )
+    accepted = await service.confirm_event_date_review(
+        first["token"], actor_id="operator-1"
+    )
+    stale = await service.confirm_event_date_review(
+        second["token"], actor_id="operator-1"
+    )
+    assert accepted["success"] is True
+    assert stale["success"] is False
+    assert "重新预览" in stale["reason"]
+    assert (
+        storage.get_event(event_id).dates[0].datetime.date().isoformat() == "2026-10-01"
+    )
+    assert len(storage.list_event_date_reviews()) == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_status_override_does_not_confirm_deadline_but_explicit_date_review_does(
     tmp_path,
 ):

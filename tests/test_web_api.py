@@ -545,6 +545,50 @@ async def test_web_management_routes_control_independent_real_question_inventory
 
 
 @pytest.mark.asyncio
+async def test_management_real_questions_api_uses_bounded_pagination(tmp_path):
+    service = _service(tmp_path)
+    service.storage.import_real_questions(
+        [
+            {
+                "source_name": "分页合成题库",
+                "exam_name": "分页合成考试",
+                "exam_year": "2098",
+                "paper": "分页卷",
+                "question_number": f"第{i}题",
+                "source_locator": f"fixture:{i}",
+                "subject": "criminal_law",
+                "question_type": "single_choice",
+                "stem": f"分页合成题干 {i}？",
+                "options": ["A. 甲", "B. 乙"],
+                "answer": "A",
+                "answer_source": "user_verified",
+                "verification_status": "user_verified",
+            }
+            for i in range(25)
+        ]
+    )
+    app = _app_for(LawAssistantWebApi(service))
+    async with app.test_client() as client:
+        first = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/management/real-questions?page=1&page_size=20"
+        )
+        second = await client.get(
+            "/api/plug/astrbot_plugin_law_assistant/management/real-questions?page=2&page_size=20"
+        )
+        first_data = (await first.get_json())["data"]
+        second_data = (await second.get_json())["data"]
+    assert len(first_data["items"]) == 20
+    assert first_data["page"] == 1 and first_data["page_count"] == 2
+    assert first_data["total"] == 25
+    assert len(second_data["items"]) == 5
+    assert second_data["page"] == 2 and second_data["page_count"] == 2
+    assert {item["id"] for item in first_data["items"]}.isdisjoint(
+        {item["id"] for item in second_data["items"]}
+    )
+    service.storage.close()
+
+
+@pytest.mark.asyncio
 async def test_web_library_question_detail_and_update_are_answer_safe(tmp_path):
     service = _service(tmp_path)
     archived = await service.library_service.archive_learning_material(

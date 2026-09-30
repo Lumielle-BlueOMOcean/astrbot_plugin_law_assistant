@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -1710,6 +1711,38 @@ class SQLiteStorage:
                 or str(date_row["evidence_text"]) != str(evidence_text)
             ):
                 raise ValueError("活動來源或日期證據已變化，請重新預覽")
+            current_value = {
+                "kind": str(date_row["kind"]),
+                "datetime": date_row["datetime"],
+                "timezone": str(date_row["timezone"]),
+                "label": str(date_row["label"]),
+                "confirmed": bool(date_row["confirmed"]),
+                "precision": _stored_date_precision(
+                    date_row["datetime"], str(date_row["evidence_text"] or "")
+                ),
+            }
+            expected_value = {
+                "kind": str(old_value.get("kind") or ""),
+                "datetime": old_value.get("datetime"),
+                "timezone": str(old_value.get("timezone") or ""),
+                "label": str(old_value.get("label") or ""),
+                "confirmed": bool(old_value.get("confirmed", False)),
+                "precision": str(old_value.get("precision") or ""),
+            }
+            current_evidence_hash = hashlib.sha256(
+                "\0".join(
+                    (
+                        str(event["raw_content_hash"]),
+                        str(event_date_id),
+                        current_value["kind"],
+                        str(date_row["evidence_text"]),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if current_value != expected_value or current_evidence_hash != str(
+                evidence_hash
+            ):
+                raise ValueError("日期节点在预览后已变化，请重新预览")
             old_json = json.dumps(old_value, ensure_ascii=False, sort_keys=True)
             proposed_json = json.dumps(
                 proposed_value, ensure_ascii=False, sort_keys=True
@@ -2713,16 +2746,25 @@ class SQLiteStorage:
         ).fetchall()
         return [_real_question_from_row(row) for row in rows]
 
-    def list_managed_real_questions(self) -> list[dict[str, Any]]:
-        """Return full verified-inventory records for an authorized management view."""
+    def list_managed_real_questions(
+        self, *, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return one bounded page for the authorized management view."""
         rows = self._connection.execute(
-            "SELECT * FROM real_questions ORDER BY id"
+            "SELECT * FROM real_questions ORDER BY id LIMIT ? OFFSET ?",
+            (max(1, min(int(limit), 100)), max(0, int(offset))),
         ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             record = self._managed_real_question_dict(row)
             result.append(record)
         return result
+
+    def count_managed_real_questions(self) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS count FROM real_questions"
+        ).fetchone()
+        return int(row["count"])
 
     def get_managed_real_question(self, question_id: int) -> dict[str, Any] | None:
         row = self._connection.execute(

@@ -490,8 +490,15 @@ class LawAssistantWebApi:
         )
 
     async def management_real_questions(self) -> Any:
+        try:
+            page = _int_arg(request.args.get("page", "1"), "page")
+            page_size = _int_arg(request.args.get("page_size", "20"), "page_size")
+        except ValueError as exc:
+            return _error("invalid_parameter", str(exc))
         return _service_payload(
-            await self.service.list_management_real_questions(actor_id="webui")
+            await self.service.list_management_real_questions(
+                actor_id="webui", page=page, page_size=page_size
+            )
         )
 
     async def management_real_question(self) -> Any:

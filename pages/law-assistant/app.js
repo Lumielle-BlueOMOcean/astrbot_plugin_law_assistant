@@ -343,10 +343,11 @@ async function renderRealQuestions(view, generation = state.renderGeneration, ro
   const result = node("div");
   view.append(sectionTitle("核验真题库存", "独立导入的真题可在此查看、修订校验、停用或恢复；关联结构化候选请从资料条目管理，以保持两侧一致。"), result);
   try {
-    const data = await apiGet("management/real-questions");
+    const pageState = state.pages.realQuestions || { page: 1, page_size: 20 };
+    const data = await apiGet("management/real-questions", pageState);
     if (!isCurrent(generation, route)) return;
     const items = data.items || [];
-    result.append(node("p", `库存记录 ${items.length} 条；当前可用于真题检索 ${items.filter((item) => item.selectable).length} 条。`, "muted"));
+    result.append(node("p", `库存记录 ${data.total ?? items.length} 条；本页 ${items.length} 条，其中当前可用于真题检索 ${items.filter((item) => item.selectable).length} 条。`, "muted"));
     result.append(table(items, [
       ["id", "ID"], ["source_name", "来源"], ["exam_name", "考试"], ["exam_year", "年份"],
       ["subject", "方向", (row) => node("span", subjectLabel(row.subject))],
@@ -358,6 +359,13 @@ async function renderRealQuestions(view, generation = state.renderGeneration, ro
       await renderRealQuestionDetail(panel, row.id, generation, route);
       result.append(panel);
     })));
+    result.append(renderPager(data, async (page) => {
+      state.pages.realQuestions = { page, page_size: pageState.page_size };
+      await renderLibrary();
+    }, async (pageSize) => {
+      state.pages.realQuestions = { page: 1, page_size: pageSize };
+      await renderLibrary();
+    }));
   } catch (error) {
     if (isCurrent(generation, route)) result.append(node("p", error.message, "error-text"));
   }

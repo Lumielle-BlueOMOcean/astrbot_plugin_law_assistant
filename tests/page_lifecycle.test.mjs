@@ -362,6 +362,32 @@ test("independent verified-question inventory supports edit and confirmed disabl
   assert.equal(posts[1].body.active, false);
 });
 
+test("verified-question inventory requests and renders server pagination", async () => {
+  const { bridge, elements, page } = await loadPage();
+  const requests = [];
+  bridge.apiGet = async (endpoint, params = {}) => {
+    if (endpoint !== "management/real-questions") throw new Error(`unexpected GET ${endpoint}`);
+    requests.push({ endpoint, params });
+    const current = Number(params.page || 1);
+    return {
+      items: [{ id: current, source_name: `页 ${current}`, selectable: true, linked_item_ids: [] }],
+      page: current, page_size: 20, total: 21, page_count: 2,
+    };
+  };
+  page.state.route = "library";
+  page.state.libraryTab = "real-questions";
+  page.state.renderGeneration = 1;
+  const view = elements.get("view-library");
+  await page.renderRealQuestions(view, 1, "library");
+  assert.equal(requests[0].params.page, 1);
+  const next = findElement(view, (element) => element.tagName === "BUTTON" && element.textContent === "下一页");
+  assert.ok(next);
+  await next.listeners.click();
+  assert.equal(requests.at(-1).params.page, 2);
+  assert.equal(requests.at(-1).params.page_size, 20);
+  assert.match(textOf(view), /页 2/);
+});
+
 test("library detail expands inline, toggles, switches rows, and saves in place", async () => {
   const { bridge, elements, page } = await loadPage();
   const updates = [];

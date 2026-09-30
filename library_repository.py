@@ -37,6 +37,25 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+_LINKED_REAL_QUESTION_FIELDS = {
+    "source_name",
+    "source_url",
+    "source_locator",
+    "exam_name",
+    "exam_year",
+    "exam_date",
+    "paper",
+    "question_number",
+    "subjects",
+    "question_type",
+    "stem",
+    "options",
+    "answer",
+    "explanation",
+    "answer_source",
+}
+
+
 def _parse_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -1448,6 +1467,10 @@ class LibraryRepository:
             ).fetchone()
             if row is None:
                 return None
+            if _LINKED_REAL_QUESTION_FIELDS.intersection(changes):
+                linked = self._linked_real_question_id(item_id)
+                if linked is not None:
+                    self._synchronize_linked_real_question(linked, changes)
             item_updates: list[str] = []
             params: list[Any] = []
             if "title" in changes:
@@ -1519,13 +1542,12 @@ class LibraryRepository:
             bundle = self.get(int(item_id))
             if bundle is None:
                 return None
-            linked_real_question_id = (
-                (bundle.structured or {}).get("verified_real_question_id")
-                if bundle.question is not None
-                else None
-            )
-            if linked_real_question_id is not None:
-                self._update_linked_real_question(int(linked_real_question_id), changes)
+            linked_real_question_id = self._linked_real_question_id(int(item_id))
+            if (
+                linked_real_question_id is not None
+                and _LINKED_REAL_QUESTION_FIELDS.intersection(changes)
+            ):
+                self._synchronize_linked_real_question(linked_real_question_id, changes)
             updates: list[str] = []
             values: list[Any] = []
             if "title" in changes:
@@ -1542,14 +1564,13 @@ class LibraryRepository:
                         metadata[field] = str(changes[field])
                 updates.append("metadata_json = ?")
                 values.append(_json(metadata))
-            if updates:
-                updates.append("updated_at = ?")
-                values.append(datetime.now().astimezone().isoformat())
-                values.append(int(item_id))
-                self.connection.execute(
-                    f"UPDATE learning_items SET {', '.join(updates)} WHERE id = ?",
-                    values,
-                )
+            updates.append("updated_at = ?")
+            values.append(datetime.now().astimezone().isoformat())
+            values.append(int(item_id))
+            self.connection.execute(
+                f"UPDATE learning_items SET {', '.join(updates)} WHERE id = ?",
+                values,
+            )
             if bundle.question is not None:
                 q_fields = {
                     "question_type": "question_type",
@@ -1612,9 +1633,64 @@ class LibraryRepository:
                     )
         return self.get(int(item_id))
 
-    def _update_linked_real_question(
+    def _linked_real_question_id(self, item_id: int) -> int | None:
+        row = self.connection.execute(
+            "SELECT verified_real_question_id FROM structured_item_bindings "
+            "WHERE item_id = ? AND verified_real_question_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (int(item_id),),
+        ).fetchone()
+        return int(row["verified_real_question_id"]) if row else None
+
+    def _synchronize_linked_real_question(
         self, real_question_id: int, changes: dict[str, Any]
     ) -> None:
+        """Atomically update canonical truth and every normalized linked projection."""
+        normalized = self._update_linked_real_question(real_question_id, changes)
+        projection_fields = {
+            "question_type": normalized.question_type,
+            "stem": normalized.stem,
+            "options_json": _json(normalized.options),
+            "answer_json": _json(normalized.answer)
+            if normalized.answer is not None
+            else None,
+            "explanation": normalized.explanation,
+            "answer_source": normalized.answer_source,
+            "exam_name": normalized.exam_name,
+            "exam_year": normalized.exam_year,
+            "exam_date": normalized.exam_date,
+            "paper": normalized.paper,
+            "question_number": normalized.question_number,
+        }
+        linked_ids = [
+            int(row["item_id"])
+            for row in self.connection.execute(
+                "SELECT item_id FROM structured_item_bindings "
+                "WHERE verified_real_question_id = ? ORDER BY item_id",
+                (int(real_question_id),),
+            ).fetchall()
+        ]
+        if not linked_ids:
+            raise ValueError("关联核验真题已没有资料投影，未保存任何更改")
+        assignments = ", ".join(f"{column} = ?" for column in projection_fields)
+        placeholders = ",".join("?" for _ in linked_ids)
+        self.connection.execute(
+            f"UPDATE learning_questions SET {assignments} WHERE item_id IN ({placeholders})",
+            [*projection_fields.values(), *linked_ids],
+        )
+        self.connection.execute(
+            f"UPDATE learning_items SET subjects_json = ?, updated_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [
+                _json([normalized.subject]),
+                datetime.now().astimezone().isoformat(),
+                *linked_ids,
+            ],
+        )
+
+    def _update_linked_real_question(
+        self, real_question_id: int, changes: dict[str, Any]
+    ) -> RealQuestion:
         row = self.connection.execute(
             "SELECT * FROM real_questions WHERE id = ?", (real_question_id,)
         ).fetchone()
@@ -1707,6 +1783,7 @@ class LibraryRepository:
                 real_question_id,
             ),
         )
+        return normalized
 
     def soft_delete_items(
         self, item_ids: list[int], *, actor_id: str, at: str
@@ -1778,6 +1855,7 @@ class LibraryRepository:
         with self.connection:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
+                rows_by_id: dict[int, sqlite3.Row] = {}
                 for item_id in ids:
                     row = self.connection.execute(
                         "SELECT item_hash, updated_at, active, identity, item_type, verification_status, metadata_json "
@@ -1809,6 +1887,9 @@ class LibraryRepository:
                         )
                     ):
                         raise ValueError(f"资料 {item_id} 在预览后发生变化")
+                    rows_by_id[item_id] = row
+                for item_id in ids:
+                    row = rows_by_id[item_id]
                     if action == "verify_case":
                         if row["item_type"] != "case" or row["identity"] != "user_case":
                             raise ValueError("批量核验只支持 user_case")
@@ -1837,6 +1918,16 @@ class LibraryRepository:
                             (str(at), item_id),
                         )
                     else:
+                        linked_real_question_id = self._linked_real_question_id(item_id)
+                        if (
+                            linked_real_question_id is not None
+                            and _LINKED_REAL_QUESTION_FIELDS.intersection(
+                                normalized_changes
+                            )
+                        ):
+                            self._synchronize_linked_real_question(
+                                linked_real_question_id, normalized_changes
+                            )
                         metadata = json.loads(row["metadata_json"] or "{}")
                         for key in ("note", "body"):
                             if key in normalized_changes:

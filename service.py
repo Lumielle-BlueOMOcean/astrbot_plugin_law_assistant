@@ -3084,14 +3084,34 @@ class LawAssistantService:
         kwargs["include_inactive"] = bool(kwargs.get("include_inactive", False))
         return await self.library_service.search_learning_library(**kwargs)
 
-    async def list_management_real_questions(self, *, actor_id: str) -> dict[str, Any]:
+    async def list_management_real_questions(
+        self, *, actor_id: str, page: int = 1, page_size: int = 20
+    ) -> dict[str, Any]:
         if not self._management_actor_allowed(actor_id):
             return {
                 "success": False,
                 "error": "forbidden",
                 "message": "需要 operator/Admin 权限",
             }
-        return {"success": True, "items": self.storage.list_managed_real_questions()}
+        try:
+            normalized_page, normalized_size, offset = page_request(page, page_size)
+        except ValueError as exc:
+            return {
+                "success": False,
+                "error": "invalid_pagination",
+                "message": str(exc),
+            }
+        return {
+            "success": True,
+            **page_payload(
+                self.storage.list_managed_real_questions(
+                    limit=normalized_size, offset=offset
+                ),
+                page=normalized_page,
+                page_size=normalized_size,
+                total=self.storage.count_managed_real_questions(),
+            ),
+        }
 
     async def get_management_real_question(
         self, question_id: int, *, actor_id: str
@@ -3770,6 +3790,88 @@ class LawAssistantService:
                 ),
             )
 
+    @staticmethod
+    def _candidate_promotion_question(
+        bundle: Any, item_id: int, override: dict[str, Any]
+    ) -> RealQuestion:
+        """Rebuild the canonical promotion candidate from persisted normalized data."""
+        source = bundle.sources[0] if bundle.sources else None
+        source_link = bundle.source_links[0] if bundle.source_links else None
+        question = bundle.question
+        answer_source = question.answer_source or (
+            "not_provided" if question.answer is None else "unverified"
+        )
+        if question.answer is not None and answer_source not in {
+            "official",
+            "third_party",
+            "user_verified",
+            "unverified",
+        }:
+            answer_source = "unverified"
+        mapping = {
+            "source_name": override.get("source_name")
+            or (source.title if source else ""),
+            "exam_name": override.get("exam_name") or question.exam_name,
+            "subject": override.get("subject")
+            or (bundle.item.subjects[0] if bundle.item.subjects else ""),
+            "question_type": override.get("question_type") or question.question_type,
+            "stem": override.get("stem") or question.stem,
+            "options": override.get("options", list(question.options)),
+            "answer": override.get("answer", question.answer),
+            "explanation": override.get("explanation", question.explanation),
+            "answer_source": override.get("answer_source") or answer_source,
+            "verification_status": "user_verified",
+            "source_url": override.get("source_url")
+            or (source.source_url if source else ""),
+            "source_locator": override.get("source_locator")
+            or (source_link.locator if source_link else ""),
+            "exam_year": override.get("exam_year") or question.exam_year,
+            "exam_date": override.get("exam_date") or question.exam_date,
+            "paper": override.get("paper") or question.paper,
+            "question_number": override.get("question_number")
+            or question.question_number,
+            "metadata": {
+                "learning_item_id": item_id,
+                "source_content_hash": source.content_hash if source else "",
+            },
+        }
+        if mapping["answer"] is None:
+            mapping["answer_source"] = "not_provided"
+        return RealQuestion.from_mapping(mapping)
+
+    @staticmethod
+    def _promotion_truth_fingerprint(bundle: Any, question: RealQuestion) -> str:
+        source = bundle.sources[0] if bundle.sources else None
+        source_link = bundle.source_links[0] if bundle.source_links else None
+        normalized = bundle.question
+        canonical = json.dumps(
+            {
+                "promotion": question.to_mapping(),
+                "candidate": {
+                    "subjects": list(bundle.item.subjects),
+                    "question_type": normalized.question_type,
+                    "stem": normalized.stem,
+                    "options": list(normalized.options),
+                    "answer": normalized.answer,
+                    "explanation": normalized.explanation,
+                    "answer_source": normalized.answer_source,
+                    "exam_name": normalized.exam_name,
+                    "exam_year": normalized.exam_year,
+                    "exam_date": normalized.exam_date,
+                    "paper": normalized.paper,
+                    "question_number": normalized.question_number,
+                    "source_content_hash": source.content_hash if source else "",
+                    "source_title": source.title if source else "",
+                    "source_url": source.source_url if source else "",
+                    "source_locator": source_link.locator if source_link else "",
+                },
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     async def prepare_candidate_promotion(
         self,
         item_ids: list[int],
@@ -3809,54 +3911,10 @@ class LawAssistantService:
                 continue
             override = overrides_by_id.get(str(item_id), {})
             override = override if isinstance(override, dict) else {}
-            source = bundle.sources[0] if bundle.sources else None
-            source_link = bundle.source_links[0] if bundle.source_links else None
-            question = bundle.question
-            answer_source = question.answer_source or (
-                "not_provided" if question.answer is None else "unverified"
-            )
-            if question.answer is not None and answer_source not in {
-                "official",
-                "third_party",
-                "user_verified",
-                "unverified",
-            }:
-                # Structured-source provenance (for example source_text) is not
-                # itself answer verification. Keep the answer but downgrade its
-                # claim to unverified during explicit identity promotion.
-                answer_source = "unverified"
-            mapping = {
-                "source_name": override.get("source_name")
-                or (source.title if source else ""),
-                "exam_name": override.get("exam_name") or question.exam_name,
-                "subject": override.get("subject")
-                or (bundle.item.subjects[0] if bundle.item.subjects else ""),
-                "question_type": override.get("question_type")
-                or question.question_type,
-                "stem": override.get("stem") or question.stem,
-                "options": override.get("options", list(question.options)),
-                "answer": override.get("answer", question.answer),
-                "explanation": override.get("explanation", question.explanation),
-                "answer_source": override.get("answer_source") or answer_source,
-                "verification_status": "user_verified",
-                "source_url": override.get("source_url")
-                or (source.source_url if source else ""),
-                "source_locator": override.get("source_locator")
-                or (source_link.locator if source_link else ""),
-                "exam_year": override.get("exam_year") or question.exam_year,
-                "exam_date": override.get("exam_date") or question.exam_date,
-                "paper": override.get("paper") or question.paper,
-                "question_number": override.get("question_number")
-                or question.question_number,
-                "metadata": {
-                    "learning_item_id": item_id,
-                    "source_content_hash": source.content_hash if source else "",
-                },
-            }
-            if mapping["answer"] is None:
-                mapping["answer_source"] = "not_provided"
             try:
-                real_question = RealQuestion.from_mapping(mapping)
+                real_question = self._candidate_promotion_question(
+                    bundle, item_id, override
+                )
                 identity_key = real_question_identity_key(real_question)
                 existing = self.storage.connection.execute(
                     "SELECT id FROM real_questions WHERE identity_key = ?",
@@ -3879,6 +3937,10 @@ class LawAssistantService:
                         "item_hash": bundle.item.item_hash,
                         "updated_at": bundle.item.updated_at.isoformat(),
                         "identity_key": identity_key,
+                        "overrides": copy.deepcopy(override),
+                        "truth_fingerprint": self._promotion_truth_fingerprint(
+                            bundle, real_question
+                        ),
                         "question": real_question,
                     }
                 )
@@ -3958,8 +4020,18 @@ class LawAssistantService:
                         or bundle.item.updated_at.isoformat() != prepared["updated_at"]
                     ):
                         raise ValueError("候选题在预览后发生变化")
+                    current_question = self._candidate_promotion_question(
+                        bundle,
+                        int(prepared["item_id"]),
+                        prepared.get("overrides", {}),
+                    )
+                    if (
+                        self._promotion_truth_fingerprint(bundle, current_question)
+                        != prepared["truth_fingerprint"]
+                    ):
+                        raise ValueError("候选题的规范化真题内容在预览后发生变化")
                     linked = self.storage.promote_candidate_real_question(
-                        prepared["question"],
+                        current_question,
                         item_id=int(prepared["item_id"]),
                         actor_id=str(actor_id),
                         at=self._now_utc().isoformat(),
