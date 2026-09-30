@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish tagged release
+    if: startsWith(github.event.head_commit.message, 'release: v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          first_line="$(printf '%s\n' "${{ github.event.head_commit.message }}" | head -n 1)"
+          tag="${first_line#release: }"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release commit message/tag: $first_line" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          metadata_version="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' metadata.yaml)"
+          if [[ "$metadata_version" != "$version" ]]; then
+            echo "metadata.yaml version $metadata_version does not match $version" >&2
+            exit 1
+          fi
+          if ! grep -Fq "### $version —" README.md; then
+            echo "README changelog does not contain a finalized $version section" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for exact-SHA CI gate
+        id: ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=""
+          for _ in $(seq 1 90); do
+            run_id="$(gh run list --workflow CI --commit "$GITHUB_SHA" --event push --json databaseId --jq '.[0].databaseId // empty' --limit 1)"
+            if [[ -n "$run_id" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "No CI run found for exact release SHA $GITHUB_SHA" >&2
+            exit 1
+          fi
+          gh run watch "$run_id" --exit-status
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download canonical exact-SHA CI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p release/artifact
+          gh run download "${{ steps.ci.outputs.run_id }}"             --name "astrbot_plugin_law_assistant-$version"             --dir release/artifact
+          zip_path="release/artifact/astrbot_plugin_law_assistant-$version.zip"
+          test -f "$zip_path"
+          hash="$(sha256sum "$zip_path" | awk '{print $1}')"
+          printf '%s  %s\n' "$hash" "$(basename "$zip_path")" > release/SHA256SUMS.txt
+          echo "Canonical ZIP SHA256: $hash"
+
+      - name: Build release notes from README changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"           RELEASE_SHA="$GITHUB_SHA"           CI_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run_id }}"           python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          sha = os.environ["RELEASE_SHA"]
+          ci_url = os.environ["CI_RUN_URL"]
+          text = Path("README.md").read_text(encoding="utf-8")
+          match = re.search(
+              rf"^### {re.escape(version)} — [^\n]+\n(.*?)(?=^### |\Z)",
+              text,
+              flags=re.MULTILINE | re.DOTALL,
+          )
+          if not match:
+              raise SystemExit(f"README changelog section not found for {version}")
+          body = match.group(1).strip()
+          notes = (
+              f"## Lumielle Law Assistant v{version}\n\n"
+              f"Source commit: `{sha}`  \n"
+              f"Database schema: `13`  \n"
+              f"Exact-SHA CI: {ci_url}\n\n"
+              f"{body}\n\n"
+              "### 验收边界\n\n"
+              "本 Release 已通过仓库自动化测试、AstrBot 4.22.0/4.25.0 "
+              "兼容性检查与发布包 smoke；这些结果不等同于真实 QQ/NapCat、"
+              "Windows 主机、真实 LLM provider 或官网持续可用性的 live E2E 验收。\n"
+          )
+          Path("release/RELEASE_NOTES.md").write_text(notes, encoding="utf-8")
+          PY
+
+      - name: Create or verify annotated tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          git fetch --tags --force
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            tagged_sha="$(git rev-list -n 1 "$tag")"
+            if [[ "$tagged_sha" != "$GITHUB_SHA" ]]; then
+              echo "Existing tag $tag points to $tagged_sha, not $GITHUB_SHA" >&2
+              exit 1
+            fi
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" "$GITHUB_SHA" -m "Lumielle Law Assistant $tag"
+            git push origin "$tag"
+          fi
+
+      - name: Create or refresh GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+          zip_path="release/artifact/astrbot_plugin_law_assistant-$version.zip"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$zip_path" release/SHA256SUMS.txt --clobber
+            gh release edit "$tag"               --title "Lumielle Law Assistant $tag"               --notes-file release/RELEASE_NOTES.md               --draft=false               --prerelease=false
+          else
+            gh release create "$tag"               "$zip_path"               release/SHA256SUMS.txt               --verify-tag               --title "Lumielle Law Assistant $tag"               --notes-file release/RELEASE_NOTES.md
+          fi
