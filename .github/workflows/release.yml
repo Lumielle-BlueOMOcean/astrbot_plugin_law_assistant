@@ -8,10 +8,13 @@ permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Publish tagged release
-    if: startsWith(github.event.head_commit.message, 'release: v')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -21,12 +24,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve and validate release version
+      - name: Resolve release intent and version
         id: version
         shell: bash
+        env:
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          first_line="$(printf '%s\n' "${{ github.event.head_commit.message }}" | head -n 1)"
+          first_line="$(printf '%s\n' "$HEAD_MESSAGE" | head -n 1)"
+          if [[ "$first_line" != release:\ v* ]]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "No release commit marker; nothing to publish."
+            exit 0
+          fi
           tag="${first_line#release: }"
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid release commit message/tag: $first_line" >&2
@@ -42,10 +52,12 @@ jobs:
             echo "README changelog does not contain a finalized $version section" >&2
             exit 1
           fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Wait for exact-SHA CI gate
+        if: steps.version.outputs.release == 'true'
         id: ci
         shell: bash
         run: |
@@ -66,12 +78,13 @@ jobs:
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: Download canonical exact-SHA CI artifact
+        if: steps.version.outputs.release == 'true'
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
           mkdir -p release/artifact
-          gh run download "${{ steps.ci.outputs.run_id }}"             --name "astrbot_plugin_law_assistant-$version"             --dir release/artifact
+          gh run download "${{ steps.ci.outputs.run_id }}" --name "astrbot_plugin_law_assistant-$version" --dir release/artifact
           zip_path="release/artifact/astrbot_plugin_law_assistant-$version.zip"
           test -f "$zip_path"
           hash="$(sha256sum "$zip_path" | awk '{print $1}')"
@@ -79,10 +92,15 @@ jobs:
           echo "Canonical ZIP SHA256: $hash"
 
       - name: Build release notes from README changelog
+        if: steps.version.outputs.release == 'true'
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+          CI_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run_id }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"           RELEASE_SHA="$GITHUB_SHA"           CI_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run_id }}"           python - <<'PY'
+          python - <<'PY'
           import os
           import re
           from pathlib import Path
@@ -114,6 +132,7 @@ jobs:
           PY
 
       - name: Create or verify annotated tag
+        if: steps.version.outputs.release == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -133,6 +152,7 @@ jobs:
           fi
 
       - name: Create or refresh GitHub Release
+        if: steps.version.outputs.release == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -141,7 +161,7 @@ jobs:
           zip_path="release/artifact/astrbot_plugin_law_assistant-$version.zip"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$zip_path" release/SHA256SUMS.txt --clobber
-            gh release edit "$tag"               --title "Lumielle Law Assistant $tag"               --notes-file release/RELEASE_NOTES.md               --draft=false               --prerelease=false
+            gh release edit "$tag" --title "Lumielle Law Assistant $tag" --notes-file release/RELEASE_NOTES.md --draft=false --prerelease=false
           else
-            gh release create "$tag"               "$zip_path"               release/SHA256SUMS.txt               --verify-tag               --title "Lumielle Law Assistant $tag"               --notes-file release/RELEASE_NOTES.md
+            gh release create "$tag" "$zip_path" release/SHA256SUMS.txt --verify-tag --title "Lumielle Law Assistant $tag" --notes-file release/RELEASE_NOTES.md
           fi
