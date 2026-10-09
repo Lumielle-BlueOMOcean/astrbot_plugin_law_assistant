@@ -44,7 +44,11 @@ def install_fake_astrbot(monkeypatch, data_dir: Path) -> None:
             return data_dir
 
     api.logger = types.SimpleNamespace(
-        error=lambda *args, **kwargs: None, exception=lambda *args, **kwargs: None
+        debug=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        exception=lambda *args, **kwargs: None,
     )
     event.AstrMessageEvent = object
     event.filter = FakeFilter

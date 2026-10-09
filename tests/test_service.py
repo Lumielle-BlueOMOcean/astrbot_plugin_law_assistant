@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import service as service_module
 from daily_plans import DailyPlan
 from daily_resolver import resolve_daily_constraints
 from learning_inventory import LearningContentProvider
@@ -1249,6 +1251,426 @@ async def test_daily_question_uses_independent_subject_and_type_resolver_and_his
     assert history["resolved_subject"] == "economic_law"
     assert history["resolved_question_type"] == "single_choice"
     assert history["resolved_origin"] == "mock"
+
+
+def _daily_delay_question() -> dict[str, object]:
+    return {
+        "available": True,
+        "origin": "mock",
+        "subject": "criminal_law",
+        "question_type": "single_choice",
+        "question_id": None,
+        "content": {
+            "question": "合成题干，不包含真实题库内容。",
+            "options": ["A. 甲", "B. 乙"],
+            "answer": "A",
+            "explanation": "合成解析。",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_slow_daily_case_does_not_block_due_daily_question(tmp_path):
+    now = datetime(2026, 10, 9, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    case_started = asyncio.Event()
+    release_case = asyncio.Event()
+
+    class Learning:
+        async def daily_case(self, **_kwargs):
+            case_started.set()
+            await release_case.wait()
+            return {"available": False, "reason": "no matching synthetic case"}
+
+        async def generate_question(self, **_kwargs):
+            return _daily_delay_question()
+
+    class QuestionPublisher:
+        def __init__(self):
+            self.question_sent = asyncio.Event()
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            self.question_sent.set()
+            return True
+
+    storage = SQLiteStorage(tmp_path / "slow-case.sqlite3")
+    target = storage.bind_target("aiocqhttp:group:slow-case", "案例慢群")
+    publisher = QuestionPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_case_enabled=True,
+            daily_case_time="16:30",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+
+    task = asyncio.create_task(service.process_due_work(now=now))
+    try:
+        await asyncio.wait_for(case_started.wait(), timeout=1)
+        await asyncio.wait_for(publisher.question_sent.wait(), timeout=0.25)
+        assert publisher.calls[0][0] == target["unified_msg_origin"]
+        assert task.done() is False, "slow case remains isolated until its gate opens"
+    finally:
+        release_case.set()
+        await asyncio.wait_for(task, timeout=2)
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_target_publisher_does_not_block_later_target(tmp_path):
+    now = datetime(2026, 10, 9, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        async def generate_question(self, **_kwargs):
+            return _daily_delay_question()
+
+    class FirstTargetBlockedPublisher:
+        def __init__(self, first_origin):
+            self.first_origin = first_origin
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.second_sent = asyncio.Event()
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            if destination == self.first_origin:
+                self.first_started.set()
+                await self.release_first.wait()
+            else:
+                self.second_sent.set()
+            return True
+
+    storage = SQLiteStorage(tmp_path / "slow-target.sqlite3")
+    first = storage.bind_target("aiocqhttp:group:slow-target-1", "慢群")
+    second = storage.bind_target("aiocqhttp:group:slow-target-2", "后续群")
+    publisher = FirstTargetBlockedPublisher(first["unified_msg_origin"])
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+
+    task = asyncio.create_task(service.process_due_work(now=now))
+    try:
+        await asyncio.wait_for(publisher.first_started.wait(), timeout=1)
+        await asyncio.wait_for(publisher.second_sent.wait(), timeout=0.25)
+        assert {call[0] for call in publisher.calls} == {
+            first["unified_msg_origin"],
+            second["unified_msg_origin"],
+        }
+    finally:
+        publisher.release_first.set()
+        await asyncio.wait_for(task, timeout=2)
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_selection_logs_finish_before_claim_and_omit_content(
+    tmp_path, caplog
+):
+    now = datetime(2026, 10, 9, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    selection_started = asyncio.Event()
+    release_selection = asyncio.Event()
+    private_stem = "SYNTHETIC_PRIVATE_STEM_MUST_NOT_BE_LOGGED"
+
+    class Learning:
+        async def generate_question(self, **_kwargs):
+            selection_started.set()
+            await release_selection.wait()
+            content = _daily_delay_question()
+            content["content"]["question"] = private_stem
+            return content
+
+    storage = SQLiteStorage(tmp_path / "selection-claim.sqlite3")
+    target = storage.bind_target("aiocqhttp:group:selection-claim", "日志测试群")
+    service = LawAssistantService(
+        storage,
+        publisher=RecordingPublisher(),
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+    caplog.set_level(logging.INFO, logger="service")
+    task = asyncio.create_task(service.process_due_work(now=now))
+    try:
+        await asyncio.wait_for(selection_started.wait(), timeout=1)
+        assert storage.list_daily_contents() == []
+    finally:
+        release_selection.set()
+        await asyncio.wait_for(task, timeout=2)
+        storage.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    expected_stages = (
+        "daily_stage=selection_start",
+        "daily_stage=selection_end",
+        "daily_stage=claim_start",
+        "daily_stage=claim_end",
+        "daily_stage=publish_start",
+        "daily_stage=publish_end",
+    )
+    positions = [
+        next(i for i, message in enumerate(messages) if stage in message)
+        for stage in expected_stages
+    ]
+    assert positions == sorted(positions)
+    related = [messages[index] for index in positions]
+    assert all(f"target_id={target['id']}" in message for message in related)
+    task_ids = {
+        part.split("=", 1)[1]
+        for message in related
+        for part in message.split()
+        if part.startswith("task_id=")
+    }
+    assert len(task_ids) == 1
+    assert private_stem not in "\n".join(messages)
+
+
+@pytest.mark.asyncio
+async def test_unknown_daily_send_is_not_retried_on_same_day(tmp_path):
+    from publisher import PublishOutcome
+
+    now = datetime(2026, 10, 9, 16, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+    selections = []
+
+    class Learning:
+        async def generate_question(self, **kwargs):
+            selections.append(kwargs)
+            return _daily_delay_question()
+
+    class UnknownPublisher:
+        def __init__(self):
+            self.calls = 0
+
+        async def publish_text(self, _destination, _text):
+            self.calls += 1
+            return PublishOutcome("unknown", "private transport detail")
+
+    storage = SQLiteStorage(tmp_path / "unknown-send.sqlite3")
+    storage.bind_target("aiocqhttp:group:unknown-send", "未知发送群")
+    publisher = UnknownPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+
+    await service.process_due_work(now=now)
+    await service.process_due_work(now=now + timedelta(minutes=1))
+
+    history = storage.list_daily_contents()
+    assert publisher.calls == 1
+    assert len(selections) == 1
+    assert len(history) == 1
+    assert history[0]["status"] == "unknown"
+    assert "private transport detail" not in str(history[0]["error_summary"])
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_selection_is_bounded_and_isolated_from_other_targets(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(service_module, "DAILY_SELECTION_TIMEOUT_SECONDS", 0.01)
+    now = datetime(2026, 10, 9, 16, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        def __init__(self):
+            self.calls = 0
+            self.never = asyncio.Event()
+
+        async def generate_question(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                await self.never.wait()
+            return _daily_delay_question()
+
+    storage = SQLiteStorage(tmp_path / "selection-timeout.sqlite3")
+    storage.bind_target("aiocqhttp:group:selection-timeout-1", "超时群")
+    storage.bind_target("aiocqhttp:group:selection-timeout-2", "正常群")
+    publisher = RecordingPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+
+    result = await asyncio.wait_for(service.process_due_work(now=now), timeout=1)
+
+    history = storage.list_daily_contents(limit=10)
+    assert result["daily_question_sent"] == 1
+    assert sorted(item["status"] for item in history) == ["sent", "skipped"]
+    assert len(publisher.calls) == 1
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_publish_is_unknown_and_never_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_module, "DAILY_PUBLISH_TIMEOUT_SECONDS", 0.01)
+    now = datetime(2026, 10, 9, 16, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        async def generate_question(self, **_kwargs):
+            return _daily_delay_question()
+
+    class HangingPublisher:
+        def __init__(self):
+            self.calls = 0
+            self.never = asyncio.Event()
+
+        async def publish_text(self, _destination, _text):
+            self.calls += 1
+            await self.never.wait()
+
+    storage = SQLiteStorage(tmp_path / "publish-timeout.sqlite3")
+    storage.bind_target("aiocqhttp:group:publish-timeout", "发送超时群")
+    publisher = HangingPublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            daily_question_enabled=True,
+            daily_question_time="16:30",
+            daily_question_origin="mock",
+            daily_question_type="single_choice",
+        ),
+        clock=lambda: now,
+    )
+
+    await asyncio.wait_for(service.process_due_work(now=now), timeout=1)
+    await service.process_due_work(now=now + timedelta(minutes=1))
+
+    history = storage.list_daily_contents()
+    assert publisher.calls == 1
+    assert len(history) == 1
+    assert history[0]["status"] == "unknown"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_due_catchup_and_delayed_reveals_survive_service_restart(tmp_path):
+    from publisher import PublishOutcome
+
+    path = tmp_path / "due-restart.sqlite3"
+    now = datetime(2026, 10, 9, 16, 43, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class Learning:
+        async def generate_question(self, **_kwargs):
+            return {
+                **_daily_delay_question(),
+                "content": {
+                    "question": "合成延迟揭晓题干。",
+                    "answer": "答案正文。",
+                    "explanation": "解析正文。",
+                },
+                "question_type": "short_answer",
+            }
+
+    class CountingPublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            return PublishOutcome("sent")
+
+    storage = SQLiteStorage(path)
+    target = storage.bind_target("aiocqhttp:group:due-restart", "重启群")
+    storage.upsert_daily_plan(
+        DailyPlan.from_mapping(
+            "daily_question",
+            {
+                "enabled": True,
+                "time": "16:30",
+                "question_origin": "mock",
+                "question_type": "short_answer",
+                "question_reveal_mode": "delayed",
+                "answer_reveal_delay_minutes": 1,
+                "explanation_reveal_delay_minutes": 2,
+            },
+        ),
+        target["id"],
+    )
+    first_publisher = CountingPublisher()
+    first_service = LawAssistantService(
+        storage,
+        publisher=first_publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+
+    first_result = await first_service.process_due_work(now=now)
+    assert first_result["daily_question_sent"] == 1
+    assert len(first_publisher.calls) == 1
+    sent_at = datetime.fromisoformat(
+        storage.connection.execute(
+            "SELECT question_sent_at FROM scheduled_reveal_jobs LIMIT 1"
+        ).fetchone()[0]
+    )
+    storage.close()
+
+    reopened = SQLiteStorage(path)
+    second_publisher = CountingPublisher()
+    restarted_service = LawAssistantService(
+        reopened,
+        publisher=second_publisher,
+        learning_service=Learning(),
+        config=SimpleNamespace(timezone="Asia/Shanghai"),
+        clock=lambda: now,
+    )
+    await restarted_service.process_due_work(now=now)
+    assert len(second_publisher.calls) == 0, "catch-up must not repeat the prompt"
+    reveal_result = await restarted_service.process_due_reveals(
+        now=sent_at + timedelta(minutes=2)
+    )
+    assert reveal_result["sent"] == 2
+    assert len(second_publisher.calls) == 2
+    assert "答案正文" in second_publisher.calls[0][1]
+    assert "解析正文" in second_publisher.calls[1][1]
+    reopened.close()
 
 
 @pytest.mark.asyncio

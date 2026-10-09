@@ -67,7 +67,10 @@ class LLMService:
                 return None
             return parse_json_response(completion)
         except Exception as exc:  # noqa: BLE001 - provider errors are fail-soft
-            self.logger.warning("Law Assistant LLM extraction unavailable: %s", exc)
+            self.logger.warning(
+                "Law Assistant LLM extraction unavailable; error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     async def _resolve_provider_id(self, session_origin: str | None) -> str:
@@ -77,7 +80,10 @@ class LLMService:
                 if value:
                     return str(value)
             except Exception as exc:  # noqa: BLE001 - provider resolution is optional
-                self.logger.debug("Interactive LLM provider unavailable: %s", exc)
+                self.logger.debug(
+                    "Interactive LLM provider unavailable; error_type=%s",
+                    type(exc).__name__,
+                )
         if self.provider_id:
             return self.provider_id
         try:
@@ -87,7 +93,10 @@ class LLMService:
             meta = provider.meta()
             return str(getattr(meta, "id", "") or "")
         except Exception as exc:  # noqa: BLE001 - provider resolution is optional
-            self.logger.debug("Default LLM provider unavailable: %s", exc)
+            self.logger.debug(
+                "Default LLM provider unavailable; error_type=%s",
+                type(exc).__name__,
+            )
             return ""
 
 

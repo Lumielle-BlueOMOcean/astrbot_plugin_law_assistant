@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -25,7 +27,7 @@ class DueAwareSchedulerService:
         self.first_due = asyncio.Event()
         self.second_due = asyncio.Event()
 
-    async def process_due_work(self, *, now=None):
+    async def process_due_work(self, *, now=None, task_id=None):
         self.due_calls += 1
         self.first_due.set()
         if self.due_calls > 1:
@@ -33,6 +35,32 @@ class DueAwareSchedulerService:
 
     def next_due_at(self, now=None):
         return None
+
+
+class Clock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+class ClockedDueService:
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.calls: list[datetime] = []
+        self.called = asyncio.Event()
+
+    async def process_due_work(self, *, now=None, task_id=None):
+        self.calls.append(now)
+        self.called.set()
+
+    def next_due_at(self, now=None):
+        local_now = (now or self.clock()).astimezone(ZoneInfo("Asia/Shanghai"))
+        due = local_now.replace(hour=16, minute=30, second=0, microsecond=0)
+        if local_now >= due:
+            due += timedelta(days=1)
+        return due
 
 
 @pytest.mark.asyncio
@@ -141,3 +169,72 @@ async def test_due_loop_runs_immediately_and_does_not_wait_for_scan_interval():
     assert service.due_calls == 1
 
     await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_due_scheduler_runs_at_1630_when_started_at_due_time(caplog):
+    clock = Clock(datetime(2026, 10, 9, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
+    service = ClockedDueService(clock)
+    sleep_requested = asyncio.Queue()
+    release_sleep = asyncio.Event()
+
+    async def controlled_sleep(seconds: float) -> None:
+        await sleep_requested.put(seconds)
+        await release_sleep.wait()
+
+    caplog.set_level("INFO", logger="scheduler")
+    scheduler = LawAssistantScheduler(
+        service,
+        enabled=True,
+        scan_enabled=False,
+        interval_minutes=5,
+        sleep=controlled_sleep,
+        clock=clock,
+    )
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(service.called.wait(), timeout=1)
+        assert service.calls == [clock.now]
+        assert await asyncio.wait_for(sleep_requested.get(), timeout=1) == 24 * 60 * 60
+        assert "scheduler_event=created" in caplog.text
+        assert "scheduler_event=planned_due" in caplog.text
+        assert "scheduler_event=sleep_start" in caplog.text
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_due_scheduler_wakes_at_1630_when_started_one_minute_early(caplog):
+    clock = Clock(datetime(2026, 10, 9, 16, 29, tzinfo=ZoneInfo("Asia/Shanghai")))
+    service = ClockedDueService(clock)
+    sleep_requested = asyncio.Queue()
+    release_sleep = asyncio.Event()
+
+    async def controlled_sleep(seconds: float) -> None:
+        await sleep_requested.put(seconds)
+        await release_sleep.wait()
+        release_sleep.clear()
+
+    caplog.set_level("INFO", logger="scheduler")
+    scheduler = LawAssistantScheduler(
+        service,
+        enabled=True,
+        scan_enabled=False,
+        interval_minutes=5,
+        sleep=controlled_sleep,
+        clock=clock,
+    )
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(service.called.wait(), timeout=1)
+        assert service.calls == [clock.now]
+        assert await asyncio.wait_for(sleep_requested.get(), timeout=1) == 60
+        clock.now = datetime(2026, 10, 9, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        service.called.clear()
+        release_sleep.set()
+        await asyncio.wait_for(service.called.wait(), timeout=1)
+        assert service.calls[-1] == clock.now
+        assert "wake_reason=timer" in caplog.text
+        assert "scheduler_event=sleep_end" in caplog.text
+    finally:
+        await scheduler.stop()

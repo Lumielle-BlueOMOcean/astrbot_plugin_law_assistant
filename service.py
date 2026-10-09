@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 if __package__ and "." in __package__:
@@ -295,6 +296,10 @@ _DAILY_HISTORY_SAFE_FIELDS = (
     "resolved_question_type",
     "resolved_origin",
 )
+
+DAILY_SELECTION_TIMEOUT_SECONDS = 120.0
+DAILY_PUBLISH_TIMEOUT_SECONDS = 30.0
+DAILY_TARGET_CONCURRENCY = 4
 
 
 def _daily_history_safe_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -4210,24 +4215,97 @@ class LawAssistantService:
         )
         return result
 
-    async def process_due_work(self, *, now: datetime | None = None) -> dict[str, Any]:
+    async def process_due_work(
+        self, *, now: datetime | None = None, task_id: str | None = None
+    ) -> dict[str, Any]:
         current = now or self.clock()
-        result: dict[str, Any] = {}
-        result["daily_case_sent"] = await self._run_daily_content(
-            content_type="daily_case",
-            now=current,
+        correlation_id = task_id or uuid4().hex[:12]
+        started = asyncio.get_running_loop().time()
+        self.logger.info(
+            "due_work_event=start task_id=%s started_at=%s",
+            correlation_id,
+            current.isoformat(),
         )
-        result["daily_question_sent"] = await self._run_daily_content(
-            content_type="daily_question",
-            now=current,
+
+        async def run_phase(phase: str, operation, default):
+            phase_started = asyncio.get_running_loop().time()
+            self.logger.info(
+                "due_phase_event=start task_id=%s phase=%s", correlation_id, phase
+            )
+            try:
+                result = await operation
+            except asyncio.CancelledError:
+                self.logger.info(
+                    "due_phase_event=stopped task_id=%s phase=%s stop_reason=cancelled",
+                    correlation_id,
+                    phase,
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate independent due lanes
+                self.logger.warning(
+                    "due_phase_event=failed task_id=%s phase=%s error_type=%s",
+                    correlation_id,
+                    phase,
+                    type(exc).__name__,
+                )
+                result = default
+            self.logger.info(
+                "due_phase_event=finished task_id=%s phase=%s duration_ms=%.1f",
+                correlation_id,
+                phase,
+                (asyncio.get_running_loop().time() - phase_started) * 1000,
+            )
+            return result
+
+        async with asyncio.TaskGroup() as group:
+            case_task = group.create_task(
+                run_phase(
+                    "daily_case",
+                    self._run_daily_content(
+                        content_type="daily_case", now=current, task_id=correlation_id
+                    ),
+                    0,
+                )
+            )
+            question_task = group.create_task(
+                run_phase(
+                    "daily_question",
+                    self._run_daily_content(
+                        content_type="daily_question",
+                        now=current,
+                        task_id=correlation_id,
+                    ),
+                    0,
+                )
+            )
+            reveal_task = group.create_task(
+                run_phase(
+                    "scheduled_reveals",
+                    self.process_due_reveals(now=current, task_id=correlation_id),
+                    {"sent": 0, "skipped": 0, "failed": 1, "needs_review": 0},
+                )
+            )
+
+        result = {
+            "daily_case_sent": case_task.result(),
+            "daily_question_sent": question_task.result(),
+            "scheduled_reveals": reveal_task.result(),
+        }
+        self.logger.info(
+            "due_work_event=finished task_id=%s duration_ms=%.1f daily_case_sent=%s daily_question_sent=%s reveal_sent=%s",
+            correlation_id,
+            (asyncio.get_running_loop().time() - started) * 1000,
+            result["daily_case_sent"],
+            result["daily_question_sent"],
+            result["scheduled_reveals"]["sent"],
         )
-        result["scheduled_reveals"] = await self.process_due_reveals(now=current)
         return result
 
     async def process_due_reveals(
-        self, *, now: datetime | None = None
+        self, *, now: datetime | None = None, task_id: str | None = None
     ) -> dict[str, int]:
         """Deliver due pages from the exact persisted session snapshot."""
+        correlation_id = task_id or uuid4().hex[:12]
         if self.publisher is None:
             return {"sent": 0, "skipped": 0, "failed": 0, "needs_review": 0}
         current = _as_utc(now or self.clock())
@@ -4236,6 +4314,8 @@ class LawAssistantService:
             current, getattr(self.config, "timezone", "Asia/Shanghai")
         ).date()
         totals = {"sent": 0, "skipped": 0, "failed": 0, "needs_review": 0}
+        phase_started = asyncio.get_running_loop().time()
+        self.logger.info("reveal_phase_event=start task_id=%s", correlation_id)
         async with self._scheduled_reveal_lock:
             for pending in self.scheduled_reveals.list_pending(
                 now=current_text, limit=1000
@@ -4244,11 +4324,45 @@ class LawAssistantService:
                     str(pending["due_at"]),
                     getattr(self.config, "timezone", "Asia/Shanghai"),
                 ).date()
+                reveal_kind = str(pending["reveal_kind"])
+                reveal_content_type = f"reveal_{reveal_kind}"
+                target_id = int(pending["target_id"] or 0)
+                claim_started = asyncio.get_running_loop().time()
+                self.logger.info(
+                    "reveal_stage=claim_start task_id=%s target_id=%s content_type=%s job_id=%s",
+                    correlation_id,
+                    target_id,
+                    reveal_content_type,
+                    int(pending["id"]),
+                )
                 claimed = self.scheduled_reveals.claim_due(
                     int(pending["id"]), now=current_text
                 )
                 if claimed is None:
+                    self.logger.info(
+                        "reveal_stage=claim_end task_id=%s target_id=%s content_type=%s job_id=%s duration_ms=%.1f result=not_claimed",
+                        correlation_id,
+                        target_id,
+                        reveal_content_type,
+                        int(pending["id"]),
+                        (asyncio.get_running_loop().time() - claim_started) * 1000,
+                    )
                     continue
+                target_id = int(claimed["target_id"] or 0)
+                job_started = asyncio.get_running_loop().time()
+                due_delay_minutes = max(
+                    0.0,
+                    (current - _as_utc(str(claimed["due_at"]))).total_seconds() / 60,
+                )
+                self.logger.info(
+                    "reveal_stage=claim_end task_id=%s target_id=%s content_type=%s job_id=%s duration_ms=%.1f due_delay_minutes=%.2f result=claimed",
+                    correlation_id,
+                    target_id,
+                    reveal_content_type,
+                    int(claimed["id"]),
+                    (asyncio.get_running_loop().time() - claim_started) * 1000,
+                    due_delay_minutes,
+                )
                 if due_local_date < local_today:
                     self.scheduled_reveals.finish(
                         int(claimed["id"]),
@@ -4257,6 +4371,13 @@ class LawAssistantService:
                         error_summary="超过配置时区的当日发送窗口，未补发旧日期内容",
                     )
                     totals["skipped"] += 1
+                    self.logger.info(
+                        "reveal_stage=stopped task_id=%s target_id=%s content_type=%s job_id=%s stop_reason=outside_local_day_window",
+                        correlation_id,
+                        target_id,
+                        reveal_content_type,
+                        int(claimed["id"]),
+                    )
                     continue
                 session = self.question_sessions.get(int(claimed["session_id"]))
                 target = (
@@ -4282,7 +4403,6 @@ class LawAssistantService:
                     totals["skipped"] += 1
                     continue
 
-                reveal_kind = str(claimed["reveal_kind"])
                 prompt_index = int(claimed["prompt_index"])
                 if self.scheduled_reveals.was_revealed(
                     session["id"], reveal_kind, prompt_index
@@ -4345,21 +4465,93 @@ class LawAssistantService:
                 for page_index, text in enumerate(pages):
                     if page_index in known_progress:
                         continue
+                    publish_started = asyncio.get_running_loop().time()
+                    self.logger.info(
+                        "reveal_stage=publish_start task_id=%s target_id=%s content_type=%s job_id=%s page_index=%s due_delay_minutes=%.2f",
+                        correlation_id,
+                        target_id,
+                        reveal_content_type,
+                        int(claimed["id"]),
+                        page_index,
+                        due_delay_minutes,
+                    )
                     try:
-                        outcome = await self.publisher.publish_text(
-                            str(claimed["target_umo"]), str(text)
+                        outcome = await asyncio.wait_for(
+                            self.publisher.publish_text(
+                                str(claimed["target_umo"]), str(text)
+                            ),
+                            timeout=DAILY_PUBLISH_TIMEOUT_SECONDS,
                         )
+                    except asyncio.CancelledError:
+                        self.scheduled_reveals.finish(
+                            int(claimed["id"]),
+                            "needs_review",
+                            at=self._now_utc().isoformat(),
+                            error_summary="揭晓发送被取消，送达状态未知",
+                        )
+                        self.logger.info(
+                            "reveal_stage=publish_end task_id=%s target_id=%s content_type=%s job_id=%s page_index=%s duration_ms=%.1f result=unknown stop_reason=cancelled",
+                            correlation_id,
+                            target_id,
+                            reveal_content_type,
+                            int(claimed["id"]),
+                            page_index,
+                            (asyncio.get_running_loop().time() - publish_started)
+                            * 1000,
+                        )
+                        raise
+                    except TimeoutError:
+                        self.scheduled_reveals.finish(
+                            int(claimed["id"]),
+                            "needs_review",
+                            at=self._now_utc().isoformat(),
+                            error_summary="揭晓发送超时，送达状态未知",
+                        )
+                        totals["needs_review"] += 1
+                        self.logger.warning(
+                            "reveal_stage=publish_end task_id=%s target_id=%s content_type=%s job_id=%s page_index=%s duration_ms=%.1f result=unknown error_type=TimeoutError",
+                            correlation_id,
+                            target_id,
+                            reveal_content_type,
+                            int(claimed["id"]),
+                            page_index,
+                            (asyncio.get_running_loop().time() - publish_started)
+                            * 1000,
+                        )
+                        failed = True
+                        break
                     except Exception as exc:  # noqa: BLE001 - delivery may be ambiguous
                         self.scheduled_reveals.finish(
                             int(claimed["id"]),
                             "needs_review",
                             at=self._now_utc().isoformat(),
-                            error_summary=str(exc),
+                            error_summary=f"揭晓发送异常，送达状态未知 ({type(exc).__name__})",
                         )
                         totals["needs_review"] += 1
+                        self.logger.warning(
+                            "reveal_stage=publish_end task_id=%s target_id=%s content_type=%s job_id=%s page_index=%s duration_ms=%.1f result=unknown error_type=%s",
+                            correlation_id,
+                            target_id,
+                            reveal_content_type,
+                            int(claimed["id"]),
+                            page_index,
+                            (asyncio.get_running_loop().time() - publish_started)
+                            * 1000,
+                            type(exc).__name__,
+                        )
                         failed = True
                         break
-                    status, error = _delivery_status(outcome)
+                    status, _transport_error = _delivery_status(outcome)
+                    self.logger.info(
+                        "reveal_stage=publish_end task_id=%s target_id=%s content_type=%s job_id=%s page_index=%s duration_ms=%.1f result=%s",
+                        correlation_id,
+                        target_id,
+                        reveal_content_type,
+                        int(claimed["id"]),
+                        page_index,
+                        (asyncio.get_running_loop().time() - publish_started) * 1000,
+                        status,
+                    )
                     if status != "sent":
                         final_status = (
                             "failed" if status == "failed" else "needs_review"
@@ -4368,7 +4560,11 @@ class LawAssistantService:
                             int(claimed["id"]),
                             final_status,
                             at=self._now_utc().isoformat(),
-                            error_summary=error or "揭晓页送达状态未确认",
+                            error_summary=(
+                                "揭晓发送失败"
+                                if status == "failed"
+                                else "揭晓发送结果未知，需人工核实"
+                            ),
                         )
                         totals[final_status] += 1
                         failed = True
@@ -4392,6 +4588,23 @@ class LawAssistantService:
                     prompt_index=prompt_index,
                 )
                 totals["sent"] += 1
+                self.logger.info(
+                    "reveal_stage=finished task_id=%s target_id=%s content_type=%s job_id=%s duration_ms=%.1f result=sent",
+                    correlation_id,
+                    target_id,
+                    reveal_content_type,
+                    int(claimed["id"]),
+                    (asyncio.get_running_loop().time() - job_started) * 1000,
+                )
+        self.logger.info(
+            "reveal_phase_event=finished task_id=%s duration_ms=%.1f sent=%s skipped=%s failed=%s needs_review=%s",
+            correlation_id,
+            (asyncio.get_running_loop().time() - phase_started) * 1000,
+            totals["sent"],
+            totals["skipped"],
+            totals["failed"],
+            totals["needs_review"],
+        )
         return totals
 
     def has_due_scheduler_work(self) -> bool:
@@ -4445,106 +4658,250 @@ class LawAssistantService:
         *,
         content_type: str,
         now: datetime | str,
+        task_id: str,
     ) -> int:
         if self.publisher is None:
             return 0
+        targets = self.storage.list_targets(enabled_only=True)
+        semaphore = asyncio.Semaphore(DAILY_TARGET_CONCURRENCY)
+        tasks = []
+
+        async def run_target(target: dict[str, Any]) -> int:
+            async with semaphore:
+                try:
+                    return await self._run_daily_target(
+                        target=target,
+                        content_type=content_type,
+                        now=now,
+                        task_id=task_id,
+                    )
+                except asyncio.CancelledError:
+                    self.logger.info(
+                        "daily_stage=target_stopped task_id=%s target_id=%s content_type=%s stop_reason=cancelled",
+                        task_id,
+                        int(target["id"]),
+                        content_type,
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one target cannot cancel lane
+                    self.logger.warning(
+                        "daily_stage=target_failed task_id=%s target_id=%s content_type=%s error_type=%s",
+                        task_id,
+                        int(target["id"]),
+                        content_type,
+                        type(exc).__name__,
+                    )
+                    return 0
+
+        async with asyncio.TaskGroup() as group:
+            for target in targets:
+                tasks.append(group.create_task(run_target(target)))
+        return sum(task.result() for task in tasks)
+
+    async def _run_daily_target(
+        self,
+        *,
+        target: dict[str, Any],
+        content_type: str,
+        now: datetime | str,
+        task_id: str,
+    ) -> int:
         local_now = _local_datetime(
             now, getattr(self.config, "timezone", "Asia/Shanghai")
         )
-        sent = 0
-        for target in self.storage.list_targets(enabled_only=True):
-            plan = self.effective_daily_plan(target["id"], content_type)
-            if not plan.enabled or not _time_is_due(now, plan.time, self.config):
-                continue
-            timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
-            intended_local = local_due_datetime(
-                local_now.date(), plan.time, timezone_name
-            )
-            intended_local_at = f"{intended_local.isoformat()}[{timezone_name}]"
-            resolved = resolve_daily_constraints(
-                plan,
-                local_now.date(),
-                target_id=target["id"],
-                content_type=content_type,
-            )
-            selected_subject = resolved["subject"]
-            selected_question_type = resolved["question_type"]
-            if (plan.selection_mode == "rotation" and selected_subject is None) or (
-                content_type == "daily_question"
-                and resolved["question_type_mode"] == "rotation"
-                and selected_question_type is None
-            ):
-                self._record_daily_skip(
-                    local_now.date().isoformat(),
-                    target["id"],
-                    content_type,
-                    "轮换计划尚未开始或缺少有效方向/题型",
-                    selected_subject,
-                    question_type=selected_question_type,
-                    origin=resolved["origin"],
-                    intended_local_at=intended_local_at,
-                    target_label=str(target.get("label") or ""),
-                )
-                continue
-            content_date = local_now.date().isoformat()
-            if self.storage.has_daily_content(
+        target_id = int(target["id"])
+        plan = self.effective_daily_plan(target_id, content_type)
+        if not plan.enabled or not _time_is_due(now, plan.time, self.config):
+            return 0
+        timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
+        intended_local = local_due_datetime(local_now.date(), plan.time, timezone_name)
+        intended_local_at = f"{intended_local.isoformat()}[{timezone_name}]"
+        due_delay_minutes = max(0.0, (local_now - intended_local).total_seconds() / 60)
+        content_date = local_now.date().isoformat()
+        resolved = resolve_daily_constraints(
+            plan,
+            local_now.date(),
+            target_id=target_id,
+            content_type=content_type,
+        )
+        selected_subject = resolved["subject"]
+        selected_question_type = resolved["question_type"]
+        if (plan.selection_mode == "rotation" and selected_subject is None) or (
+            content_type == "daily_question"
+            and resolved["question_type_mode"] == "rotation"
+            and selected_question_type is None
+        ):
+            self._record_scheduled_skip(
+                task_id=task_id,
+                target=target,
                 content_date=content_date,
-                target_id=target["id"],
                 content_type=content_type,
-            ):
-                continue
+                reason="轮换计划尚未开始或缺少有效方向/题型",
+                subject=selected_subject,
+                question_type=selected_question_type,
+                origin=resolved["origin"],
+                intended_local_at=intended_local_at,
+                due_delay_minutes=due_delay_minutes,
+            )
+            return 0
+        if self.storage.has_daily_content(
+            content_date=content_date,
+            target_id=target_id,
+            content_type=content_type,
+        ):
+            self.logger.info(
+                "daily_stage=target_skipped task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f stop_reason=already_claimed",
+                task_id,
+                target_id,
+                content_type,
+                due_delay_minutes,
+            )
+            return 0
+
+        used_content_keys = self.storage.list_sent_content_keys(target_id, content_type)
+        selection_started = asyncio.get_running_loop().time()
+        self.logger.info(
+            "daily_stage=selection_start task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f",
+            task_id,
+            target_id,
+            content_type,
+            due_delay_minutes,
+        )
+        try:
             if content_type == "daily_case":
-                used_content_keys = self.storage.list_sent_content_keys(
-                    target["id"], content_type
-                )
-                content = await self.get_daily_case(
-                    date=content_date,
-                    subject=selected_subject,
-                    used_content_keys=used_content_keys,
+                content = await asyncio.wait_for(
+                    self.get_daily_case(
+                        date=content_date,
+                        subject=selected_subject,
+                        used_content_keys=used_content_keys,
+                    ),
+                    timeout=DAILY_SELECTION_TIMEOUT_SECONDS,
                 )
             else:
-                used_content_keys = self.storage.list_sent_content_keys(
-                    target["id"], content_type
+                content = await asyncio.wait_for(
+                    self.generate_question(
+                        selected_subject or "",
+                        origin=resolved["origin"] or "random",
+                        question_type=selected_question_type,
+                        used_content_keys=used_content_keys,
+                    ),
+                    timeout=DAILY_SELECTION_TIMEOUT_SECONDS,
                 )
-                content = await self.generate_question(
-                    selected_subject or "",
-                    origin=resolved["origin"] or "random",
-                    question_type=selected_question_type,
-                    used_content_keys=used_content_keys,
-                )
-            if not content.get("available"):
-                reason = str(content.get("reason", "没有匹配内容"))
-                self._record_daily_skip(
-                    content_date,
-                    target["id"],
-                    content_type,
-                    reason,
-                    selected_subject,
-                    question_type=selected_question_type,
-                    origin=resolved["origin"],
-                    intended_local_at=intended_local_at,
-                    target_label=str(target.get("label") or ""),
-                )
-                continue
-            raw_body = content.get("content", content)
-            body = raw_body if isinstance(raw_body, dict) else {"body": raw_body}
-            claim_id = self.storage.claim_daily_content(
-                content_date=content_date,
-                target_id=target["id"],
-                content_type=content_type,
-                body=body,
-                source_item_id=content.get("case_id") or content.get("question_id"),
-                source_kind=content.get("source_kind"),
-                source_item_key=content.get("source_item_key"),
-                resolved_subject=content.get("subject") or selected_subject,
-                resolved_question_type=content.get("question_type")
-                or selected_question_type,
-                resolved_origin=content.get("origin") or resolved["origin"],
-                intended_local_at=intended_local_at,
-                target_label=str(target.get("label") or ""),
+        except asyncio.CancelledError:
+            self.logger.info(
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=stopped stop_reason=cancelled",
+                task_id,
+                target_id,
+                content_type,
+                (asyncio.get_running_loop().time() - selection_started) * 1000,
             )
-            if claim_id is None:
-                continue
+            raise
+        except TimeoutError:
+            self.logger.warning(
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=timeout error_type=TimeoutError",
+                task_id,
+                target_id,
+                content_type,
+                (asyncio.get_running_loop().time() - selection_started) * 1000,
+            )
+            self._record_scheduled_skip(
+                task_id=task_id,
+                target=target,
+                content_date=content_date,
+                content_type=content_type,
+                reason="内容选择超时",
+                subject=selected_subject,
+                question_type=selected_question_type,
+                origin=resolved["origin"],
+                intended_local_at=intended_local_at,
+                due_delay_minutes=due_delay_minutes,
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001 - provider failures become daily skips
+            self.logger.warning(
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=error error_type=%s",
+                task_id,
+                target_id,
+                content_type,
+                (asyncio.get_running_loop().time() - selection_started) * 1000,
+                type(exc).__name__,
+            )
+            self._record_scheduled_skip(
+                task_id=task_id,
+                target=target,
+                content_date=content_date,
+                content_type=content_type,
+                reason=f"内容选择失败 ({type(exc).__name__})",
+                subject=selected_subject,
+                question_type=selected_question_type,
+                origin=resolved["origin"],
+                intended_local_at=intended_local_at,
+                due_delay_minutes=due_delay_minutes,
+            )
+            return 0
+
+        available = bool(content.get("available"))
+        self.logger.info(
+            "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=%s",
+            task_id,
+            target_id,
+            content_type,
+            (asyncio.get_running_loop().time() - selection_started) * 1000,
+            due_delay_minutes,
+            "available" if available else "unavailable",
+        )
+        if not available:
+            self._record_scheduled_skip(
+                task_id=task_id,
+                target=target,
+                content_date=content_date,
+                content_type=content_type,
+                reason=str(content.get("reason", "没有匹配内容")),
+                subject=selected_subject,
+                question_type=selected_question_type,
+                origin=resolved["origin"],
+                intended_local_at=intended_local_at,
+                due_delay_minutes=due_delay_minutes,
+            )
+            return 0
+
+        raw_body = content.get("content", content)
+        body = raw_body if isinstance(raw_body, dict) else {"body": raw_body}
+        claim_started = asyncio.get_running_loop().time()
+        self.logger.info(
+            "daily_stage=claim_start task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f",
+            task_id,
+            target_id,
+            content_type,
+            due_delay_minutes,
+        )
+        claim_id = self.storage.claim_daily_content(
+            content_date=content_date,
+            target_id=target_id,
+            content_type=content_type,
+            body=body,
+            source_item_id=content.get("case_id") or content.get("question_id"),
+            source_kind=content.get("source_kind"),
+            source_item_key=content.get("source_item_key"),
+            resolved_subject=content.get("subject") or selected_subject,
+            resolved_question_type=content.get("question_type")
+            or selected_question_type,
+            resolved_origin=content.get("origin") or resolved["origin"],
+            intended_local_at=intended_local_at,
+            target_label=str(target.get("label") or ""),
+        )
+        self.logger.info(
+            "daily_stage=claim_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=%s",
+            task_id,
+            target_id,
+            content_type,
+            (asyncio.get_running_loop().time() - claim_started) * 1000,
+            "claimed" if claim_id is not None else "already_claimed",
+        )
+        if claim_id is None:
+            return 0
+
+        try:
             question_snapshot = (
                 self._build_question_snapshot(content)
                 if content_type == "daily_question"
@@ -4555,64 +4912,129 @@ class LawAssistantService:
                 if content_type == "daily_case"
                 else self._snapshot_first_prompt(question_snapshot or {})
             )
-            outcome = await self.publisher.publish_text(
-                target["unified_msg_origin"],
-                formatted,
-            )
-            status, error = _delivery_status(outcome)
+        except Exception as exc:  # noqa: BLE001 - malformed content must not publish
             self.storage.finish_daily_content(
-                claim_id, status=status, error_summary=error
+                claim_id,
+                status="failed",
+                error_summary=f"发送前内容准备失败 ({type(exc).__name__})",
             )
-            sent += int(status == "sent")
-            if status == "sent":
-                if question_snapshot is not None:
-                    item = (
-                        content.get("item")
-                        if isinstance(content.get("item"), dict)
-                        else {}
-                    )
-                    opened = self._persist_question_snapshot(
-                        question_snapshot,
-                        session_origin=target["unified_msg_origin"],
-                        target_id=target["id"],
-                        actor_id="scheduler",
-                        source_kind=(
-                            "library_question"
-                            if item
-                            else (
-                                "real_question"
-                                if content.get("origin") == "real"
-                                else "generated_question"
-                            )
-                        ),
-                        source_item_key=str(
-                            content.get("question_id")
-                            or item.get("id")
-                            or question_snapshot.get("snapshot_hash")
-                        ),
-                        question_identity=str(question_snapshot.get("identity") or ""),
-                        library_item_id=item.get("id"),
-                        real_question_id=(
-                            content.get("question_id")
+            self.logger.warning(
+                "daily_stage=content_prepare_end task_id=%s target_id=%s content_type=%s result=failed error_type=%s",
+                task_id,
+                target_id,
+                content_type,
+                type(exc).__name__,
+            )
+            return 0
+
+        publish_started = asyncio.get_running_loop().time()
+        self.logger.info(
+            "daily_stage=publish_start task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f",
+            task_id,
+            target_id,
+            content_type,
+            due_delay_minutes,
+        )
+        try:
+            outcome = await asyncio.wait_for(
+                self.publisher.publish_text(target["unified_msg_origin"], formatted),
+                timeout=DAILY_PUBLISH_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            self.storage.finish_daily_content(
+                claim_id,
+                status="unknown",
+                error_summary="定时发送被取消，送达状态未知",
+            )
+            self.logger.info(
+                "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=unknown stop_reason=cancelled",
+                task_id,
+                target_id,
+                content_type,
+                (asyncio.get_running_loop().time() - publish_started) * 1000,
+            )
+            raise
+        except TimeoutError:
+            status, error = "unknown", "定时发送超时，送达状态未知"
+            error_type = "TimeoutError"
+        except Exception as exc:  # noqa: BLE001 - transport result is ambiguous
+            status, error = (
+                "unknown",
+                f"定时发送异常，送达状态未知 ({type(exc).__name__})",
+            )
+            error_type = type(exc).__name__
+        else:
+            status, _transport_error = _delivery_status(outcome)
+            error = (
+                "定时发送失败"
+                if status == "failed"
+                else "定时发送结果未知，需人工核实"
+                if status == "unknown"
+                else None
+            )
+            error_type = None
+        self.storage.finish_daily_content(claim_id, status=status, error_summary=error)
+        publish_log = self.logger.warning if status != "sent" else self.logger.info
+        publish_log(
+            "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=%s%s",
+            task_id,
+            target_id,
+            content_type,
+            (asyncio.get_running_loop().time() - publish_started) * 1000,
+            due_delay_minutes,
+            status,
+            f" error_type={error_type}" if error_type else "",
+        )
+        if status != "sent":
+            return 0
+
+        if question_snapshot is not None:
+            item = content.get("item") if isinstance(content.get("item"), dict) else {}
+            try:
+                opened = self._persist_question_snapshot(
+                    question_snapshot,
+                    session_origin=target["unified_msg_origin"],
+                    target_id=target_id,
+                    actor_id="scheduler",
+                    source_kind=(
+                        "library_question"
+                        if item
+                        else (
+                            "real_question"
                             if content.get("origin") == "real"
-                            else None
-                        ),
-                    )
-                    sent_at = self._now_utc()
-                    self._schedule_question_reveals(
-                        plan=plan,
-                        session_id=int(opened["session_id"]),
-                        target_umo=str(target["unified_msg_origin"]),
-                        snapshot=question_snapshot,
-                        snapshot_hash=str(opened["snapshot_hash"]),
-                        sent_at=sent_at,
-                    )
-                self.logger.info(
-                    "Law Assistant sent %s to %s",
-                    content_type,
-                    target["unified_msg_origin"],
+                            else "generated_question"
+                        )
+                    ),
+                    source_item_key=str(
+                        content.get("question_id")
+                        or item.get("id")
+                        or question_snapshot.get("snapshot_hash")
+                    ),
+                    question_identity=str(question_snapshot.get("identity") or ""),
+                    library_item_id=item.get("id"),
+                    real_question_id=(
+                        content.get("question_id")
+                        if content.get("origin") == "real"
+                        else None
+                    ),
                 )
-        return sent
+                self._schedule_question_reveals(
+                    plan=plan,
+                    session_id=int(opened["session_id"]),
+                    target_umo=str(target["unified_msg_origin"]),
+                    snapshot=question_snapshot,
+                    snapshot_hash=str(opened["snapshot_hash"]),
+                    sent_at=self._now_utc(),
+                )
+            except Exception as exc:  # noqa: BLE001 - message is already sent
+                self.logger.error(
+                    "daily_stage=session_persist_failed task_id=%s target_id=%s content_type=%s error_type=%s stop_reason=message_already_sent",
+                    task_id,
+                    target_id,
+                    content_type,
+                    type(exc).__name__,
+                )
+        return 1
 
     def _schedule_question_reveals(
         self,
@@ -4663,6 +5085,49 @@ class LawAssistantService:
                         ),
                     )
 
+    def _record_scheduled_skip(
+        self,
+        *,
+        task_id: str,
+        target: dict[str, Any],
+        content_date: str,
+        content_type: str,
+        reason: str,
+        subject: str | None,
+        question_type: str | None,
+        origin: str | None,
+        intended_local_at: str,
+        due_delay_minutes: float,
+    ) -> None:
+        target_id = int(target["id"])
+        started = asyncio.get_running_loop().time()
+        self.logger.info(
+            "daily_stage=claim_start task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f purpose=skip",
+            task_id,
+            target_id,
+            content_type,
+            due_delay_minutes,
+        )
+        claim_id = self._record_daily_skip(
+            content_date,
+            target_id,
+            content_type,
+            reason,
+            subject,
+            question_type=question_type,
+            origin=origin,
+            intended_local_at=intended_local_at,
+            target_label=str(target.get("label") or ""),
+        )
+        self.logger.info(
+            "daily_stage=claim_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=%s stop_reason=selection_unavailable",
+            task_id,
+            target_id,
+            content_type,
+            (asyncio.get_running_loop().time() - started) * 1000,
+            "skipped" if claim_id is not None else "already_claimed",
+        )
+
     def _record_daily_skip(
         self,
         content_date: str,
@@ -4675,7 +5140,7 @@ class LawAssistantService:
         origin: str | None = None,
         intended_local_at: str | None = None,
         target_label: str = "",
-    ) -> None:
+    ) -> int | None:
         claim_id = self.storage.record_daily_skip(
             content_date=content_date,
             target_id=target_id,
@@ -4689,6 +5154,7 @@ class LawAssistantService:
         )
         if claim_id is not None:
             self.storage.mark_daily_skipped(claim_id, reason)
+        return claim_id
 
     def _auto_publish_enabled(self) -> bool:
         return bool(getattr(self.config, "auto_publish_events", False))

@@ -28,7 +28,7 @@ class NoopPublisher:
         self.logger = logger or logging.getLogger(__name__)
 
     async def publish_text(self, destination: str, text: str) -> bool | PublishOutcome:
-        self.logger.info("Publisher is not enabled: %s", destination)
+        self.logger.info("Publisher is not enabled")
         return False
 
 
@@ -47,8 +47,11 @@ class AstrBotPublisher:
             result = await self.context.send_message(destination, chain)
             return PublishOutcome("sent") if result else PublishOutcome("failed")
         except Exception as exc:  # noqa: BLE001 - transport errors are fail-soft
-            self.logger.warning("Law Assistant publication failed: %s", exc)
-            return PublishOutcome("unknown", str(exc))
+            error_type = type(exc).__name__
+            self.logger.warning(
+                "Law Assistant publication failed; error_type=%s", error_type
+            )
+            return PublishOutcome("unknown", f"publisher error ({error_type})")
 
 
 def format_event(event) -> str:

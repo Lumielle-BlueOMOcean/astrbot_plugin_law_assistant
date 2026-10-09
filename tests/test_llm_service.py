@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -54,3 +55,21 @@ async def test_llm_service_returns_none_without_provider() -> None:
             return None
 
     assert await LLMService(Context()).generate_json("return JSON") is None
+
+
+@pytest.mark.asyncio
+async def test_llm_provider_failure_log_redacts_raw_exception(caplog) -> None:
+    class Context:
+        async def llm_generate(self, **_kwargs):
+            raise RuntimeError("PRIVATE_PROVIDER_CREDENTIAL_SHOULD_NOT_ESCAPE")
+
+    caplog.set_level(logging.WARNING)
+
+    assert (
+        await LLMService(Context(), provider_id="synthetic-provider").generate_json(
+            "synthetic prompt"
+        )
+        is None
+    )
+
+    assert "PRIVATE_PROVIDER_CREDENTIAL_SHOULD_NOT_ESCAPE" not in caplog.text
