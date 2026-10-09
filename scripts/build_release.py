@@ -24,6 +24,7 @@ _EXCLUDED_PREFIXES = (
     "dist/",
     "build/",
 )
+_EXCLUDED_ROOT_FILES = {"AGENTS.md", ".gitignore", ".gitattributes"}
 _EXCLUDED_SUFFIXES = (
     ".pyc",
     ".pyo",
@@ -84,7 +85,11 @@ def build_release(root: str | Path, output_dir: str | Path) -> Path:
     files = []
     for path in _tracked_files(root_path):
         relative = path.relative_to(root_path).as_posix()
-        if not path.is_file() or _is_excluded(relative):
+        if (
+            not path.is_file()
+            or relative in _EXCLUDED_ROOT_FILES
+            or _is_excluded(relative)
+        ):
             continue
         files.append((relative, path))
     required = {"metadata.yaml", "main.py", "_conf_schema.json", "requirements.txt"}
@@ -95,6 +100,8 @@ def build_release(root: str | Path, output_dir: str | Path) -> Path:
     output_path.mkdir(parents=True, exist_ok=True)
     archive_path = output_path / f"{PLUGIN_NAME}-{version}.zip"
     with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
+        # AstrBot 4.22 treats the first ZIP member as the wrapper directory.
+        archive.writestr(f"{PLUGIN_NAME}/", "")
         for relative, path in sorted(files):
             archive.write(path, f"{PLUGIN_NAME}/{relative}")
     if archive_path.stat().st_size <= 0:

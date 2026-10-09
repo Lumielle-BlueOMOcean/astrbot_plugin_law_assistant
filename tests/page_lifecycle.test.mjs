@@ -125,7 +125,7 @@ test("Page apiGet/apiPost consume the already-unwrapped Bridge payload", async (
 test("overview renders safe active-session progress from the Bridge payload", async () => {
   const { bridge, elements, page } = await loadPage();
   bridge.apiGet = async () => ({
-    plugin: { version: "0.6.0" },
+    plugin: { version: "0.6.1" },
     schema_version: 13,
     radar: { current: 0 },
     learning: {},
@@ -332,7 +332,7 @@ test("independent verified-question inventory supports edit and confirmed disabl
     if (endpoint === "management/real-question") {
       return { question: { ...question, selectable: !disabled } };
     }
-    if (endpoint === "overview") return { plugin: { version: "0.6.0" } };
+    if (endpoint === "overview") return { plugin: { version: "0.6.1" } };
     throw new Error(`unexpected GET ${endpoint}`);
   };
   bridge.apiPost = async (endpoint, body) => {

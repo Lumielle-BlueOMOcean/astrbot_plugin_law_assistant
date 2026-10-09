@@ -4,7 +4,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 插件版本 | 0.6.0（正式发布） |
+| 插件版本 | 0.6.1（开发中，未发布） |
 | 数据库 schema | 13 |
 | 仓库 | [Lumielle-BlueOMOcean/astrbot_plugin_law_assistant](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant) |
 | AstrBot | >=4.22.0,<5；嵌入式 Plugin Page 需 >=4.25.0 |
@@ -80,11 +80,30 @@ LLM interprets evidence; deterministic code owns truth。URL、原文 hash、题
 
 ### CI ZIP
 
-GitHub Actions 的成功 release-package job 会产生 astrbot_plugin_law_assistant-0.6.0 artifact，其中 ZIP 文件名为 astrbot_plugin_law_assistant-0.6.0.zip。在支持 ZIP 插件安装的管理器中使用该包；若目标版不提供此能力，解压到：
+GitHub Actions 的成功 release-package job 会产生 `astrbot_plugin_law_assistant-0.6.1` 候选 artifact，其中 ZIP 文件名为 `astrbot_plugin_law_assistant-0.6.1.zip`。0.6.1 当前尚未发布；该 CI 包是候选安装包。在支持 ZIP 插件安装的管理器中使用该包；若目标版不提供此能力，解压到：
 
     {AstrBot 数据目录}/plugins/astrbot_plugin_law_assistant/
 
 确保 metadata.yaml 直接位于插件目录根部，而不是重复嵌套一层目录。ZIP 只含插件代码/静态资源，不含现有配置或运行数据库。
+
+### Windows 深目录与仓库 URL 安装
+
+GitHub Source Archive、AstrBot 配置的下载代理/镜像、以及正式 Release ZIP 是不同分发路径。AstrBot 4.22.0 与 4.25.0 的仓库安装源码都先对 ZIP 成员执行解压，再整理 SHA/版本顶层目录；因此一个过深的文档路径可能在整理前就触发 Windows 路径长度错误。0.6.1 在 Git 仓库使用 `.gitattributes` 的 `export-ignore` 将 docs、tests、scripts、CI 配置和根目录开发规则从 GitHub 源码归档排除；这不影响正常 clone，也不删除仓库历史。CI 将下载待测 exact commit 的 GitHub Source Archive，检查成员、运行文件、路径预算，并通过目标 AstrBot 版本的真实 ZIP 根目录整理方法做加载 smoke。
+
+本轮 CI 测试的精确地址形式为 `https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_law_assistant/archive/<exact-commit-sha>.zip`。它证明该 GitHub exact-commit Source Archive 成员正确，不自动证明 AstrBot UI 当前使用了这个地址：所核对的 AstrBot 4.22.0/4.25.0 源码在未指定分支时会先解析 Releases 并使用最新 release 的 `zipball_url`，分支 URL 则取对应分支归档；4.25 还允许上游调用方传入 `download_url`。因此在 0.6.1 正式发布前，未指定分支的仓库安装仍可能解析到既有 0.6.0 Release。此施工不创建 tag/Release；要验收 0.6.1 候选包，应使用 exact-SHA CI ZIP，或由目标 AstrBot 的仓库安装入口明确选择待测分支/归档。
+
+若 AstrBot 环境配置了第三方镜像、下载代理或自定义 `download_url`，只有在其原样转发同一 GitHub ZIP 时才可继承该结果；本项目无法控制或默认验证未知镜像是否重新打包，故镜像路径仍须在目标环境单独确认。正式 Release ZIP 由另一套运行时文件构建流程生成，并单独执行成员与路径预算检查。无论哪种方式，都不要假设任意深度的 Windows 安装路径均受支持；尽量将 AstrBot 安装在较短路径下。
+
+若仓库 URL 安装曾失败并留下残缺插件目录：
+
+1. 停止 AstrBot，避免它继续加载不完整插件。
+2. 确认失败的代码目录是 `data/plugins/astrbot_plugin_law_assistant/`。
+3. 先备份插件数据目录及用户导入文件。
+4. 仅清理确认属于本次失败的残留插件**代码目录**；不要删除 `data/plugin_data/astrbot_plugin_law_assistant/` 中的数据库或导入资产。
+5. 使用更新后的仓库安装路径重试；若目标宿主的仓库镜像尚未验证，可改用其明确支持的正式 Release ZIP 安装方式，或手动将 ZIP 解压到插件目录并确认没有重复嵌套。
+6. 启动后确认 `main.py` 被发现、插件版本显示正确且命令/Tool 正常注册。安装失败恢复不应由插件脚本自动删除宿主目录或用户数据库。
+
+静态路径预算和 CI 解压/加载 smoke 不等于 Windows 实机验收。实际 Windows AstrBot 的仓库 URL 安装、正式 ZIP 安装、旧 schema 13 数据保留升级仍需在目标机器验证。
 
 ### 升级
 
@@ -520,7 +539,7 @@ AstrBot 4.25 还可执行：
 
     python scripts/build_release.py --output dist
 
-ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、缓存、SQLite、日志、虚拟环境和常见凭据文件。当前 CI workflow 在 main push 与 pull request 运行 5 个 required jobs：Quality / Unit、AstrBot compatibility (4.22.0)、AstrBot compatibility (4.25.0)、Release package smoke (4.22.0)、Release package smoke (4.25.0)。release jobs 从最终提交构建/解压 ZIP 并执行包内编译和 loader smoke；4.25 还执行 Page discovery/API route smoke，生成名为 astrbot_plugin_law_assistant-0.6.0 的 artifact。正式发布以通过 exact-SHA CI 的提交创建 v0.6.0 tag 与 GitHub Release，并使用该提交对应 CI 产物作为发布包；具体运行结果以该 commit 的 Actions 页面为准。
+ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、缓存、SQLite、日志、虚拟环境和常见凭据文件。当前 CI workflow 在 main push 与 pull request 运行 5 个 required jobs：Quality / Unit、AstrBot compatibility (4.22.0)、AstrBot compatibility (4.25.0)、Release package smoke (4.22.0)、Release package smoke (4.25.0)。release jobs 从 `metadata.yaml` 读取包版本，构建/解压 ZIP 并执行包内编译和 loader smoke；同时检查 exact-commit GitHub Source Archive 的成员与 Windows 深路径预算，并调用对应 AstrBot 的真实 ZIP 根目录整理方法完成安装 smoke。4.25 还执行 Release ZIP 与源码 ZIP 的 Page discovery/API route smoke。0.6.1 候选 artifact 名为 `astrbot_plugin_law_assistant-0.6.1`；正式发布仍须经过独立 exact-SHA 审查和单独发布 Gate，CI 成功本身不会创建 tag 或 Release。具体运行结果以该 commit 的 Actions 页面为准。
 
 回归 fixture 不得包含真实题库正文、凭据或生产数据库。真实 QQ/NapCat、真实模型自然语言稳定性、Windows 本机 AstrBot 部署、官网当前实时可用性、用户真题版权及逐题内容质量，需要分别在有授权的实际环境验收；上述本地/CI 测试不能代替它们。
 
@@ -538,6 +557,18 @@ ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、
 | 0.5.1 | cfbb5817cf8bd26a7afe263acfb8f7509f9ecfe4 |
 | 0.5.2 | d4b2ddf3f1fdab76043144b7acdf44a82ad5733c |
 | 0.6.0 | 3c3c70077fc0901883b0f156d7f743ab85ec89d1 |
+
+### 0.6.1 — Unreleased
+
+**修复**
+
+- 修复 Windows 深目录安装时，GitHub 仓库源码归档中的不必要开发文档可能因路径过长而在 AstrBot 整理归档根目录前解压失败的问题。
+- 通过 Git `export-ignore` 保留仓库中的开发文档，同时使其不进入经过验证的 GitHub exact-commit Source Archive；正式 Release ZIP 继续由独立运行时文件构建流程生成。
+
+**测试**
+
+- 增加 GitHub Source Archive 成员检查、Windows 目标路径预算回归、真实 AstrBot ZIP 根目录整理/加载 smoke，以及 AstrBot 4.22.0/4.25.0 兼容验证。
+- Source Archive 检查不代表任意第三方 S3/镜像重新打包结果已验证；Windows 本机安装仍待实机验收。
 
 ### 0.6.0 — 2026-09-30
 

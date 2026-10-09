@@ -84,6 +84,14 @@ jobs:
     steps:
       - name: Check out plugin repository
         uses: actions/checkout@v4
+      - name: Resolve plugin version
+        id: plugin-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' metadata.yaml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -100,26 +108,67 @@ jobs:
         run: |
           python -m pip install "$ASTRBOT_SOURCE"
           python -m pip install -r requirements.txt
+      - name: Download exact GitHub source archive
+        env:
+          SOURCE_ARCHIVE_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          SOURCE_ARCHIVE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/law-assistant-source-$SOURCE_ARCHIVE_SHA.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/$SOURCE_ARCHIVE_REPO/archive/$SOURCE_ARCHIVE_SHA.zip"
+          echo "SOURCE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "SOURCE_ARCHIVE_SHA=$SOURCE_ARCHIVE_SHA" >> "$GITHUB_ENV"
+      - name: Inspect exact GitHub source archive and Windows path budget
+        run: >-
+          python scripts/archive_validation.py "$SOURCE_ARCHIVE"
+          --distribution source --expected-sha "$SOURCE_ARCHIVE_SHA"
+      - name: Install source archive through exact AstrBot updater
+        run: >-
+          python tests/source_archive_install_smoke.py "$ASTRBOT_SOURCE"
+          "$SOURCE_ARCHIVE" --distribution source
+          --source-commit "$SOURCE_ARCHIVE_SHA"
+          --astrbot-commit "${{ matrix.commit }}"
+          --version "${{ steps.plugin-version.outputs.version }}"
+          --output-root "$RUNNER_TEMP/source-installed"
       - name: Build clean release ZIP
         run: python scripts/build_release.py --output "$RUNNER_TEMP/release"
+      - name: Inspect clean release ZIP and Windows path budget
+        run: >-
+          python scripts/archive_validation.py
+          "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-${{ steps.plugin-version.outputs.version }}.zip"
+          --distribution release
+      - name: Install release ZIP through exact AstrBot updater
+        run: >-
+          python tests/source_archive_install_smoke.py "$ASTRBOT_SOURCE"
+          "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-${{ steps.plugin-version.outputs.version }}.zip"
+          --distribution release --astrbot-commit "${{ matrix.commit }}"
+          --version "${{ steps.plugin-version.outputs.version }}"
+          --output-root "$RUNNER_TEMP/release-installed"
       - name: Extract release ZIP
         run: |
           mkdir -p "$RUNNER_TEMP/unpacked"
-          unzip -q "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-0.6.0.zip" -d "$RUNNER_TEMP/unpacked"
+          unzip -q "$RUNNER_TEMP/release/astrbot_plugin_law_assistant-${{ steps.plugin-version.outputs.version }}.zip" -d "$RUNNER_TEMP/unpacked"
       - name: Compile extracted plugin
         run: python -m compileall "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
       - name: Run extracted package loader smoke
         run: python tests/compatibility_smoke.py "$ASTRBOT_SOURCE" --commit "${{ matrix.commit }}" --plugin-root "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
       - name: Run real AstrBot Plugin Page discovery smoke
         if: matrix.version == '4.25.0'
-        run: python tests/page_discovery_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+        run: python tests/page_discovery_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/release-installed"
       - name: Run real AstrBot Plugin API route contract smoke
         if: matrix.version == '4.25.0'
-        run: python tests/web_api_route_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/unpacked/astrbot_plugin_law_assistant"
+        run: python tests/web_api_route_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/release-installed"
+      - name: Run source-archive Plugin Page discovery smoke
+        if: matrix.version == '4.25.0'
+        run: python tests/page_discovery_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/source-installed"
+      - name: Run source-archive Web API route contract smoke
+        if: matrix.version == '4.25.0'
+        run: python tests/web_api_route_smoke.py "$ASTRBOT_SOURCE" "$RUNNER_TEMP/source-installed"
       - name: Upload release ZIP artifact
         if: matrix.version == '4.25.0'
         uses: actions/upload-artifact@v4
         with:
-          name: astrbot_plugin_law_assistant-0.6.0
-          path: ${{ runner.temp }}/release/astrbot_plugin_law_assistant-0.6.0.zip
+          name: astrbot_plugin_law_assistant-${{ steps.plugin-version.outputs.version }}
+          path: ${{ runner.temp }}/release/astrbot_plugin_law_assistant-${{ steps.plugin-version.outputs.version }}.zip
           if-no-files-found: error

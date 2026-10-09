@@ -1,0 +1,7 @@
+/docs/ export-ignore
+/tests/ export-ignore
+/scripts/ export-ignore
+/.github/ export-ignore
+/AGENTS.md export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
