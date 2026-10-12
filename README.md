@@ -515,13 +515,15 @@ SQLite 和用户数据写入 AstrBot 插件专属路径：
 推荐 Python 3.12（AstrBot 4.22/4.25 环境也要求该主版本）：
 
     python -m pip install -r requirements.txt
-    python -m pip install pytest pytest-asyncio ruff quart
+    python -m pip install pytest pytest-asyncio "ruff==0.16.10" quart
     python -m compileall .
     ruff format --check .
     ruff check .
     pytest
     node --test tests/page_lifecycle.test.mjs
     git diff --check
+
+CI 与本地开发将 Ruff 固定为 `0.16.10`，避免 lint 规则随 Ruff 小版本漂移。除此之外，`requirements.txt` 的运行依赖使用版本范围，开发/测试工具（如 pytest、pytest-asyncio 与 quart）也未完整固定；因此仍存在范围内上游版本变化带来的漂移风险。本轮不扩展为全依赖锁定工程。
 
 完整兼容性 smoke 需对应版本官方 AstrBot source checkout：
 
@@ -567,12 +569,15 @@ ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、
 - 修复 Windows 深目录安装时，GitHub 仓库源码归档中的不必要开发文档可能因路径过长而在 AstrBot 整理归档根目录前解压失败的问题。
 - 通过 Git `export-ignore` 保留仓库中的开发文档，同时使其不进入经过验证的 GitHub exact-commit Source Archive；正式 Release ZIP 继续由独立运行时文件构建流程生成。
 - 修复每日 due work 的串行阻塞：案例、每日一题和延迟揭晓独立执行；同类目标任务采用有界并发，选题与发送设置超时。
+- 修复跨目标到期时刻：若目标在上一目标执行期间到点且当天尚无执行记录，Scheduler 会在当日本地日期内重新检查；已存在 sent/failed/skipped/unknown 记录仍阻止重复发送，overdue 重检至少间隔 5 秒，due 解析异常使用 30 秒重试间隔。
 - 为 Scheduler wake/due、选题、claim、发布和揭晓阶段增加脱敏时序日志；发送结果未知时保留幂等记录并转人工核实，不自动重发。`attempted_at` 明确为选题后的 claim 时间。
+- 固定本地与 CI 使用 Ruff 0.16.10，避免 lint 规则随工具版本漂移；运行依赖仍使用受约束的版本范围，其他开发/测试依赖也未完整锁定，仍存在上游版本漂移风险。
 
 **测试**
 
 - 增加 GitHub Source Archive 成员检查、Windows 目标路径预算回归、真实 AstrBot ZIP 根目录整理/加载 smoke，以及 AstrBot 4.22.0/4.25.0 兼容验证。
 - 增加可控时钟到点/唤醒、案例与目标阻塞隔离、选择与 claim 时序、超时和 unknown 不重发、重启后 catch-up/延迟揭晓回归。
+- 增加 16:30/16:31 跨目标慢执行、终态幂等、内部异常重检间隔及计划到期/选题/claim/发布时序回归。
 - Source Archive 检查不代表任意第三方 S3/镜像重新打包结果已验证；Windows 本机安装仍待实机验收。
 
 ### 0.6.0 — 2026-09-30

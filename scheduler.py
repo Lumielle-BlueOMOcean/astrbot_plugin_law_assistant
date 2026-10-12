@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+OVERDUE_RECHECK_SECONDS = 5.0
+DUE_RESOLUTION_RETRY_SECONDS = 30.0
+
 
 class LawAssistantScheduler:
     """Own independent interval-scan and due-time task lifecycles."""
@@ -151,12 +154,41 @@ class LawAssistantScheduler:
             self._wake_event.clear()
             task_id = uuid4().hex[:12]
             current = self.clock()
+            wake_due_at = None
+            try:
+                wake_due_at = self.service.next_due_at(current)
+                if wake_due_at is not None and wake_due_at.tzinfo is None:
+                    raise ValueError(
+                        "next_due_at must return a timezone-aware datetime"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - due work still gets its catch-up pass
+                self.logger.warning(
+                    "scheduler_event=wake_plan_failed scheduler_id=%s task_id=%s error_type=%s",
+                    self._scheduler_id,
+                    task_id,
+                    type(exc).__name__,
+                )
+                wake_due_at = None
+            wake_delay_seconds = (
+                (
+                    current.astimezone(timezone.utc)
+                    - wake_due_at.astimezone(timezone.utc)
+                ).total_seconds()
+                if wake_due_at is not None
+                else None
+            )
             self.logger.info(
-                "scheduler_event=wake scheduler_id=%s task_id=%s wake_reason=%s wake_at=%s",
+                "scheduler_event=wake scheduler_id=%s task_id=%s wake_reason=%s wake_at=%s planned_due_at=%s wake_delay_seconds=%s",
                 self._scheduler_id,
                 task_id,
                 wake_reason,
                 current.isoformat(),
+                wake_due_at.isoformat() if wake_due_at is not None else "none",
+                f"{wake_delay_seconds:.3f}"
+                if wake_delay_seconds is not None
+                else "none",
             )
             try:
                 await self.service.process_due_work(now=current, task_id=task_id)
@@ -202,9 +234,12 @@ class LawAssistantScheduler:
                             - planned_at.astimezone(timezone.utc)
                         ).total_seconds(),
                     )
+                    if delay_seconds == 0:
+                        delay_seconds = OVERDUE_RECHECK_SECONDS
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - retry time is recalculated
+                delay_seconds = DUE_RESOLUTION_RETRY_SECONDS
                 self.logger.warning(
                     "scheduler_event=next_due_failed scheduler_id=%s task_id=%s error_type=%s",
                     self._scheduler_id,

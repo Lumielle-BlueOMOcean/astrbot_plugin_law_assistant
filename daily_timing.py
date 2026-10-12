@@ -23,15 +23,24 @@ def local_due_datetime(day: date, wall_time: str, timezone_name: str) -> datetim
     raise ValueError("could not resolve daily plan time in configured timezone")
 
 
-def next_daily_due(now: datetime | str, wall_time: str, timezone_name: str) -> datetime:
-    """Return the nearest future daily HH:MM occurrence in local time."""
+def next_daily_due(
+    now: datetime | str,
+    wall_time: str,
+    timezone_name: str,
+    *,
+    allow_missed_today: bool = False,
+) -> datetime:
+    """Return the next occurrence, optionally retaining today's missed one."""
     current = datetime.fromisoformat(now) if isinstance(now, str) else now
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     zone = ZoneInfo(timezone_name)
     local_now = current.astimezone(zone)
     candidate = local_due_datetime(local_now.date(), wall_time, timezone_name)
-    if candidate <= local_now:
+    is_past_instant = candidate.astimezone(timezone.utc) <= local_now.astimezone(
+        timezone.utc
+    )
+    if is_past_instant and not allow_missed_today:
         candidate = local_due_datetime(
             local_now.date() + timedelta(days=1), wall_time, timezone_name
         )

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from daily_plans import DailyPlan
 from daily_resolver import resolve_daily_constraints
@@ -218,3 +219,41 @@ def test_due_time_resolver_uses_local_wall_time_and_handles_dst_gap_and_fold():
     assert (spring_gap.hour, spring_gap.minute) == (3, 0)
     assert spring_gap.fold == 0
     assert fall_fold.fold == 0
+
+
+def test_due_resolver_can_keep_an_unrecorded_missed_occurrence_on_today():
+    timing = importlib.import_module("daily_timing")
+    now = "2026-09-29T16:32:00+08:00"
+
+    assert timing.next_daily_due(now, "16:30", "Asia/Shanghai").isoformat() == (
+        "2026-09-30T16:30:00+08:00"
+    )
+    assert (
+        timing.next_daily_due(
+            now, "16:30", "Asia/Shanghai", allow_missed_today=True
+        ).isoformat()
+        == "2026-09-29T16:30:00+08:00"
+    )
+
+
+def test_due_resolver_compares_dst_fold_occurrences_by_absolute_time():
+    timing = importlib.import_module("daily_timing")
+    after_first_fold = datetime(
+        2026, 11, 1, 1, 20, tzinfo=ZoneInfo("America/New_York"), fold=1
+    )
+
+    assert (
+        timing.next_daily_due(after_first_fold, "01:30", "America/New_York")
+        .date()
+        .isoformat()
+        == "2026-11-02"
+    )
+    assert (
+        timing.next_daily_due(
+            after_first_fold,
+            "01:30",
+            "America/New_York",
+            allow_missed_today=True,
+        ).isoformat()
+        == "2026-11-01T01:30:00-04:00"
+    )

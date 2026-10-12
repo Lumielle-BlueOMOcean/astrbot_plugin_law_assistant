@@ -4629,13 +4629,20 @@ class LawAssistantService:
                 plan = self.effective_daily_plan(target_id, content_type)
                 if not plan.enabled:
                     continue
-                due = next_daily_due(current, plan.time, timezone_name)
-                if due.astimezone(
-                    local_now.tzinfo
-                ).date() == local_today and self.storage.has_daily_content(
+                has_today_record = self.storage.has_daily_content(
                     content_date=local_today.isoformat(),
                     target_id=target_id,
                     content_type=content_type,
+                )
+                due = next_daily_due(
+                    current,
+                    plan.time,
+                    timezone_name,
+                    allow_missed_today=not has_today_record,
+                )
+                if (
+                    has_today_record
+                    and due.astimezone(local_now.tzinfo).date() == local_today
                 ):
                     due = next_daily_due(
                         due + timedelta(seconds=1), plan.time, timezone_name
@@ -4698,6 +4705,10 @@ class LawAssistantService:
                 tasks.append(group.create_task(run_target(target)))
         return sum(task.result() for task in tasks)
 
+    def _daily_due_delay_minutes(self, intended_local: datetime) -> float:
+        """Measure lateness using a fresh wall-clock observation."""
+        return (_as_utc(self.clock()) - _as_utc(intended_local)).total_seconds() / 60
+
     async def _run_daily_target(
         self,
         *,
@@ -4716,7 +4727,6 @@ class LawAssistantService:
         timezone_name = getattr(self.config, "timezone", "Asia/Shanghai")
         intended_local = local_due_datetime(local_now.date(), plan.time, timezone_name)
         intended_local_at = f"{intended_local.isoformat()}[{timezone_name}]"
-        due_delay_minutes = max(0.0, (local_now - intended_local).total_seconds() / 60)
         content_date = local_now.date().isoformat()
         resolved = resolve_daily_constraints(
             plan,
@@ -4741,7 +4751,7 @@ class LawAssistantService:
                 question_type=selected_question_type,
                 origin=resolved["origin"],
                 intended_local_at=intended_local_at,
-                due_delay_minutes=due_delay_minutes,
+                due_delay_minutes=self._daily_due_delay_minutes(intended_local),
             )
             return 0
         if self.storage.has_daily_content(
@@ -4754,7 +4764,7 @@ class LawAssistantService:
                 task_id,
                 target_id,
                 content_type,
-                due_delay_minutes,
+                self._daily_due_delay_minutes(intended_local),
             )
             return 0
 
@@ -4765,7 +4775,7 @@ class LawAssistantService:
             task_id,
             target_id,
             content_type,
-            due_delay_minutes,
+            self._daily_due_delay_minutes(intended_local),
         )
         try:
             if content_type == "daily_case":
@@ -4789,20 +4799,22 @@ class LawAssistantService:
                 )
         except asyncio.CancelledError:
             self.logger.info(
-                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=stopped stop_reason=cancelled",
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=stopped stop_reason=cancelled",
                 task_id,
                 target_id,
                 content_type,
                 (asyncio.get_running_loop().time() - selection_started) * 1000,
+                self._daily_due_delay_minutes(intended_local),
             )
             raise
         except TimeoutError:
             self.logger.warning(
-                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=timeout error_type=TimeoutError",
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=timeout error_type=TimeoutError",
                 task_id,
                 target_id,
                 content_type,
                 (asyncio.get_running_loop().time() - selection_started) * 1000,
+                self._daily_due_delay_minutes(intended_local),
             )
             self._record_scheduled_skip(
                 task_id=task_id,
@@ -4814,16 +4826,17 @@ class LawAssistantService:
                 question_type=selected_question_type,
                 origin=resolved["origin"],
                 intended_local_at=intended_local_at,
-                due_delay_minutes=due_delay_minutes,
+                due_delay_minutes=self._daily_due_delay_minutes(intended_local),
             )
             return 0
         except Exception as exc:  # noqa: BLE001 - provider failures become daily skips
             self.logger.warning(
-                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=error error_type=%s",
+                "daily_stage=selection_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=error error_type=%s",
                 task_id,
                 target_id,
                 content_type,
                 (asyncio.get_running_loop().time() - selection_started) * 1000,
+                self._daily_due_delay_minutes(intended_local),
                 type(exc).__name__,
             )
             self._record_scheduled_skip(
@@ -4836,7 +4849,7 @@ class LawAssistantService:
                 question_type=selected_question_type,
                 origin=resolved["origin"],
                 intended_local_at=intended_local_at,
-                due_delay_minutes=due_delay_minutes,
+                due_delay_minutes=self._daily_due_delay_minutes(intended_local),
             )
             return 0
 
@@ -4847,7 +4860,7 @@ class LawAssistantService:
             target_id,
             content_type,
             (asyncio.get_running_loop().time() - selection_started) * 1000,
-            due_delay_minutes,
+            self._daily_due_delay_minutes(intended_local),
             "available" if available else "unavailable",
         )
         if not available:
@@ -4861,7 +4874,7 @@ class LawAssistantService:
                 question_type=selected_question_type,
                 origin=resolved["origin"],
                 intended_local_at=intended_local_at,
-                due_delay_minutes=due_delay_minutes,
+                due_delay_minutes=self._daily_due_delay_minutes(intended_local),
             )
             return 0
 
@@ -4873,7 +4886,7 @@ class LawAssistantService:
             task_id,
             target_id,
             content_type,
-            due_delay_minutes,
+            self._daily_due_delay_minutes(intended_local),
         )
         claim_id = self.storage.claim_daily_content(
             content_date=content_date,
@@ -4891,11 +4904,12 @@ class LawAssistantService:
             target_label=str(target.get("label") or ""),
         )
         self.logger.info(
-            "daily_stage=claim_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=%s",
+            "daily_stage=claim_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=%s",
             task_id,
             target_id,
             content_type,
             (asyncio.get_running_loop().time() - claim_started) * 1000,
+            self._daily_due_delay_minutes(intended_local),
             "claimed" if claim_id is not None else "already_claimed",
         )
         if claim_id is None:
@@ -4933,7 +4947,7 @@ class LawAssistantService:
             task_id,
             target_id,
             content_type,
-            due_delay_minutes,
+            self._daily_due_delay_minutes(intended_local),
         )
         try:
             outcome = await asyncio.wait_for(
@@ -4947,11 +4961,12 @@ class LawAssistantService:
                 error_summary="定时发送被取消，送达状态未知",
             )
             self.logger.info(
-                "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f result=unknown stop_reason=cancelled",
+                "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=unknown stop_reason=cancelled",
                 task_id,
                 target_id,
                 content_type,
                 (asyncio.get_running_loop().time() - publish_started) * 1000,
+                self._daily_due_delay_minutes(intended_local),
             )
             raise
         except TimeoutError:
@@ -4981,7 +4996,7 @@ class LawAssistantService:
             target_id,
             content_type,
             (asyncio.get_running_loop().time() - publish_started) * 1000,
-            due_delay_minutes,
+            self._daily_due_delay_minutes(intended_local),
             status,
             f" error_type={error_type}" if error_type else "",
         )
