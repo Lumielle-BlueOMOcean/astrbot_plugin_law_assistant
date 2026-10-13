@@ -238,12 +238,14 @@ Plans 的方向/题型模式采用依赖式控件：random 不展示固定项，
 | confirm | /law confirm {token} | 私聊；确认此前的短期发布预览。token 锁定操作者、正文和目标，不能重复使用。 |
 | case | /law case [方向] | 私聊；获取当日/匹配案例学习内容，不在群内发送。 |
 | question | /law question [real / mock / random] [方向] [题型] | 私聊；按条件选择/生成题目并开启当前私聊 Session；省略项按产品规则随机。非法显式筛选报错。 |
+| question-number | /law question-number {原始题号} [来源选择器] | 私聊；按导入资料中的原始题号打开对应单题或完整客观题组；同号跨资料时必须提供导入编号、文件名或 PDF SHA-256。 |
+| publish-question-number | /law publish-question-number {原始题号} {群名/ID...} [--source {来源选择器}] | 私聊 Admin/operator；准备原始题号对应单题/完整题组的多页发布预览，仍须 `/law confirm {token}` 明确确认。 |
 | study | /law study {资料库题目ID} | 私聊 Admin/operator；打开已存模拟题或候选题 Session；身份标签保持原状。 |
 | current | /law current | Session 当前精确会话；查看当前题面及当前小问揭晓状态。 |
 | next | /law next | Session 当前精确会话；继续阅读当前题面/材料的下一页。 |
 | next-question | /law next-question | Session 当前精确会话；进入下一独立小问。 |
-| answer / next-answer | /law answer、/law next-answer | Session 当前精确会话；显式揭晓当前小问答案/答案续页。 |
-| explanation / next-explanation | /law explanation、/law next-explanation | Session 当前精确会话；单独揭晓解析/解析续页。 |
+| answer / next-answer | /law answer [原始题号]、/law next-answer | Session 当前精确会话；显式揭晓当前题/指定组内成员答案或答案续页。 |
+| explanation / next-explanation | /law explanation [原始题号]、/law next-explanation | Session 当前精确会话；单独揭晓当前题/指定组内成员解析或解析续页。 |
 | close | /law close | Admin/operator；关闭当前精确会话。 |
 | import | /law import {imports内相对路径} [auto / case / mock_question / real_question_candidate] | 私聊 Admin/operator；从插件 imports 受控目录立即归档；不能给任意绝对路径。 |
 | plans / plan | /law plans [目标别名/ID] | 私聊；只读查看全局/群级每日计划与安排。 |
@@ -255,7 +257,7 @@ Plans 的方向/题型模式采用依赖式控件：random 不展示固定项，
 | laws | /law laws | 私聊；只读查看已保存的法规更新。 |
 | help | /law help | 显示简要命令帮助。 |
 
-常用中文入口示例：`法务 状态`、`法务 活动`、`法务 截止`、`法务 题目 刑法 多选`、`法务 真题 知识产权 多选`、`法务 模拟题 民法 案例分析`、`法务 案例 司法实务`、`法务 当前`、`法务 下一页`、`法务 下一题`、`法务 答案`、`法务 答案续页`、`法务 解析`、`法务 解析续页`、`法务 结束`、`法务 计划`、`法务 群计划`、`法务 绑定 法硕一群`、`法务 帮助`。管理操作仍受私聊与 Admin/operator 权限约束；群内绑定是明确例外。
+常用中文入口示例：`法务 状态`、`法务 活动`、`法务 截止`、`法务 题目 刑法 多选`、`法务 真题 知识产权 多选`、`法务 模拟题 民法 案例分析`、`法务 案例 司法实务`、`法务 题号 207`、`法务 发布题号 207 法硕一群`、`法务 当前`、`法务 下一页`、`法务 下一题`、`法务 答案 207`、`法务 答案续页`、`法务 解析 208`、`法务 解析续页`、`法务 结束`、`法务 计划`、`法务 群计划`、`法务 绑定 法硕一群`、`法务 帮助`。管理操作仍受私聊与 Admin/operator 权限约束；群内绑定是明确例外。
 
 参数形式以当前仓库 CLI parser 为准；常用中文题型别名包括单选、多选、不定项、判断、简答、案例分析。发布目标名若重名，应使用唯一别名或 ID 消除歧义。
 
@@ -266,6 +268,8 @@ Plans 的方向/题型模式采用依赖式控件：random 不展示固定项，
 可以在私聊中说“看看最近有哪些法硕比赛”“给我一道知识产权真题多选题”“给我一个司法实务案例”“把刚才这道题发到法硕一群”“显示一群未来七天案例和题目计划”。LLM 负责把意图映射为结构化参数；插件继续做权限、方向/类型校验、证据检查和目标锁定。
 
 题目/案例读取 Tool 可返回短期 content_ref；“把刚才那道题发到群里”通过引用锁定相同内容，“重新出一道题再发”则需明确选择新内容。发布流程先预览，确认时不会重新生成或随机选择。长期计划变更必须预览并确认。
+
+原始题号读取可用 `/law question-number 207 [来源选择器]` 或 `law_generate_question(question_number="207", source_selector="...")`。题组会按来源声明的顺序完整展示；同号存在于多个导入资料时，必须提供精确的来源选择器。`/law publish-question-number 207 法硕一群` 或 `law_prepare_publish_question(question_number="207", target="法硕一群")` 只生成锁定正文和群目标的预览，仍需显式确认。
 
 当前注册的 25 个 Tools：
 
@@ -363,7 +367,9 @@ token 绑定操作者并限时、一次性。目标失效、token 过期、重�
 
 ## Structured Material v1：PDF 与 JSON 成对导入
 
-该格式是候选资料交换契约，不是官方身份声明。规范详见 docs/structured-material-v1.md。Schema 固定为字符串 "1.0"；prepare 同时校验原 PDF 字节 SHA-256、JSON 原文 hash 与规范化 payload hash，confirm 使用同一快照。请先阅读 validator 预览中的 fatal/error/review、材料、小问、答题要求、locator 与答案来源，再确认。
+**版本说明：** 下方 JSON 骨架是 1.0 示例；插件兼容 1.0 与 1.1。1.1 增加必须显式提供的 `objective_question_groups`（无分组时为空数组），完整定义见后文及 `docs/structured-material-v1.md`。
+
+该格式是候选资料交换契约，不是官方身份声明。规范详见 `docs/structured-material-v1.md`。下方模板的 schema_version 为 "1.0" 示例，插件同时支持 1.0 与 1.1；prepare 会校验原 PDF 字节 SHA-256、JSON 原文 hash 与规范化 payload hash，confirm 使用同一快照。请先阅读 validator 预览中的 fatal/error/review、材料、题组、小问、答题要求、locator 与答案来源，再确认。
 
 下面是虚构结构骨架，不是题目示例，也不能原样作为真实导入；64 个零仅是 hash 占位符，必须替换为原 PDF 的真实 SHA-256：
 
@@ -399,6 +405,14 @@ token 绑定操作者并限时、一次性。目标失效、token 过期、重�
 可用题型：single_choice、multiple_choice、indefinite_choice、true_false、short_answer、case_analysis。materials 保存共享事实/材料；Question 的 stem_blocks 保存顶层问题；真正独立的小问才放 subquestions；评分和作答规范放 answer_requirements。答案和解释与题面分开，保留 locator、provenance。JSON 中声称 official/verified 不授予该身份。
 
 确认导入后，题目身份是 real_question_candidate，验证状态 pending_review；它不会进入 /law question real 的核验真题库存。候选题可由有权限的操作者显式学习，屏幕上仍会标明候选身份。官方案例身份只由受信 source adapter 路径确定。
+
+### 显式客观题组（Structured Material 1.1）
+
+Schema 1.1 在顶层增加必需的 `objective_question_groups` 数组（无组时为空数组）。每组用 `id`、有序 `material_refs`、至少两个有序 `question_refs` 和 `publish_mode: "all_at_once"` 显式声明；可选 `source_directives` 保存来源引导语。成员仅限单选、多选、不定项和判断题，不得含 `subquestions`，且每个成员的 `material_refs` 必须与组完全一致。题组不能重叠、重复成员或悬空引用。Schema 1.0 保持原行为：不能带题组字段；Schema 1.1 不能漏掉该数组。校验器不会根据相似案情或文本相邻关系猜测分组。
+
+题号命令对组内任意成员都返回同一题组；未分组但引用材料的客观单题也会连同公共材料完整展示。客观题组是每日选择和群发布的不可拆分单位：明确的来源、方向或题型条件必须被所有成员同时满足；部分成员尚未按既有流程晋级核验时，整组不得进入 `origin=real` 库存。人工通过来源题号打开的资料仍带有待复核身份标记。
+
+客观题组发布按公共材料、成员题干及选项顺序生成答案安全页面，页面预算为 `min(question_message_max_chars, 1000)`。目标群逐页顺序发送；遇失败或结果未知立即停止该群，不重发，不记录成功题组历史、不建立 Question Session。只有所有页面均成功，才按该导入资料中的组身份记一次历史并建立一个目标 Session；其他目标独立处理。该路径不改变主观题和普通单题的既有分阶段揭晓行为。
 
 ## 已核验真题 JSON 导入
 
@@ -579,6 +593,16 @@ ZIP 从 Git 已跟踪文件建立，排除 .git、CI、tests、scripts、docs、
 - 增加可控时钟到点/唤醒、案例与目标阻塞隔离、选择与 claim 时序、超时和 unknown 不重发、重启后 catch-up/延迟揭晓回归。
 - 增加 16:30/16:31 跨目标慢执行、终态幂等、内部异常重检间隔及计划到期/选题/claim/发布时序回归。
 - Source Archive 检查不代表任意第三方 S3/镜像重新打包结果已验证；Windows 本机安装仍待实机验收。
+
+**客观题关联题组**
+
+- 扩展 Structured Material 1.1 的显式客观题组契约；原始题号命中组内任一成员时，按固定顺序解析完整题组，不按文本相似度推断分组。
+- 客观题组在核验真题选择、手动发布和每日发送中作为导入范围内的不可拆分单位；任一成员仍为待复核候选时，整组不进入 verified-real 库存，人工学习仍保留候选身份。
+- 手动预览和每日发送共享答案安全的多页正文；目标群逐页顺序发送，全部成功后才计组级历史并开启 Session。失败/unknown 停止当前目标，不自动重发。
+
+**新增回归测试**
+
+- 覆盖 1.1 组 validator/持久化、题号精确消歧、严格筛选、答案安全 Session、锁定多页预览、部分发送失败及组级每日幂等；测试只使用合成数据。
 
 ### 0.6.0 — 2026-09-30
 

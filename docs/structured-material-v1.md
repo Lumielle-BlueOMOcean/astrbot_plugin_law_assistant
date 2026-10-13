@@ -15,7 +15,9 @@
 }
 ```
 
-`schema_version` 必填且目前只能是字符串 `"1.0"`。未知重大版本会被拒绝，插件不会静默解释未知字段。`materials`、`questions`、`cases` 可以为空；一份资料可以只包含题目、只包含案例，或包含公共材料与其中任意一种条目。
+`schema_version` 必填且目前支持字符串 `"1.0"` 与向后兼容的 `"1.1"`。未知重大版本会被拒绝，插件不会静默解释未知字段。`materials`、`questions`、`cases` 可以为空；一份资料可以只包含题目、只包含案例，或包含公共材料与其中任意一种条目。Schema 1.1 还必须提供 `objective_question_groups`，没有显式分组时使用空数组。
+
+1.0 的既有格式与行为不变；1.1 必须显式提供顶层 `objective_question_groups` 数组，即使没有分组也应提供空数组。1.0 若包含该字段会被拒绝，1.1 若缺少该字段也会被拒绝，避免消费者静默丢弃题组关系。
 
 校验入口是 `structured_material.validate_structured_material()`，预览入口是 `structured_material.build_structured_material_preview()`。两者都是纯校验/转换操作，不写 SQLite、不保存文件、不调用网络或 LLM。
 
@@ -160,6 +162,39 @@
 一道只有多个自然段的长题仍然只使用一个 Question。不能把 block ID 当成题目 ID，也不能把“题干1、题干2”伪装成独立小问。
 
 只有原资料确实列出多个独立作答问题时才建立小问。编号列表本身不是充分依据：字数、评分和表达规范等答题要求属于 `answer_requirements`。小问答案只有在来源中的编号/题目标题能够确定性对应时才关联；无法唯一对应时保留 unresolved 状态，不按位置猜配。
+
+## 1.1：客观题关联题组
+
+题组是由来源明确声明的客观题发布单位，不是根据案情文字相似或题号相邻推断出的关系。示意：
+
+```json
+{
+  "schema_version": "1.1",
+  "objective_question_groups": [
+    {
+      "id": "GROUP-01",
+      "material_refs": ["M01"],
+      "question_refs": ["Q006", "Q007", "Q008"],
+      "publish_mode": "all_at_once",
+      "source_directives": ["请根据以上材料依次作答"]
+    }
+  ]
+}
+```
+
+实际文件仍需包含完整的 `document`、`materials`、`questions`、`cases` 及必需字段；上例只展示新增分组字段。
+
+每个题组对象只接受 `id`、`material_refs`、`question_refs`、`publish_mode` 和可选 `source_directives`：
+
+- `id` 在整份文档所有对象中唯一。
+- `material_refs` 和 `question_refs` 是有序引用数组。材料引用必须存在；至少引用两个不同题目，且每个成员都必须存在并且只属于一个题组。
+- 成员题型只能是 `single_choice`、`multiple_choice`、`indefinite_choice` 或 `true_false`，不得包含 `subquestions`。成员自身的 `material_refs` 必须与题组的有序材料引用完全相同。
+- 当前唯一支持的 `publish_mode` 是 `all_at_once`，即整组一起选题和发布。
+- 可选 `source_directives` 是字符串数组；若包含元素，每项必须是非空字符串。它保留原文引导语供来源审计，不是额外题目、选项、答案或解析。
+
+组内每个来源题号都解析为同一完整题组，成员顺序严格按 `question_refs`；材料只展示一次。未显式分组但引用公共材料的客观单题仍独立交付并包含其材料。组成员必须全部满足显式来源/方向/题型筛选，否则整个组不进入该候选范围。所有成员都完成现有核验晋级之前，组不能进入 verified-real 日常库存；候选学习仍保留 `real_question_candidate` / `pending_review` 身份。
+
+组消息分页只含共享材料、每个成员的题干及选项，不含答案/解析；每条正文预算为 `min(question_message_max_chars, 1000)`。人工发布先固定全部页面和目标并经确认后顺序发送。任意一页失败或状态未知即停止该目标，不自动重发，不将部分发送记为成功，也不为其建立 Question Session。全部成功后按导入范围内的题组身份计一次每日历史并建立一个目标 Session；不同目标的结果相互独立。Schema 1.0 和非组题目不因该扩展而自动聚类。
 
 ## cases：案例
 

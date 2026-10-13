@@ -100,6 +100,7 @@ def _valid_document() -> dict:
             ),
         ],
     }
+
     question = _question(
         material_refs=["M01"],
         answer={
@@ -154,6 +155,37 @@ def _valid_document() -> dict:
     }
 
 
+def _valid_objective_group_document() -> dict:
+    payload = _valid_document()
+    payload["schema_version"] = "1.1"
+    payload["questions"] = [
+        _question(
+            f"Q20{number}",
+            question_type="multiple_choice",
+            source_number=str(number),
+            material_refs=["M01"],
+            stem_blocks=[
+                _block(
+                    f"Q20{number}-S01",
+                    1,
+                    f"合成题目 {number} 的问题？",
+                )
+            ],
+        )
+        for number in (1, 2, 3)
+    ]
+    payload["objective_question_groups"] = [
+        {
+            "id": "G201-203",
+            "material_refs": ["M01"],
+            "question_refs": ["Q201", "Q202", "Q203"],
+            "publish_mode": "all_at_once",
+            "source_directives": ["合成原文引导语"],
+        }
+    ]
+    return payload
+
+
 def _issue_codes(result) -> set[str]:
     return {issue.code for issue in result.issues}
 
@@ -173,6 +205,7 @@ def test_valid_document_preview_preserves_order_provenance_and_counts():
     assert preview["document"]["title"] == "虚构结构化资料样本"
     assert preview["counts"] == {
         "questions": 1,
+        "objective_question_groups": 0,
         "cases": 1,
         "materials": 1,
         "subquestions": 0,
@@ -208,6 +241,80 @@ def test_json_text_is_parsed_and_unknown_schema_is_fatal():
     result = validate_structured_material(unknown)
     assert result.fatal is True
     assert "schema.unsupported_version" in _issue_codes(result)
+
+
+def test_schema_1_1_accepts_ordered_objective_group_and_previews_it():
+    payload = _valid_objective_group_document()
+
+    result = validate_structured_material(payload)
+    preview = build_structured_material_preview(payload)
+
+    assert result.fatal is False
+    assert result.usable_questions == 3
+    assert result.objective_question_groups == tuple(
+        payload["objective_question_groups"]
+    )
+    assert preview["counts"]["objective_question_groups"] == 1
+    assert preview["objective_question_groups"][0] == {
+        "id": "G201-203",
+        "material_refs": ["M01"],
+        "question_refs": ["Q201", "Q202", "Q203"],
+        "publish_mode": "all_at_once",
+    }
+
+
+@pytest.mark.parametrize(
+    ("invalidity", "expected_code"),
+    [
+        ("missing_field", "objective_group.missing"),
+        ("dangling_question", "objective_group.question_ref_missing"),
+        ("duplicate_member", "objective_group.question_ref_duplicate"),
+        ("overlap", "objective_group.member_overlap"),
+        ("non_objective", "objective_group.member_not_objective"),
+        ("subquestions", "objective_group.subquestions_forbidden"),
+        ("wrong_material", "objective_group.material_refs_mismatch"),
+        ("invalid_mode", "objective_group.publish_mode_invalid"),
+        ("unknown_field", "objective_group.unknown_field"),
+    ],
+)
+def test_schema_1_1_rejects_invalid_objective_group_contract(
+    invalidity: str, expected_code: str
+):
+    payload = _valid_objective_group_document()
+    group = payload["objective_question_groups"][0]
+    if invalidity == "missing_field":
+        payload.pop("objective_question_groups")
+    elif invalidity == "dangling_question":
+        group["question_refs"][1] = "missing-question"
+    elif invalidity == "duplicate_member":
+        group["question_refs"][1] = group["question_refs"][0]
+    elif invalidity == "overlap":
+        group["question_refs"] = ["Q201", "Q202"]
+        payload["objective_question_groups"].append(
+            {
+                "id": "G202-203",
+                "material_refs": ["M01"],
+                "question_refs": ["Q202", "Q203"],
+                "publish_mode": "all_at_once",
+            }
+        )
+    elif invalidity == "non_objective":
+        payload["questions"][1]["question_type"] = "short_answer"
+    elif invalidity == "subquestions":
+        payload["questions"][1]["subquestions"] = [
+            {"id": "sub-1", "source_number": "1", "stem_blocks": []}
+        ]
+    elif invalidity == "wrong_material":
+        payload["questions"][1]["material_refs"] = []
+    elif invalidity == "invalid_mode":
+        group["publish_mode"] = "one_at_a_time"
+    elif invalidity == "unknown_field":
+        group["guess_members_by_text"] = True
+
+    result = validate_structured_material(payload)
+
+    assert result.fatal is True
+    assert expected_code in _issue_codes(result)
 
 
 @pytest.mark.parametrize(

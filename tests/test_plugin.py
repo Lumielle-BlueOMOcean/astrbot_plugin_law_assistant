@@ -208,6 +208,166 @@ def test_chinese_command_aliases_normalize_question_origins_and_session_actions(
 
 
 @pytest.mark.asyncio
+async def test_source_number_command_and_tools_delegate_to_group_service(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+
+    class GroupService:
+        def __init__(self):
+            self.calls = []
+
+        async def start_question_by_number(
+            self,
+            source_number,
+            *,
+            source_selector,
+            session_origin,
+            actor_id,
+            origin="random",
+            subject="",
+            question_type=None,
+        ):
+            self.calls.append(
+                (
+                    "start",
+                    source_number,
+                    source_selector,
+                    session_origin,
+                    actor_id,
+                    origin,
+                    subject,
+                    question_type,
+                )
+            )
+            return {"success": True, "text": "整组题面"}
+
+        async def prepare_publish_question(
+            self,
+            *,
+            source_number,
+            source_selector,
+            target_selectors,
+            session_origin,
+            actor_id,
+            **kwargs,
+        ):
+            self.calls.append(
+                (
+                    "prepare",
+                    source_number,
+                    source_selector,
+                    target_selectors,
+                    session_origin,
+                    actor_id,
+                )
+            )
+            return {"ready": True, "preview": "整组预览"}
+
+        async def question_session_action(
+            self, action, *, question_number, session_origin, actor_id
+        ):
+            self.calls.append(
+                ("action", action, question_number, session_origin, actor_id)
+            )
+            return {"success": True, "text": "指定题答案"}
+
+    service = GroupService()
+    plugin.service = service
+    event = FakeEvent(
+        private=True,
+        sender_id="42",
+        message="/law question-number 207 source-a.json",
+        unified_msg_origin="aiocqhttp:FriendMessage:42",
+    )
+
+    command_result = await anext(plugin.law(event))
+    event.message = (
+        '/law publish-question-number 207 "一群,二群" --source source-a.json'
+    )
+    publish_command_result = await anext(plugin.law(event))
+    tool_result = await plugin.law_generate_question(
+        event,
+        question_number="208",
+        source_selector="source-b.json",
+        subject="民商法",
+        question_type="多选",
+    )
+    publish_result = await plugin.law_prepare_publish_question(
+        event,
+        question_number="207",
+        source_selector="source-a.json",
+        target="一群,二群",
+    )
+    answer_result = await plugin.law_question_session(
+        event, action="answer", question_number="208"
+    )
+    event.message = "/law answer 206"
+    answer_command_result = await anext(plugin.law(event))
+
+    assert command_result == "整组题面"
+    assert json.loads(publish_command_result)["preview"] == "整组预览"
+    assert json.loads(tool_result)["text"] == "整组题面"
+    assert json.loads(publish_result)["preview"] == "整组预览"
+    assert json.loads(answer_result)["text"] == "指定题答案"
+    assert answer_command_result == "指定题答案"
+    assert service.calls == [
+        (
+            "start",
+            "207",
+            "source-a.json",
+            event.unified_msg_origin,
+            "42",
+            "random",
+            "",
+            None,
+        ),
+        (
+            "prepare",
+            "207",
+            "source-a.json",
+            ["一群", "二群"],
+            event.unified_msg_origin,
+            "42",
+        ),
+        (
+            "start",
+            "208",
+            "source-b.json",
+            event.unified_msg_origin,
+            "42",
+            "random",
+            "民商法",
+            "多选",
+        ),
+        (
+            "prepare",
+            "207",
+            "source-a.json",
+            ["一群", "二群"],
+            event.unified_msg_origin,
+            "42",
+        ),
+        ("action", "answer", "208", event.unified_msg_origin, "42"),
+        ("action", "answer", "206", event.unified_msg_origin, "42"),
+    ]
+
+
+def test_source_number_commands_have_explicit_chinese_aliases(plugin_module):
+    normalize = plugin_module._normalize_law_command_parts
+    assert normalize("法务 题号 207") == ["/law", "question-number", "207"]
+    assert normalize("法务 发布题号 207 一群") == [
+        "/law",
+        "publish-question-number",
+        "207",
+        "一群",
+    ]
+    assert plugin_module._parse_publish_question_number_args(
+        ["207", "一群,二群", "--source", "source-file.pdf"]
+    ) == ("207", "source-file.pdf", ["一群", "二群"])
+
+
+@pytest.mark.asyncio
 async def test_question_command_returns_bounded_text_and_explicit_answer_continuation(
     plugin_module,
 ):

@@ -28,6 +28,7 @@ if __package__ and "." in __package__:
         parse_question_type,
         parse_subject,
         real_question_identity_key,
+        subject_matches,
     )
     from .daily_plans import DailyPlan
     from .daily_resolver import resolve_daily_constraints
@@ -42,6 +43,7 @@ if __package__ and "." in __package__:
     from .library_models import LibrarySource
     from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
+    from .objective_question_groups import normalize_source_number
     from .pagination import page_payload, page_request
     from .publisher import format_deadline_reminder, format_event
     from .question_session import (
@@ -51,6 +53,7 @@ if __package__ and "." in __package__:
         format_session_answer,
         format_session_explanation,
         format_session_prompt,
+        format_session_prompt_pages,
         format_session_status,
         prepare_question_session_snapshot,
     )
@@ -76,6 +79,7 @@ else:
         parse_question_type,
         parse_subject,
         real_question_identity_key,
+        subject_matches,
     )
     from daily_plans import DailyPlan
     from daily_resolver import resolve_daily_constraints
@@ -87,6 +91,7 @@ else:
     from library_models import LibrarySource
     from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
+    from objective_question_groups import normalize_source_number
     from pagination import page_payload, page_request
     from publisher import format_deadline_reminder, format_event
     from question_session import (
@@ -96,6 +101,7 @@ else:
         format_session_answer,
         format_session_explanation,
         format_session_prompt,
+        format_session_prompt_pages,
         format_session_status,
         prepare_question_session_snapshot,
     )
@@ -145,6 +151,7 @@ class PendingPublication:
     source_item_key: str | None = None
     library_item_id: int | None = None
     real_question_id: int | None = None
+    bodies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,7 +440,9 @@ class LawAssistantService:
         ):
             library_id = None
         item_key = str(
-            content.get("question_id")
+            content.get("source_item_key")
+            or content.get("objective_group_id")
+            or content.get("question_id")
             or item.get("id")
             or snapshot.get("snapshot_hash")
         )
@@ -578,8 +587,269 @@ class LawAssistantService:
             opened["content_ref"] = remembered["content_ref"]
         return opened
 
+    def _structured_question_by_number(
+        self, source_number: str, source_selector: str | None = None
+    ) -> dict[str, Any]:
+        """Resolve one import-scoped objective source number without guessing."""
+        if self.library_service is None:
+            return {"available": False, "reason": "结构化资料库服务不可用"}
+        repository = self.library_service.repository
+        matches = repository.list_structured_source_number_matches(source_number)
+        selector = str(source_selector or "").strip()
+        if selector:
+            matches = [
+                unit
+                for unit in matches
+                if self._structured_unit_matches_selector(unit, selector)
+            ]
+        if not matches:
+            suffix = f"（来源：{selector}）" if selector else ""
+            return {
+                "available": False,
+                "error": "source_number_not_found",
+                "reason": f"没有找到原始题号 {source_number}{suffix}。",
+            }
+        if len(matches) > 1:
+            choices = [self._structured_unit_source_summary(unit) for unit in matches]
+            labels = "；".join(
+                f"导入 #{item['import_id']}（{item['source_file'] or '未命名来源'}）"
+                for item in choices
+            )
+            return {
+                "available": False,
+                "error": "ambiguous_source_number",
+                "reason": (
+                    f"原始题号 {source_number} 在多个导入中重复：{labels}。"
+                    "请用导入编号、来源文件名或 PDF SHA-256 指定来源。"
+                ),
+                "matches": choices,
+            }
+        unit = matches[0]
+        members = unit.get("members")
+        if not isinstance(members, list) or not members:
+            return {"available": False, "reason": "该题号没有完整的持久化成员"}
+        objective_types = {
+            "single_choice",
+            "multiple_choice",
+            "indefinite_choice",
+            "true_false",
+        }
+        payloads: list[dict[str, Any]] = []
+        for member in members:
+            payload = member.get("payload")
+            bundle = member.get("bundle")
+            if not isinstance(payload, dict) or bundle is None:
+                return {"available": False, "reason": "题组来源记录不完整"}
+            if payload.get("question_type") not in objective_types or payload.get(
+                "subquestions"
+            ):
+                return {
+                    "available": False,
+                    "error": "unsupported_question_type",
+                    "reason": "原始题号不属于支持的客观题题组。",
+                }
+            if not bundle.item.active or bundle.item.deleted_at:
+                return {"available": False, "reason": "题组中存在已停用的资料条目"}
+            payloads.append(payload)
+
+        all_verified = all(
+            member.get("verified_real_question_id") is not None
+            and member["bundle"].item.identity == "verified_real_question"
+            for member in members
+        )
+        identity = (
+            "verified_real_question" if all_verified else "real_question_candidate"
+        )
+        first = members[0]
+        first_payload = payloads[0]
+        item = first["bundle"].item
+        subjects = list(item.subjects)
+        question = dict(first_payload)
+        question["question_identity"] = identity
+        structured = {
+            "payload": first_payload,
+            "answer_requirements": first_payload.get("answer_requirements", []),
+        }
+        is_group = bool(unit.get("group_id"))
+        content: dict[str, Any] = {
+            "available": True,
+            "origin": "real" if all_verified else "candidate",
+            "identity": identity,
+            "subject": (first_payload.get("subjects") or subjects or ["other"])[0],
+            "question_type": str(first_payload.get("question_type") or ""),
+            "question_id": first.get("verified_real_question_id")
+            if all_verified
+            else None,
+            "question": question,
+            "item": {
+                "id": first["item_id"],
+                "identity": identity,
+                "subjects": subjects,
+                "title": item.title,
+            },
+            "structured": structured,
+            "shared_materials": unit.get("shared_materials", []),
+            "source_kind": (
+                "structured_objective_group"
+                if is_group
+                else "structured_objective_question"
+            ),
+            "source_item_key": str(unit.get("unit_key") or ""),
+            "objective_group_id": unit.get("group_id") or "",
+            "import_id": int(unit["import_id"]),
+        }
+        if is_group:
+            content["objective_questions"] = [
+                {
+                    "payload": payload,
+                    "source_number": str(member.get("source_number") or ""),
+                }
+                for member, payload in zip(members, payloads, strict=True)
+            ]
+        else:
+            content["stem_blocks"] = first_payload.get("stem_blocks", [])
+            content["subquestions"] = first_payload.get("subquestions", [])
+        if all_verified:
+            content["source_name"] = str(first_payload.get("source_name") or "")
+            content["exam_name"] = str(first_payload.get("exam_name") or "")
+            content["exam_year"] = str(first_payload.get("exam_year") or "")
+            content["paper"] = str(first_payload.get("paper") or "")
+            content["source_url"] = str(first_payload.get("source_url") or "")
+            content["answer_source"] = str(first_payload.get("answer_source") or "")
+        return content
+
+    @staticmethod
+    def _structured_unit_source_summary(unit: dict[str, Any]) -> dict[str, Any]:
+        document = (unit.get("import_payload") or {}).get("document", {})
+        if not isinstance(document, dict):
+            document = {}
+        return {
+            "import_id": int(unit["import_id"]),
+            "source_file": str(document.get("original_filename") or ""),
+            "original_file_sha256": str(
+                unit.get("original_file_sha256")
+                or document.get("original_file_sha256")
+                or ""
+            ),
+        }
+
+    @classmethod
+    def _structured_unit_matches_selector(
+        cls, unit: dict[str, Any], selector: str
+    ) -> bool:
+        summary = cls._structured_unit_source_summary(unit)
+        normalized = selector.strip()
+        lowered = normalized.casefold()
+        if lowered.startswith("import:"):
+            return normalized.split(":", 1)[1] == str(summary["import_id"])
+        if lowered.startswith("file:"):
+            return (
+                normalized.split(":", 1)[1].casefold()
+                == summary["source_file"].casefold()
+            )
+        if lowered.startswith("sha256:"):
+            return (
+                normalized.split(":", 1)[1].casefold()
+                == summary["original_file_sha256"].casefold()
+            )
+        return normalized == str(summary["import_id"]) or lowered in {
+            summary["source_file"].casefold(),
+            summary["original_file_sha256"].casefold(),
+        }
+
+    async def start_question_by_number(
+        self,
+        source_number: str,
+        *,
+        source_selector: str | None,
+        session_origin: str,
+        actor_id: str,
+        origin: str = "random",
+        subject: str = "",
+        question_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Open the complete explicitly grouped unit containing a source number."""
+        content = self._structured_question_by_number(source_number, source_selector)
+        content = self._apply_source_number_filters(
+            content, origin=origin, subject=subject, question_type=question_type
+        )
+        if not content.get("available"):
+            return {"success": False, **content}
+        return self.open_question_session(
+            content,
+            session_origin=session_origin,
+            actor_id=actor_id,
+            source_kind=content.get("source_kind"),
+        )
+
+    @staticmethod
+    def _apply_source_number_filters(
+        content: dict[str, Any],
+        *,
+        origin: str,
+        subject: str | None,
+        question_type: str | None,
+    ) -> dict[str, Any]:
+        if not content.get("available"):
+            return content
+        try:
+            requested_origin = parse_origin(origin)
+            requested_subject = parse_subject(subject)
+            requested_type = parse_question_type(question_type)
+        except ValueError as exc:
+            return {
+                "available": False,
+                "error": "invalid_parameter",
+                "reason": str(exc),
+            }
+        if requested_origin != "random" and content.get("origin") != requested_origin:
+            return {
+                "available": False,
+                "error": "source_number_filter_mismatch",
+                "reason": f"原始题号对应的来源身份不符合 {requested_origin} 筛选。",
+            }
+        payloads = [
+            member.get("payload", member)
+            for member in content.get("objective_questions", [])
+            if isinstance(member, dict)
+        ]
+        if not payloads:
+            structured = content.get("structured")
+            payload = (
+                structured.get("payload") if isinstance(structured, dict) else None
+            )
+            if isinstance(payload, dict):
+                payloads = [payload]
+        if requested_subject and any(
+            not subject_matches(
+                payload.get("subjects") or (content.get("subject"),),
+                requested_subject,
+            )
+            for payload in payloads
+        ):
+            return {
+                "available": False,
+                "error": "source_number_filter_mismatch",
+                "reason": f"题组中至少一题不符合 {requested_subject} 方向筛选。",
+            }
+        if requested_type and any(
+            parse_question_type(payload.get("question_type")) != requested_type
+            for payload in payloads
+        ):
+            return {
+                "available": False,
+                "error": "source_number_filter_mismatch",
+                "reason": f"题组中至少一题不符合 {requested_type} 题型筛选。",
+            }
+        return content
+
     async def question_session_action(
-        self, action: str, *, session_origin: str, actor_id: str
+        self,
+        action: str,
+        *,
+        session_origin: str,
+        actor_id: str,
+        question_number: str | None = None,
     ) -> dict[str, Any]:
         """Apply one explicit command to the active session in exactly this chat scope."""
         session = self.question_sessions.get_active(str(session_origin or ""))
@@ -600,6 +870,41 @@ class LawAssistantService:
             }
         snapshot = prepare_question_session_snapshot(session["snapshot"])
         session["snapshot"] = snapshot
+        if question_number:
+            if action not in {"current", "answer", "explanation"}:
+                return {
+                    "success": False,
+                    "reason": "指定原始题号仅可用于 current、answer 或 explanation。",
+                }
+            normalized_number = normalize_source_number(question_number)
+            prompts = snapshot.get("prompts", [])
+            matching_indexes = [
+                index
+                for index, prompt in enumerate(prompts)
+                if normalize_source_number(prompt.get("source_number"))
+                == normalized_number
+            ]
+            if len(matching_indexes) != 1:
+                return {
+                    "success": False,
+                    "reason": (
+                        f"当前题组中没有唯一匹配的原始题号：{question_number}。"
+                    ),
+                }
+            if matching_indexes[0] != session["current_prompt_index"]:
+                session = (
+                    self.question_sessions.advance(
+                        session["id"],
+                        actor_id=str(actor_id),
+                        at=self._now_utc().isoformat(),
+                        material_index=len(snapshot.get("materials", [])),
+                        material_page=0,
+                        prompt_index=matching_indexes[0],
+                        prompt_page=0,
+                    )
+                    or session
+                )
+                session["snapshot"] = snapshot
         if action == "current":
             return {
                 "success": True,
@@ -616,6 +921,15 @@ class LawAssistantService:
                 return {
                     "success": False,
                     "reason": f"当前正在阅读已揭晓内容；请使用 {continuation} 继续，不会跳转题面。",
+                }
+            if snapshot.get("objective_group_pages_sent"):
+                return {
+                    "success": True,
+                    "session_id": session["id"],
+                    "text": (
+                        "该题组的公共材料和全部题面已在发布时完整发送。"
+                        "可用「下一题」切换当前成员，或用「答案 <题号>」/「解析 <题号>」查看对应内容。"
+                    ),
                 }
             materials = snapshot.get("materials", [])
             material_index = session["current_material_index"]
@@ -712,7 +1026,8 @@ class LawAssistantService:
             prompts = snapshot.get("prompts", [])
             next_index = session["current_prompt_index"] + 1
             if next_index >= len(prompts):
-                return {"success": False, "reason": "没有更多小问了。"}
+                noun = "题目" if snapshot.get("objective_group_id") else "小问"
+                return {"success": False, "reason": f"没有更多{noun}了。"}
             session = (
                 self.question_sessions.advance(
                     session["id"],
@@ -726,6 +1041,18 @@ class LawAssistantService:
                 or session
             )
             session["snapshot"] = snapshot
+            if snapshot.get("objective_group_pages_sent"):
+                source_number = str(
+                    prompts[next_index].get("source_number") or next_index + 1
+                )
+                return {
+                    "success": True,
+                    "session_id": session["id"],
+                    "text": (
+                        f"已切换至题号 {source_number}。"
+                        "题面已随题组发布并完整发送；可用「答案」或「解析」分阶段查看。"
+                    ),
+                }
         elif action in {"answer", "explanation"}:
             unread_notice = (
                 action == "answer"
@@ -2358,6 +2685,8 @@ class LawAssistantService:
         origin: str = "random",
         subject: str | None = None,
         question_type: str | None = None,
+        source_number: str | None = None,
+        source_selector: str | None = None,
         target_selectors: list[str] | None = None,
         session_origin: str | None = None,
         actor_id: str | None = None,
@@ -2367,7 +2696,22 @@ class LawAssistantService:
             targets = self._resolve_targets(target_selectors)
         except ValueError as exc:
             return {"ready": False, "reason": str(exc)}
-        if content_ref:
+        if source_number and content_ref:
+            return {
+                "ready": False,
+                "reason": "原始题号与短期内容引用不能同时指定。",
+            }
+        if source_number:
+            content = self._structured_question_by_number(
+                source_number, source_selector
+            )
+            content = self._apply_source_number_filters(
+                content,
+                origin=origin,
+                subject=subject,
+                question_type=question_type,
+            )
+        elif content_ref:
             content, reference_error = self._take_content_reference(
                 content_ref,
                 content_type="question",
@@ -2386,8 +2730,9 @@ class LawAssistantService:
             )
         if not content.get("available"):
             return {"ready": False, **content}
-        snapshot = self._build_question_snapshot(content)
-        body = self._snapshot_first_prompt(snapshot)
+        snapshot = self._build_question_snapshot(content, group_pages_sent=True)
+        bodies = self._snapshot_publication_bodies(snapshot)
+        body = bodies[0]
         token = secrets.token_urlsafe(12)
         created = self._now_utc()
         self._publish_confirmations[token] = PendingPublication(
@@ -2400,16 +2745,21 @@ class LawAssistantService:
             question_snapshot=snapshot,
             question_identity=str(snapshot.get("identity") or ""),
             source_kind=(
-                "library_question"
-                if isinstance(content.get("item"), dict)
+                str(content.get("source_kind"))
+                if content.get("source_kind")
                 else (
-                    "real_question"
-                    if content.get("origin") == "real"
-                    else "generated_question"
+                    "library_question"
+                    if isinstance(content.get("item"), dict)
+                    else (
+                        "real_question"
+                        if content.get("origin") == "real"
+                        else "generated_question"
+                    )
                 )
             ),
             source_item_key=str(
-                content.get("question_id")
+                content.get("source_item_key")
+                or content.get("question_id")
                 or (content.get("item") or {}).get("id")
                 or snapshot.get("snapshot_hash")
             ),
@@ -2417,13 +2767,15 @@ class LawAssistantService:
             real_question_id=(
                 content.get("question_id") if content.get("origin") == "real" else None
             ),
+            bodies=tuple(bodies),
         )
         return {
             "ready": True,
             "token": token,
             "content_type": "question",
             "targets": targets,
-            "preview": body,
+            "preview": "\n\n".join(bodies),
+            "preview_pages": bodies,
             "content_ref": content.get("content_ref"),
             "selection": {
                 key: content.get(key)
@@ -2432,13 +2784,27 @@ class LawAssistantService:
             },
         }
 
-    def _build_question_snapshot(self, content: dict[str, Any]) -> dict[str, Any]:
+    def _build_question_snapshot(
+        self, content: dict[str, Any], *, group_pages_sent: bool = False
+    ) -> dict[str, Any]:
         limit = getattr(self.config, "question_message_max_chars", 1600)
         try:
             limit = max(300, min(4000, int(limit)))
         except (TypeError, ValueError):
             limit = 1600
-        return build_question_session_snapshot(content, max_chars=limit)
+        if content.get("objective_group_id"):
+            limit = min(limit, 1000)
+        snapshot_input = content
+        if group_pages_sent and content.get("objective_group_id"):
+            snapshot_input = {**content, "objective_group_pages_sent": True}
+        return build_question_session_snapshot(snapshot_input, max_chars=limit)
+
+    def _snapshot_publication_bodies(self, snapshot: dict[str, Any]) -> list[str]:
+        if snapshot.get("objective_group_id"):
+            pages = format_session_prompt_pages(snapshot)
+            if pages:
+                return pages
+        return [self._snapshot_first_prompt(snapshot)]
 
     @staticmethod
     def _snapshot_first_prompt(snapshot: dict[str, Any]) -> str:
@@ -2461,13 +2827,28 @@ class LawAssistantService:
             if target is None:
                 outcomes.append("failed")
                 continue
-            try:
-                outcome = await self.publisher.publish_text(
-                    target["unified_msg_origin"], pending.body
-                )
-                status, error = _delivery_status(outcome)
-            except Exception as exc:  # noqa: BLE001 - isolate target transport failure.
-                status, error = "failed", str(exc)
+            status = "sent"
+            bodies = pending.bodies or (pending.body,)
+            for page_index, body in enumerate(bodies, start=1):
+                error_type = "publisher_result"
+                try:
+                    outcome = await self.publisher.publish_text(
+                        target["unified_msg_origin"], body
+                    )
+                    status, _error = _delivery_status(outcome)
+                except Exception as exc:  # noqa: BLE001 - isolate target transport failure.
+                    status = "failed"
+                    error_type = type(exc).__name__
+                if status != "sent":
+                    self.logger.warning(
+                        "Law Assistant question group delivery stopped target_id=%s page=%s/%s status=%s error_type=%s",
+                        target_id,
+                        page_index,
+                        len(bodies),
+                        status,
+                        error_type,
+                    )
+                    break
             outcomes.append(status)
             if status == "sent":
                 self._persist_question_snapshot(
@@ -2483,9 +2864,9 @@ class LawAssistantService:
                 )
             else:
                 self.logger.warning(
-                    "Law Assistant failed to publish question to %s: %s",
-                    target["unified_msg_origin"],
-                    error,
+                    "Law Assistant failed to publish question target_id=%s status=%s",
+                    target_id,
+                    status,
                 )
         return outcomes
 
@@ -4917,14 +5298,14 @@ class LawAssistantService:
 
         try:
             question_snapshot = (
-                self._build_question_snapshot(content)
+                self._build_question_snapshot(content, group_pages_sent=True)
                 if content_type == "daily_question"
                 else None
             )
-            formatted = (
-                _format_daily_content(content_type, content)
+            formatted_pages = (
+                [_format_daily_content(content_type, content)]
                 if content_type == "daily_case"
-                else self._snapshot_first_prompt(question_snapshot or {})
+                else self._snapshot_publication_bodies(question_snapshot or {})
             )
         except Exception as exc:  # noqa: BLE001 - malformed content must not publish
             self.storage.finish_daily_content(
@@ -4943,58 +5324,73 @@ class LawAssistantService:
 
         publish_started = asyncio.get_running_loop().time()
         self.logger.info(
-            "daily_stage=publish_start task_id=%s target_id=%s content_type=%s due_delay_minutes=%.2f",
+            "daily_stage=publish_start task_id=%s target_id=%s content_type=%s page_count=%s due_delay_minutes=%.2f",
             task_id,
             target_id,
             content_type,
+            len(formatted_pages),
             self._daily_due_delay_minutes(intended_local),
         )
-        try:
-            outcome = await asyncio.wait_for(
-                self.publisher.publish_text(target["unified_msg_origin"], formatted),
-                timeout=DAILY_PUBLISH_TIMEOUT_SECONDS,
-            )
-        except asyncio.CancelledError:
-            self.storage.finish_daily_content(
-                claim_id,
-                status="unknown",
-                error_summary="定时发送被取消，送达状态未知",
-            )
-            self.logger.info(
-                "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=unknown stop_reason=cancelled",
-                task_id,
-                target_id,
-                content_type,
-                (asyncio.get_running_loop().time() - publish_started) * 1000,
-                self._daily_due_delay_minutes(intended_local),
-            )
-            raise
-        except TimeoutError:
-            status, error = "unknown", "定时发送超时，送达状态未知"
-            error_type = "TimeoutError"
-        except Exception as exc:  # noqa: BLE001 - transport result is ambiguous
-            status, error = (
-                "unknown",
-                f"定时发送异常，送达状态未知 ({type(exc).__name__})",
-            )
-            error_type = type(exc).__name__
-        else:
-            status, _transport_error = _delivery_status(outcome)
-            error = (
-                "定时发送失败"
-                if status == "failed"
-                else "定时发送结果未知，需人工核实"
-                if status == "unknown"
-                else None
-            )
-            error_type = None
+        status = "sent"
+        error: str | None = None
+        error_type: str | None = None
+        pages_sent = 0
+        for page_index, formatted in enumerate(formatted_pages, start=1):
+            try:
+                outcome = await asyncio.wait_for(
+                    self.publisher.publish_text(
+                        target["unified_msg_origin"], formatted
+                    ),
+                    timeout=DAILY_PUBLISH_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                self.storage.finish_daily_content(
+                    claim_id,
+                    status="unknown",
+                    error_summary="定时发送被取消，送达状态未知",
+                )
+                self.logger.info(
+                    "daily_stage=publish_end task_id=%s target_id=%s content_type=%s page=%s/%s pages_sent=%s duration_ms=%.1f due_delay_minutes=%.2f result=unknown stop_reason=cancelled",
+                    task_id,
+                    target_id,
+                    content_type,
+                    page_index,
+                    len(formatted_pages),
+                    pages_sent,
+                    (asyncio.get_running_loop().time() - publish_started) * 1000,
+                    self._daily_due_delay_minutes(intended_local),
+                )
+                raise
+            except TimeoutError:
+                status, error = "unknown", "定时发送超时，送达状态未知"
+                error_type = "TimeoutError"
+            except Exception as exc:  # noqa: BLE001 - transport result is ambiguous
+                status, error = (
+                    "unknown",
+                    f"定时发送异常，送达状态未知 ({type(exc).__name__})",
+                )
+                error_type = type(exc).__name__
+            else:
+                status, _transport_error = _delivery_status(outcome)
+                error = (
+                    "定时发送失败"
+                    if status == "failed"
+                    else "定时发送结果未知，需人工核实"
+                    if status == "unknown"
+                    else None
+                )
+            if status != "sent":
+                break
+            pages_sent += 1
         self.storage.finish_daily_content(claim_id, status=status, error_summary=error)
         publish_log = self.logger.warning if status != "sent" else self.logger.info
         publish_log(
-            "daily_stage=publish_end task_id=%s target_id=%s content_type=%s duration_ms=%.1f due_delay_minutes=%.2f result=%s%s",
+            "daily_stage=publish_end task_id=%s target_id=%s content_type=%s pages_sent=%s/%s duration_ms=%.1f due_delay_minutes=%.2f result=%s%s",
             task_id,
             target_id,
             content_type,
+            pages_sent,
+            len(formatted_pages),
             (asyncio.get_running_loop().time() - publish_started) * 1000,
             self._daily_due_delay_minutes(intended_local),
             status,
@@ -5021,7 +5417,8 @@ class LawAssistantService:
                         )
                     ),
                     source_item_key=str(
-                        content.get("question_id")
+                        content.get("source_item_key")
+                        or content.get("question_id")
                         or item.get("id")
                         or question_snapshot.get("snapshot_hash")
                     ),

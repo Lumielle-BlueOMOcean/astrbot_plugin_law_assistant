@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -29,8 +31,16 @@ else:
     )
 try:
     from .content import RealQuestion, real_question_identity_key, subject_filter
+    from .objective_question_groups import (
+        normalize_source_number,
+        resolve_objective_question_group,
+    )
 except ImportError:
     from content import RealQuestion, real_question_identity_key, subject_filter
+    from objective_question_groups import (
+        normalize_source_number,
+        resolve_objective_question_group,
+    )
 
 
 def _json(value: Any) -> str:
@@ -761,7 +771,9 @@ class LibraryRepository:
             "review_items": review_items,
         }
 
-    def get(self, item_id: int) -> LibraryItemBundle | None:
+    def get(
+        self, item_id: int, *, structured_binding_id: int | None = None
+    ) -> LibraryItemBundle | None:
         row = self.connection.execute(
             "SELECT * FROM learning_items WHERE id = ?", (item_id,)
         ).fetchone()
@@ -819,7 +831,9 @@ class LibraryRepository:
                 answer_source=str(question_row["answer_source"]),
                 exam_date=str(question_row["exam_date"]),
             )
-        structured = self._structured_for_item(item_id)
+        structured = self._structured_for_item(
+            item_id, binding_id=structured_binding_id
+        )
         return LibraryItemBundle(
             item=item,
             sources=tuple(_source_from_row(source) for source in source_rows),
@@ -844,19 +858,26 @@ class LibraryRepository:
             ),
         )
 
-    def _structured_for_item(self, item_id: int) -> dict[str, Any] | None:
+    def _structured_for_item(
+        self, item_id: int, *, binding_id: int | None = None
+    ) -> dict[str, Any] | None:
+        binding_filter = "b.item_id = ?"
+        parameters: tuple[Any, ...] = (item_id,)
+        if binding_id is not None:
+            binding_filter += " AND b.id = ?"
+            parameters += (binding_id,)
         binding = self.connection.execute(
-            """
+            f"""
             SELECT b.*, i.schema_version, i.original_file_sha256,
                    i.structured_json_sha256, i.structured_payload_sha256,
                    i.preparation_method, i.created_by AS import_created_by,
                    i.created_at AS import_created_at
             FROM structured_item_bindings AS b
             JOIN structured_imports AS i ON i.id = b.import_id
-            WHERE b.item_id = ?
+            WHERE {binding_filter}
             ORDER BY b.id DESC LIMIT 1
             """,
-            (item_id,),
+            parameters,
         ).fetchone()
         if binding is None:
             return None
@@ -876,10 +897,10 @@ class LibraryRepository:
         item_blocks = self.connection.execute(
             """
             SELECT * FROM structured_blocks
-            WHERE item_id = ? AND subquestion_id IS NULL
+            WHERE item_id = ? AND import_id = ? AND subquestion_id IS NULL
             ORDER BY section, order_index, id
             """,
-            (item_id,),
+            (item_id, int(binding["import_id"])),
         ).fetchall()
         stem_blocks = [
             block_dict(row) for row in item_blocks if row["section"] == "stem"
@@ -983,6 +1004,178 @@ class LibraryRepository:
             "stem_blocks": stem_blocks,
             "subquestions": subquestions,
             "explanation_blocks": explanation_blocks,
+        }
+
+    def get_structured_delivery_unit(self, item_id: int) -> dict[str, Any] | None:
+        """Resolve the latest structured question binding into an ordered unit."""
+        binding = self.connection.execute(
+            """
+            SELECT b.*
+            FROM structured_item_bindings AS b
+            WHERE b.item_id = ? AND b.item_kind = 'question'
+            ORDER BY b.id DESC LIMIT 1
+            """,
+            (item_id,),
+        ).fetchone()
+        if binding is None:
+            return None
+        return self._structured_delivery_unit_for_binding(binding)
+
+    def get_structured_delivery_unit_for_real_question(
+        self, real_question_id: int
+    ) -> dict[str, Any] | None:
+        """Resolve the import unit containing a promoted real-question row."""
+        binding = self.connection.execute(
+            """
+            SELECT b.*
+            FROM structured_item_bindings AS b
+            WHERE b.verified_real_question_id = ? AND b.item_kind = 'question'
+            ORDER BY b.id DESC LIMIT 1
+            """,
+            (real_question_id,),
+        ).fetchone()
+        if binding is None:
+            return None
+        return self._structured_delivery_unit_for_binding(binding)
+
+    def list_structured_source_number_matches(
+        self, source_number: str
+    ) -> list[dict[str, Any]]:
+        """Return distinct import-scoped units matching an exact normalized number."""
+        normalized = normalize_source_number(source_number)
+        if not normalized:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT b.*
+            FROM structured_item_bindings AS b
+            WHERE b.item_kind = 'question'
+            ORDER BY b.import_id, b.id
+            """
+        ).fetchall()
+        units: dict[tuple[int, str], dict[str, Any]] = {}
+        for binding in rows:
+            if normalize_source_number(binding["source_number"]) != normalized:
+                continue
+            unit = self._listed_structured_delivery_unit(binding)
+            if unit is None:
+                continue
+            key = (unit["import_id"], unit["unit_key"])
+            units.setdefault(key, unit)
+        return list(units.values())
+
+    def list_structured_delivery_units(self) -> list[dict[str, Any]]:
+        """List distinct import-scoped structured question units in source order."""
+        rows = self.connection.execute(
+            """
+            SELECT b.*
+            FROM structured_item_bindings AS b
+            WHERE b.item_kind = 'question'
+            ORDER BY b.import_id, b.id
+            """
+        ).fetchall()
+        units: dict[tuple[int, str], dict[str, Any]] = {}
+        for binding in rows:
+            unit = self._listed_structured_delivery_unit(binding)
+            if unit is None:
+                continue
+            units.setdefault((unit["import_id"], unit["unit_key"]), unit)
+        return list(units.values())
+
+    def _listed_structured_delivery_unit(
+        self, binding: sqlite3.Row
+    ) -> dict[str, Any] | None:
+        """Skip malformed bindings without blocking other valid inventory rows."""
+        try:
+            return self._structured_delivery_unit_for_binding(binding)
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                "Skipping malformed structured delivery binding id=%s import_id=%s error_type=%s",
+                binding["id"],
+                binding["import_id"],
+                type(exc).__name__,
+            )
+            return None
+
+    def _structured_delivery_unit_for_binding(
+        self, binding: sqlite3.Row
+    ) -> dict[str, Any] | None:
+        import_id = int(binding["import_id"])
+        external_id = str(binding["external_id"])
+        import_row = self.connection.execute(
+            "SELECT * FROM structured_imports WHERE id = ?", (import_id,)
+        ).fetchone()
+        if import_row is None:
+            return None
+        import_payload = json.loads(import_row["payload_json"])
+        if not isinstance(import_payload, dict):
+            raise TypeError("structured import payload is malformed")
+        group = resolve_objective_question_group(import_payload, external_id)
+        member_external_ids = (
+            list(group["question_refs"]) if group is not None else [external_id]
+        )
+        question_payloads = {
+            str(item.get("id")): item
+            for item in import_payload.get("questions", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        if any(member_id not in question_payloads for member_id in member_external_ids):
+            raise ValueError("objective group references a missing source question")
+
+        members: list[dict[str, Any]] = []
+        for member_external_id in member_external_ids:
+            member_binding = self.connection.execute(
+                """
+                SELECT * FROM structured_item_bindings
+                WHERE import_id = ? AND external_id = ? AND item_kind = 'question'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (import_id, member_external_id),
+            ).fetchone()
+            if member_binding is None:
+                raise ValueError("objective group member is not persisted")
+            member_item_id = int(member_binding["item_id"])
+            bundle = self.get(
+                member_item_id, structured_binding_id=int(member_binding["id"])
+            )
+            if bundle is None:
+                raise ValueError("objective group learning item is missing")
+            members.append(
+                {
+                    "binding_id": int(member_binding["id"]),
+                    "item_id": member_item_id,
+                    "external_id": member_external_id,
+                    "source_number": str(member_binding["source_number"]),
+                    "item_kind": str(member_binding["item_kind"]),
+                    "structure_version": str(member_binding["structure_version"]),
+                    "review_status": str(member_binding["review_status"]),
+                    "verified_real_question_id": (
+                        int(member_binding["verified_real_question_id"])
+                        if member_binding["verified_real_question_id"] is not None
+                        else None
+                    ),
+                    "payload": copy.deepcopy(question_payloads[member_external_id]),
+                    "bundle": bundle,
+                }
+            )
+        source_key = str(group["id"]) if group is not None else external_id
+        unit_key = f"{import_id}:{source_key}"
+        return {
+            "import_id": import_id,
+            "schema_version": str(import_row["schema_version"]),
+            "original_file_sha256": str(import_row["original_file_sha256"]),
+            "structured_json_sha256": str(import_row["structured_json_sha256"]),
+            "structured_payload_sha256": str(import_row["structured_payload_sha256"]),
+            "source_kind": "structured_import",
+            "source_item_key": source_key,
+            "unit_key": unit_key,
+            "group_id": str(group["id"]) if group is not None else None,
+            "group": copy.deepcopy(group),
+            "members": members,
+            "shared_materials": list(members[0]["bundle"].shared_materials)
+            if members
+            else [],
+            "import_payload": import_payload,
         }
 
     def list_by_source(self, source_id: int) -> list[LearningItem]:

@@ -169,11 +169,33 @@ def _requirements(values: Any) -> list[str]:
     ]
 
 
-def _header(snapshot: dict[str, Any]) -> str:
+def _option_texts(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    rendered: list[str] = []
+    for option in values:
+        if isinstance(option, dict):
+            key = str(option.get("key") or "").strip()
+            text = str(option.get("text") or "").strip()
+            value = f"{key}. {text}" if key else text
+        else:
+            value = str(option or "").strip()
+        if value:
+            rendered.append(value)
+    return rendered
+
+
+def _header(snapshot: dict[str, Any], prompt_index: int | None = None) -> str:
+    subject_label = snapshot.get("subject_label", "其他")
+    question_type_label = snapshot.get("question_type_label", "")
+    prompts = snapshot.get("prompts", [])
+    if prompt_index is not None and 0 <= prompt_index < len(prompts):
+        prompt = prompts[prompt_index]
+        subject_label = prompt.get("subject_label") or subject_label
+        question_type_label = prompt.get("question_type_label") or question_type_label
     return (
         f"【{snapshot.get('identity_label', '题目')}｜"
-        f"{snapshot.get('subject_label', '其他')}｜"
-        f"{snapshot.get('question_type_label', '')}】"
+        f"{subject_label}｜{question_type_label}】"
     )
 
 
@@ -451,6 +473,8 @@ def _prompt_body_blocks(
                 and _normalized_text(text) != shared_text
             ]
     if prompt_stems:
+        if snapshot.get("objective_group_id") and prompt.get("source_number"):
+            blocks.append(f"原始题号：{prompt['source_number']}")
         blocks.append(f"题干：{prompt_stems[0]}")
         blocks.extend(prompt_stems[1:])
     else:
@@ -544,8 +568,9 @@ def _render_snapshot(
             _index: int = index,
             _count: int = prompt_count,
         ) -> str:
-            progress = f"小问 {_index + 1}/{_count}｜" if _count > 1 else ""
-            return f"{_header(snapshot)}\n{progress}题干续页 {page}/{total}"
+            unit_label = "组题" if snapshot.get("objective_group_id") else "小问"
+            progress = f"{unit_label} {_index + 1}/{_count}｜" if _count > 1 else ""
+            return f"{_header(snapshot, _index)}\n{progress}题干续页 {page}/{total}"
 
         prompt_suffix = lambda _page, _total: (
             "回复「法务 答案」查看答案；回复「法务 解析」查看解析。"
@@ -581,8 +606,11 @@ def _render_snapshot(
             _index: int = index,
             _count: int = prompt_count,
         ) -> str:
-            progress = f"小问 {_index + 1}/{_count}｜" if _count > 1 else ""
-            return f"{_header(snapshot)}\n{label}｜{progress}第 {page}/{total} 页"
+            unit_label = "组题" if snapshot.get("objective_group_id") else "小问"
+            progress = f"{unit_label} {_index + 1}/{_count}｜" if _count > 1 else ""
+            return (
+                f"{_header(snapshot, _index)}\n{label}｜{progress}第 {page}/{total} 页"
+            )
 
         answer_pages = _paginate_message_blocks(
             answer_blocks,
@@ -607,8 +635,11 @@ def _render_snapshot(
             _index: int = index,
             _count: int = prompt_count,
         ) -> str:
-            progress = f"小问 {_index + 1}/{_count}｜" if _count > 1 else ""
-            return f"{_header(snapshot)}\n{label}｜{progress}第 {page}/{total} 页"
+            unit_label = "组题" if snapshot.get("objective_group_id") else "小问"
+            progress = f"{unit_label} {_index + 1}/{_count}｜" if _count > 1 else ""
+            return (
+                f"{_header(snapshot, _index)}\n{label}｜{progress}第 {page}/{total} 页"
+            )
 
         explanation_pages = _paginate_message_blocks(
             explanation_blocks,
@@ -627,6 +658,16 @@ def _render_snapshot(
                 "explanation_pages": explanation_pages,
                 "answer_available": answer_available,
                 "explanation_available": explanation_available,
+                "subject_label": str(
+                    prompt.get("subject_label")
+                    or snapshot.get("subject_label")
+                    or "其他"
+                ),
+                "question_type_label": str(
+                    prompt.get("question_type_label")
+                    or snapshot.get("question_type_label")
+                    or ""
+                ),
             }
         )
     snapshot["prompts"] = rendered_prompts
@@ -720,7 +761,11 @@ def build_question_session_snapshot(
         )
     )
     shared_stem_blocks: list[str] = []
-    if origin == "real":
+    objective_questions = result.get("objective_questions")
+    has_objective_group = isinstance(objective_questions, list) and bool(
+        objective_questions
+    )
+    if origin == "real" and not has_objective_group:
         content = (
             result.get("content") if isinstance(result.get("content"), dict) else {}
         )
@@ -781,10 +826,65 @@ def build_question_session_snapshot(
                     "blocks": _ordered_block_texts(material.get("blocks", [])),
                 }
             )
-        shared_stem_blocks = _ordered_block_texts(stem_blocks)
-        subquestions = result.get("subquestions", []) or []
         prompts = []
-        if isinstance(subquestions, list) and subquestions:
+        if has_objective_group:
+            shared_stem_blocks = []
+            first_payload: dict[str, Any] = {}
+            for index, member in enumerate(objective_questions):
+                if not isinstance(member, dict):
+                    continue
+                member_payload = (
+                    member.get("payload")
+                    if isinstance(member.get("payload"), dict)
+                    else member
+                )
+                if not first_payload:
+                    first_payload = member_payload
+                member_type = str(member_payload.get("question_type") or "")
+                member_subjects = member_payload.get("subjects")
+                if not isinstance(member_subjects, list) or not member_subjects:
+                    member_subjects = item.get("subjects") or [subject]
+                member_subject = str(member_subjects[0] or subject)
+                prompts.append(
+                    {
+                        "id": str(member_payload.get("id") or index + 1),
+                        "source_number": str(
+                            member_payload.get("source_number")
+                            or member.get("source_number")
+                            or index + 1
+                        ),
+                        "stem_blocks": _ordered_block_texts(
+                            member_payload.get("stem_blocks", [])
+                        ),
+                        "options": _option_texts(member_payload.get("options", [])),
+                        "answer_blocks": _answer_blocks(
+                            member_payload.get("answer"), member_type
+                        ),
+                        "explanation_blocks": _content_blocks(
+                            member_payload.get("explanation_blocks")
+                            or member_payload.get("explanation", [])
+                        ),
+                        "answer_requirements": _requirements(
+                            member_payload.get("answer_requirements", [])
+                        ),
+                        "subject_label": SUBJECT_LABELS.get(
+                            member_subject, member_subject or "其他"
+                        ),
+                        "question_type_label": QUESTION_TYPE_LABELS.get(
+                            member_type, member_type
+                        ),
+                    }
+                )
+            if first_payload:
+                question = {**first_payload, **question}
+                question_type = str(first_payload.get("question_type") or question_type)
+                subjects = first_payload.get("subjects")
+                if isinstance(subjects, list) and subjects:
+                    subject = str(subjects[0] or subject)
+        else:
+            shared_stem_blocks = _ordered_block_texts(stem_blocks)
+        subquestions = result.get("subquestions", []) or []
+        if not has_objective_group and isinstance(subquestions, list) and subquestions:
             for index, subquestion in enumerate(subquestions):
                 if not isinstance(subquestion, dict):
                     continue
@@ -810,7 +910,7 @@ def build_question_session_snapshot(
                         ),
                     }
                 )
-        else:
+        elif not has_objective_group:
             prompts.append(
                 {
                     "id": str(item.get("id") or "question"),
@@ -866,11 +966,14 @@ def build_question_session_snapshot(
         "subject_label": SUBJECT_LABELS.get(subject, subject or "其他"),
         "question_type": question_type,
         "question_type_label": QUESTION_TYPE_LABELS.get(question_type, question_type),
+        "objective_group_id": str(result.get("objective_group_id") or ""),
         "materials": materials,
         "prompts": prompts,
         "answer_requirements": requirements,
         "exam": exam,
     }
+    if has_objective_group and result.get("objective_group_pages_sent") is True:
+        snapshot["objective_group_pages_sent"] = True
     for index, prompt in enumerate(snapshot["prompts"]):
         prompt["source_stem_blocks"] = prompt.pop("stem_blocks", [])
         prompt["source_options"] = prompt.pop("options", [])
@@ -924,6 +1027,24 @@ def format_session_prompt(
     return pages[min(max(0, page_index), len(pages) - 1)]
 
 
+def format_session_prompt_pages(snapshot: dict[str, Any]) -> list[str]:
+    """Return all answer-free pages in order: shared materials then each prompt."""
+    display = prepare_question_session_snapshot(snapshot)
+    pages = [
+        str(page)
+        for material in display.get("materials", [])
+        for page in material.get("pages", [])
+        if str(page)
+    ]
+    pages.extend(
+        str(page)
+        for prompt in display.get("prompts", [])
+        for page in prompt.get("stem_pages", [])
+        if str(page)
+    )
+    return pages
+
+
 def format_session_status(session: dict[str, Any]) -> str:
     """Summarize progress without retransmitting source text or hidden content."""
     snapshot = prepare_question_session_snapshot(session["snapshot"])
@@ -964,8 +1085,15 @@ def format_session_status(session: dict[str, Any]) -> str:
             f"第 {page_index + 1}/{max(1, len(pages))} 页"
         )
     if prompt_count:
-        lines.append(f"小问：{prompt_index + 1}/{prompt_count}")
+        unit_label = "组题" if snapshot.get("objective_group_id") else "小问"
+        lines.append(f"{unit_label}：{prompt_index + 1}/{prompt_count}")
         prompt = snapshot["prompts"][prompt_index]
+        if prompt.get("subject_label") or prompt.get("question_type_label"):
+            lines[0] = (
+                f"当前题目：{snapshot.get('identity_label', '题目')}｜"
+                f"{prompt.get('subject_label') or snapshot.get('subject_label', '其他')}｜"
+                f"{prompt.get('question_type_label') or snapshot.get('question_type_label', '')}"
+            )
         stage = session.get("current_stage")
         page_field = "stem_pages"
         stage_label = "题干页"
@@ -981,7 +1109,10 @@ def format_session_status(session: dict[str, Any]) -> str:
             page_index = display_session_page_index(
                 snapshot, "prompts", prompt_index, page_index
             )
-        lines.append(f"{stage_label}：{page_index + 1}/{max(1, len(pages))}")
+        if snapshot.get("objective_group_pages_sent"):
+            lines.append("题组题面：发布时已完整发送")
+        else:
+            lines.append(f"{stage_label}：{page_index + 1}/{max(1, len(pages))}")
     lines.append(
         "答案："
         f"{'已揭晓' if session.get('current_prompt_answer_revealed') else '未揭晓'}"
@@ -1003,7 +1134,9 @@ def format_session_answer(
     prompt = prompts[min(max(0, prompt_index), len(prompts) - 1)]
     pages = prompt.get("answer_pages", [])
     if not pages:
-        return _compose_message(_header(snapshot), "当前题目没有可用的参考答案。", "")
+        return _compose_message(
+            _header(snapshot, prompt_index), "当前题目没有可用的参考答案。", ""
+        )
     return pages[min(max(0, page_index), len(pages) - 1)]
 
 
@@ -1018,5 +1151,7 @@ def format_session_explanation(
         "explanation_pages", []
     )
     if not pages:
-        return _compose_message(_header(snapshot), "当前题目没有可用解析。", "")
+        return _compose_message(
+            _header(snapshot, prompt_index), "当前题目没有可用解析。", ""
+        )
     return pages[min(max(0, page_index), len(pages) - 1)]

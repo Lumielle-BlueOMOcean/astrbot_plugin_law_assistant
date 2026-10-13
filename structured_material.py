@@ -23,6 +23,7 @@ except ImportError:
 
 
 SCHEMA_VERSION = "1.0"
+SUPPORTED_SCHEMA_VERSIONS = {"1.0", "1.1"}
 MAX_JSON_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_TEXT_CHARS = 600_000
 MAX_MATERIALS = 500
@@ -49,6 +50,19 @@ PREPARATION_METHODS = {
     "mixed",
 }
 REVIEW_STATUSES = {"pending_review", "needs_review", "reviewed"}
+OBJECTIVE_QUESTION_TYPES = {
+    "single_choice",
+    "multiple_choice",
+    "indefinite_choice",
+    "true_false",
+}
+OBJECTIVE_GROUP_FIELDS = {
+    "id",
+    "material_refs",
+    "question_refs",
+    "publish_mode",
+    "source_directives",
+}
 PROTECTED_IDENTITIES = {
     "verified_real_question",
     "official_case",
@@ -95,6 +109,7 @@ class ValidationResult:
     valid_case_items: tuple[dict[str, Any], ...]
     issues: tuple[ValidationIssue, ...]
     review_item_ids: frozenset[str]
+    objective_question_groups: tuple[dict[str, Any], ...] = ()
 
     @property
     def fatal(self) -> bool:
@@ -131,6 +146,9 @@ class ValidationResult:
             "materials": copy.deepcopy(list(self.materials)),
             "questions": copy.deepcopy(list(self.questions)),
             "cases": copy.deepcopy(list(self.cases)),
+            "objective_question_groups": copy.deepcopy(
+                list(self.objective_question_groups)
+            ),
             "issues": [issue.to_mapping() for issue in self.issues],
         }
 
@@ -145,6 +163,204 @@ class _Validator:
         self.material_text_by_id: dict[str, str] = {}
         self.valid_questions: list[dict[str, Any]] = []
         self.valid_cases: list[dict[str, Any]] = []
+
+    def validate_objective_question_groups(
+        self,
+        values: Any,
+        *,
+        questions: tuple[dict[str, Any], ...],
+        material_ids: set[str],
+    ) -> tuple[dict[str, Any], ...]:
+        """Validate explicit ordered groups without inferring membership."""
+        if not isinstance(values, list):
+            self.add(
+                "objective_group.type",
+                "objective_question_groups",
+                "fatal",
+                "objective_question_groups 必须是数组",
+            )
+            return ()
+
+        question_by_id = {str(item.get("id")): item for item in questions}
+        seen_members: set[str] = set()
+        groups: list[dict[str, Any]] = []
+        for index, raw in enumerate(values):
+            path = f"objective_question_groups[{index}]"
+            if not isinstance(raw, dict):
+                self.add(
+                    "objective_group.type",
+                    path,
+                    "fatal",
+                    "题组必须是对象",
+                )
+                continue
+
+            group = copy.deepcopy(raw)
+            group_id = self.register_id(group.get("id"), f"{path}.id")
+            unknown_fields = set(group) - OBJECTIVE_GROUP_FIELDS
+            for field in sorted(unknown_fields):
+                refs_ok = False
+                self.add(
+                    "objective_group.unknown_field",
+                    f"{path}.{field}",
+                    "fatal",
+                    f"不支持的题组字段：{field}",
+                    item_id=group_id or None,
+                )
+
+            refs_ok = True
+            material_refs = group.get("material_refs")
+            if not isinstance(material_refs, list):
+                refs_ok = False
+                self.add(
+                    "objective_group.material_refs_type",
+                    f"{path}.material_refs",
+                    "fatal",
+                    "题组 material_refs 必须是有序数组",
+                    item_id=group_id or None,
+                )
+                material_refs = []
+            else:
+                if len({ref for ref in material_refs if isinstance(ref, str)}) != len(
+                    material_refs
+                ):
+                    refs_ok = False
+                    self.add(
+                        "objective_group.material_ref_duplicate",
+                        f"{path}.material_refs",
+                        "fatal",
+                        "题组 material_refs 不能重复",
+                        item_id=group_id or None,
+                    )
+                for ref_index, ref in enumerate(material_refs):
+                    if not isinstance(ref, str) or ref not in material_ids:
+                        refs_ok = False
+                        self.add(
+                            "objective_group.material_ref_missing",
+                            f"{path}.material_refs[{ref_index}]",
+                            "fatal",
+                            "题组 material_ref 未指向同一模板中的材料",
+                            item_id=group_id or None,
+                        )
+
+            question_refs = group.get("question_refs")
+            if not isinstance(question_refs, list):
+                refs_ok = False
+                self.add(
+                    "objective_group.question_refs_type",
+                    f"{path}.question_refs",
+                    "fatal",
+                    "题组 question_refs 必须是有序数组",
+                    item_id=group_id or None,
+                )
+                question_refs = []
+            if len(question_refs) < 2:
+                refs_ok = False
+                self.add(
+                    "objective_group.question_refs_too_few",
+                    f"{path}.question_refs",
+                    "fatal",
+                    "题组至少需要两个题目引用",
+                    item_id=group_id or None,
+                )
+
+            group_members: set[str] = set()
+            for ref_index, question_ref in enumerate(question_refs):
+                ref_path = f"{path}.question_refs[{ref_index}]"
+                if (
+                    not isinstance(question_ref, str)
+                    or question_ref not in question_by_id
+                ):
+                    refs_ok = False
+                    self.add(
+                        "objective_group.question_ref_missing",
+                        ref_path,
+                        "fatal",
+                        "题组 question_ref 未指向同一模板中的有效题目",
+                        item_id=group_id or None,
+                    )
+                    continue
+                if question_ref in group_members:
+                    refs_ok = False
+                    self.add(
+                        "objective_group.question_ref_duplicate",
+                        ref_path,
+                        "fatal",
+                        "同一题组不能重复引用题目",
+                        item_id=group_id or None,
+                    )
+                group_members.add(question_ref)
+                if question_ref in seen_members:
+                    refs_ok = False
+                    self.add(
+                        "objective_group.member_overlap",
+                        ref_path,
+                        "fatal",
+                        "一个题目不能属于多个 objective question group",
+                        item_id=group_id or None,
+                    )
+                seen_members.add(question_ref)
+
+                question = question_by_id[question_ref]
+                if question.get("question_type") not in OBJECTIVE_QUESTION_TYPES:
+                    refs_ok = False
+                    self.add(
+                        "objective_group.member_not_objective",
+                        ref_path,
+                        "fatal",
+                        "题组成员必须是客观题题型",
+                        item_id=group_id or None,
+                    )
+                if question.get("subquestions"):
+                    refs_ok = False
+                    self.add(
+                        "objective_group.subquestions_forbidden",
+                        f"questions[{question_ref}].subquestions",
+                        "fatal",
+                        "客观题组成员不得包含独立 subquestions",
+                        item_id=question_ref,
+                    )
+                if question.get("material_refs", []) != material_refs:
+                    refs_ok = False
+                    self.add(
+                        "objective_group.material_refs_mismatch",
+                        ref_path,
+                        "fatal",
+                        "题组与成员必须引用完全相同且顺序一致的公共材料",
+                        item_id=question_ref,
+                    )
+
+            if group.get("publish_mode") != "all_at_once":
+                refs_ok = False
+                self.add(
+                    "objective_group.publish_mode_invalid",
+                    f"{path}.publish_mode",
+                    "fatal",
+                    "当前仅支持 publish_mode=all_at_once",
+                    item_id=group_id or None,
+                )
+
+            if "source_directives" in group:
+                directives = group["source_directives"]
+                if not isinstance(directives, list) or any(
+                    not isinstance(directive, str) or not directive.strip()
+                    for directive in directives
+                ):
+                    refs_ok = False
+                    self.add(
+                        "objective_group.source_directives_invalid",
+                        f"{path}.source_directives",
+                        "fatal",
+                        "source_directives 必须是非空字符串数组",
+                        item_id=group_id or None,
+                    )
+
+            if refs_ok and group_id:
+                group["id"] = group_id
+                group["material_refs"] = copy.deepcopy(material_refs)
+                group["question_refs"] = copy.deepcopy(question_refs)
+                groups.append(group)
+        return tuple(groups)
 
     def add(
         self,
@@ -1265,13 +1481,31 @@ def validate_structured_material(
                 "必须提供 schema_version",
             )
         )
-    elif schema_version != SCHEMA_VERSION:
+    elif schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         issues.append(
             ValidationIssue(
                 "schema.unsupported_version",
                 "schema_version",
                 "fatal",
                 f"不支持的结构化资料版本：{schema_version}",
+            )
+        )
+    elif schema_version == "1.1" and "objective_question_groups" not in parsed:
+        issues.append(
+            ValidationIssue(
+                "objective_group.missing",
+                "objective_question_groups",
+                "fatal",
+                "schema 1.1 必须提供 objective_question_groups（可为空数组）",
+            )
+        )
+    elif schema_version == "1.0" and "objective_question_groups" in parsed:
+        issues.append(
+            ValidationIssue(
+                "objective_group.schema_version_mismatch",
+                "objective_question_groups",
+                "fatal",
+                "objective_question_groups 需要 schema_version 1.1",
             )
         )
     if issues:
@@ -1285,6 +1519,15 @@ def validate_structured_material(
         parsed.get("questions", []), material_ids=validator.material_ids
     )
     cases = validator.validate_cases(parsed.get("cases", []))
+    objective_question_groups = (
+        validator.validate_objective_question_groups(
+            parsed.get("objective_question_groups"),
+            questions=questions,
+            material_ids=validator.material_ids,
+        )
+        if schema_version == "1.1"
+        else ()
+    )
     return ValidationResult(
         payload=copy.deepcopy(parsed),
         document=document,
@@ -1295,6 +1538,7 @@ def validate_structured_material(
         valid_case_items=tuple(validator.valid_cases),
         issues=tuple(validator.issues),
         review_item_ids=frozenset(validator.review_item_ids),
+        objective_question_groups=objective_question_groups,
     )
 
 
@@ -1340,6 +1584,15 @@ def build_structured_material_preview(
         for question in result.questions
     )
     issue_codes = [issue.code for issue in result.issues]
+    objective_group_summaries = [
+        {
+            "id": group.get("id"),
+            "material_refs": copy.deepcopy(group.get("material_refs", [])),
+            "question_refs": copy.deepcopy(group.get("question_refs", [])),
+            "publish_mode": group.get("publish_mode"),
+        }
+        for group in result.objective_question_groups
+    ]
     return {
         "schema_version": (
             result.payload.get("schema_version") if result.payload else None
@@ -1347,6 +1600,7 @@ def build_structured_material_preview(
         "document": copy.deepcopy(result.document),
         "counts": {
             "questions": len(result.questions),
+            "objective_question_groups": len(objective_group_summaries),
             "cases": len(result.cases),
             "materials": len(result.materials),
             "subquestions": len(subquestions),
@@ -1373,6 +1627,7 @@ def build_structured_material_preview(
             for item in result.materials
         ],
         "questions": question_summaries,
+        "objective_question_groups": objective_group_summaries,
         "cases": case_summaries,
         "issues": [issue.to_mapping() for issue in result.issues],
     }

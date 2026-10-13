@@ -11,6 +11,11 @@ from library_repository import LibraryRepository
 from library_service import LibraryService
 from service import LawAssistantService
 from storage import SQLiteStorage
+from tests.test_structured_ingestion import (
+    _objective_group_payload,
+    _prepare_service,
+    _text_pdf_bytes,
+)
 
 
 class ValidLLM:
@@ -62,6 +67,60 @@ def _source(*, source_kind="file", title="测试资料"):
 class FirstChoiceRandom:
     def choice(self, values):
         return values[0]
+
+
+async def _import_and_promote_synthetic_objective_group(
+    tmp_path,
+    *,
+    promote_count: int = 3,
+    mismatched_subject: bool = False,
+    singleton: bool = False,
+):
+    from content import RealQuestion
+
+    pdf_bytes = _text_pdf_bytes()
+    payload = _objective_group_payload(pdf_bytes)
+    if singleton:
+        payload["questions"] = payload["questions"][:1]
+        payload["objective_question_groups"] = []
+    if mismatched_subject:
+        payload["questions"][2]["subjects"] = ["criminal_law"]
+    storage, ingestion, prepared, _ = await _prepare_service(
+        tmp_path, payload_override=payload
+    )
+    confirmed = await ingestion.confirm(prepared)
+    repository = LibraryRepository(storage.connection)
+    for member in confirmed["items"][:promote_count]:
+        source = next(
+            question
+            for question in payload["questions"]
+            if question["id"] == member["external_id"]
+        )
+        question = RealQuestion.from_mapping(
+            {
+                "source_name": "合成核验题库",
+                "exam_name": "合成考试",
+                "exam_year": "2099",
+                "source_locator": f"合成题号 {source['source_number']}",
+                "subject": source["subjects"][0],
+                "question_type": source["question_type"],
+                "stem": source["stem_blocks"][0]["text"],
+                "options": [
+                    f"{option['key']}. {option['text']}" for option in source["options"]
+                ],
+                "answer": source["answer"]["keys"],
+                "explanation": source["explanation_blocks"][0]["text"],
+                "answer_source": "third_party",
+                "verification_status": "verified",
+            }
+        )
+        storage.promote_candidate_real_question(
+            question,
+            item_id=member["item_id"],
+            actor_id="synthetic-reviewer",
+            at="2026-10-13T00:00:00+00:00",
+        )
+    return storage, ingestion, confirmed, payload, repository
 
 
 @pytest.mark.asyncio
@@ -140,6 +199,141 @@ async def test_provider_real_question_filter_is_exact(tmp_path):
     assert selected["question_type"] == "single_choice"
     assert selected["question_id"] is not None
     assert selected["answer_source"] == "official"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_candidates_never_enter_verified_real_inventory(tmp_path):
+    storage, _, _, _, repository = await _import_and_promote_synthetic_objective_group(
+        tmp_path, promote_count=0
+    )
+    provider = LearningContentProvider(
+        storage,
+        library_service=LibraryService(repository),
+        rng=FirstChoiceRandom(),
+    )
+
+    result = await provider.select_question(
+        origin="real", subject="civil_commercial", question_type="multiple_choice"
+    )
+
+    assert storage.count_real_questions() == 0
+    assert result["available"] is False
+    assert "已核验真题" in result["reason"]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_partially_promoted_objective_group_is_not_split_into_single_real_questions(
+    tmp_path,
+):
+    storage, _, _, _, repository = await _import_and_promote_synthetic_objective_group(
+        tmp_path, promote_count=1
+    )
+    provider = LearningContentProvider(
+        storage,
+        library_service=LibraryService(repository),
+        rng=FirstChoiceRandom(),
+    )
+
+    result = await provider.select_question(
+        origin="real", subject="civil_commercial", question_type="multiple_choice"
+    )
+
+    assert storage.count_real_questions() == 1
+    assert result["available"] is False
+    assert "已核验真题" in result["reason"]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_fully_promoted_objective_group_is_one_strictly_filtered_real_unit(
+    tmp_path,
+):
+    storage, _, _, _, repository = await _import_and_promote_synthetic_objective_group(
+        tmp_path, promote_count=3
+    )
+    provider = LearningContentProvider(
+        storage,
+        library_service=LibraryService(repository),
+        rng=FirstChoiceRandom(),
+    )
+
+    selected = await provider.select_question(
+        origin="real", subject="civil_commercial", question_type="multiple_choice"
+    )
+    used_group = await provider.select_question(
+        origin="real",
+        subject="civil_commercial",
+        question_type="multiple_choice",
+        used_content_keys={(selected["source_kind"], selected["source_item_key"])},
+    )
+    strict_subject_miss = await provider.select_question(
+        origin="real", subject="intellectual_property", question_type="multiple_choice"
+    )
+
+    assert storage.count_real_questions() == 3
+    assert selected["available"] is True
+    assert selected["origin"] == "real"
+    assert selected["objective_group_id"] == "civil-objective-206-208"
+    assert [question["id"] for question in selected["objective_questions"]] == [
+        "objective-206",
+        "objective-207",
+        "objective-208",
+    ]
+    assert selected["source_kind"] == "structured_objective_group"
+    assert selected["source_item_key"].startswith(f"{selected['import_id']}:")
+    assert (
+        selected["item"]["id"]
+        == repository.list_structured_delivery_units()[0]["members"][0]["item_id"]
+    )
+    assert used_group["available"] is False
+    assert strict_subject_miss["available"] is False
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_objective_group_subject_filter_must_match_every_member(tmp_path):
+    storage, _, _, _, repository = await _import_and_promote_synthetic_objective_group(
+        tmp_path, promote_count=3, mismatched_subject=True
+    )
+    provider = LearningContentProvider(
+        storage,
+        library_service=LibraryService(repository),
+        rng=FirstChoiceRandom(),
+    )
+
+    result = await provider.select_question(
+        origin="real", subject="civil_commercial", question_type="multiple_choice"
+    )
+
+    assert result["available"] is False
+    assert storage.count_real_questions() == 3
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_material_referenced_objective_singleton_uses_structured_snapshot(
+    tmp_path,
+):
+    storage, _, _, _, repository = await _import_and_promote_synthetic_objective_group(
+        tmp_path, promote_count=1, singleton=True
+    )
+    provider = LearningContentProvider(
+        storage,
+        library_service=LibraryService(repository),
+        rng=FirstChoiceRandom(),
+    )
+
+    result = await provider.select_question(
+        origin="real", subject="civil_commercial", question_type="multiple_choice"
+    )
+
+    assert result["available"] is True
+    assert result["objective_group_id"] == ""
+    assert len(result["objective_questions"]) == 1
+    assert result["source_kind"] == "real_question"
+    assert result["shared_materials"][0]["id"] == "material-1"
     storage.close()
 
 

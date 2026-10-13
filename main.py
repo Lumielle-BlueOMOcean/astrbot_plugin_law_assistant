@@ -388,6 +388,31 @@ class LawAssistant(Star):
                     actor_id=str(event.get_sender_id()),
                 )
             )
+        elif subcommand == "question-number" and len(parts) > 2:
+            text = _question_session_result_text(
+                await self.service.start_question_by_number(
+                    parts[2],
+                    source_selector=" ".join(parts[3:]) or None,
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
+                )
+            )
+        elif subcommand == "publish-question-number" and len(parts) > 2:
+            source_number, source_selector, targets = (
+                _parse_publish_question_number_args(parts[2:])
+            )
+            if not source_number:
+                text = "请提供原始题号。"
+            else:
+                text = _json_text(
+                    await self.service.prepare_publish_question(
+                        source_number=source_number,
+                        source_selector=source_selector,
+                        target_selectors=targets,
+                        session_origin=_session_origin(event),
+                        actor_id=str(event.get_sender_id()),
+                    )
+                )
         elif subcommand == "study" and len(parts) > 2:
             text = _question_session_result_text(
                 await self.service.start_library_question_session(
@@ -411,6 +436,7 @@ class LawAssistant(Star):
                     subcommand,
                     session_origin=_session_origin(event),
                     actor_id=str(event.get_sender_id()),
+                    question_number=parts[2] if len(parts) > 2 else None,
                 )
             )
         elif subcommand == "import" and len(parts) > 2:
@@ -568,16 +594,32 @@ class LawAssistant(Star):
         subject: str = "",
         origin: str = "random",
         question_type: str = "",
+        question_number: str = "",
+        source_selector: str = "",
     ) -> str:
-        """按来源、方向和题型获取一道题目；真题只来自已核验题库。
+        """按来源、方向和题型获取题目，或按资料原始题号打开完整题组。
 
         Args:
             subject(string): 可选方向，如刑法、民商法、知识产权。
             origin(string): real、mock 或 random，默认 random。
             question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空随机。
+            question_number(string): 可选资料原始题号；指定时打开其所属完整题组，不拆分成员。
+            source_selector(string): 题号跨资料来源重号时，用导入编号、文件名或 PDF SHA-256 精确区分。
         """
         if not self._authorized(event):
             return self._denial(event)
+        if question_number:
+            return _json_text(
+                await self.service.start_question_by_number(
+                    question_number,
+                    source_selector=source_selector or None,
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
+                    origin=origin,
+                    subject=subject,
+                    question_type=question_type or None,
+                )
+            )
         return _json_text(
             await self.service.start_question_session(
                 subject=subject,
@@ -606,11 +648,17 @@ class LawAssistant(Star):
         )
 
     @filter.llm_tool(name="law_question_session")
-    async def law_question_session(self, event: AstrMessageEvent, action: str) -> str:
+    async def law_question_session(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        question_number: str = "",
+    ) -> str:
         """继续当前题目或显式揭晓答案/解析。
 
         Args:
             action(string): current、next、next-question、answer、explanation、next-answer、next-explanation 或 close。
+            question_number(string): 可选当前组内的原始题号；仅用于定位 current/answer/explanation。
         """
         if not self._can_use_question_session_action(event, action):
             return self._denial(
@@ -621,6 +669,7 @@ class LawAssistant(Star):
                 action,
                 session_origin=_session_origin(event),
                 actor_id=str(event.get_sender_id()),
+                question_number=question_number or None,
             )
         )
 
@@ -823,6 +872,8 @@ class LawAssistant(Star):
         question_type: str = "",
         target: str = "",
         content_ref: str = "",
+        question_number: str = "",
+        source_selector: str = "",
     ) -> str:
         """生成并预览一题后定向发布；必须用 law_confirm_publish 明确确认。
 
@@ -832,6 +883,8 @@ class LawAssistant(Star):
             question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空随机。
             target(string): 群名、目标 ID，或用逗号分隔的多个群；留空时仅有一个群才自动选择。
             content_ref(string): law_generate_question 返回的短期内容引用；提供时复用刚才的原题。
+            question_number(string): 可选原始题号；指定时整组预览，不随机换题。
+            source_selector(string): 重号时使用导入编号、文件名或 PDF SHA-256 精确指定来源。
         """
         if not self._authorized(event):
             return self._denial(event)
@@ -844,6 +897,8 @@ class LawAssistant(Star):
                 session_origin=_session_origin(event),
                 actor_id=str(event.get_sender_id()),
                 content_ref=content_ref or None,
+                source_number=question_number or None,
+                source_selector=source_selector or None,
             )
         )
 
@@ -1047,6 +1102,7 @@ class LawAssistant(Star):
         return (
             "常用：法务 状态、法务 活动、法务 截止、法务 题目 [方向] [题型]、"
             "法务 真题 [方向] [题型]、法务 模拟题 [方向] [题型]、法务 案例 [方向]、"
+            "法务 题号 <原始题号> [来源]、法务 发布题号 <原始题号> <群名> [--source <来源>]、"
             "法务 当前、法务 下一页、法务 下一题、法务 答案、法务 解析、法务 结束、"
             "法务 计划、法务 群计划、法务 绑定 <别名>、法务 帮助。"
             "管理与维护：law scan、law import、law question-import、law review、"
@@ -1221,6 +1277,8 @@ def _normalize_law_command_parts(message_text: str) -> list[str]:
         "答案续页": "next-answer",
         "解析": "explanation",
         "解析续页": "next-explanation",
+        "题号": "question-number",
+        "发布题号": "publish-question-number",
         "结束": "close",
         "计划": "plans",
         "群计划": "plans",
@@ -1238,6 +1296,32 @@ def _normalize_law_command_parts(message_text: str) -> list[str]:
             *arguments,
         ]
     return ["/law", normalized, *arguments]
+
+
+def _parse_publish_question_number_args(
+    args: list[str],
+) -> tuple[str, str | None, list[str] | None]:
+    """Parse an exact source number, optional source selector, and target list."""
+    if not args:
+        return "", None, None
+    source_number = args[0].strip()
+    source_selector: str | None = None
+    target_parts: list[str] = []
+    index = 1
+    while index < len(args):
+        value = args[index]
+        if value in {"--source", "--import"} and index + 1 < len(args):
+            source_selector = args[index + 1].strip() or None
+            index += 2
+            continue
+        if value.startswith(("--source=", "--import=")):
+            source_selector = value.split("=", 1)[1].strip() or None
+            index += 1
+            continue
+        target_parts.append(value)
+        index += 1
+    targets = _split_targets(" ".join(target_parts)) if target_parts else None
+    return source_number, source_selector, targets
 
 
 def _event_dict(event: Any) -> dict[str, Any]:

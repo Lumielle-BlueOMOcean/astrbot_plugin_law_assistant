@@ -13,6 +13,7 @@ from question_session import (
     format_session_answer,
     format_session_explanation,
     format_session_prompt,
+    format_session_prompt_pages,
     prepare_question_session_snapshot,
 )
 from question_session_repository import QuestionSessionRepository
@@ -354,6 +355,96 @@ def test_structured_subquestion_answer_uses_parent_question_type():
     assert "A、C" in format_session_answer(snapshot)
 
 
+def _objective_group_result() -> dict[str, object]:
+    def question(external_id: str, source_number: str, stem: str, key: str) -> dict:
+        return {
+            "id": external_id,
+            "source_number": source_number,
+            "question_type": "multiple_choice",
+            "subjects": ["civil_commercial"],
+            "material_refs": ["group-material"],
+            "stem_blocks": [{"id": f"{external_id}-stem", "order": 1, "text": stem}],
+            "options": [
+                {"key": "A", "text": f"{external_id} 合成选项甲"},
+                {"key": "B", "text": f"{external_id} 合成选项乙"},
+            ],
+            "answer": {"keys": [key], "provenance": "source_text"},
+            "answer_status": "provided",
+            "answer_requirements": [
+                {
+                    "order": 1,
+                    "text": f"{external_id} 专属答题要求",
+                    "locator": "PDF第1页",
+                    "provenance": "source_text",
+                }
+            ],
+            "explanation_blocks": [
+                {
+                    "id": f"{external_id}-explain",
+                    "order": 1,
+                    "text": f"{external_id} 私有解析",
+                }
+            ],
+        }
+
+    return {
+        "available": True,
+        "origin": "candidate",
+        "subject": "civil_commercial",
+        "question_type": "multiple_choice",
+        "item": {
+            "id": 71,
+            "identity": "real_question_candidate",
+            "subjects": ["civil_commercial"],
+        },
+        "objective_group_id": "synthetic-group",
+        "objective_questions": [
+            question("q-a", "206", "合成成员甲题干", "A"),
+            question("q-b", "207", "合成成员乙题干", "B"),
+        ],
+        "shared_materials": [
+            {
+                "id": "group-material",
+                "title": "合成公共材料标题",
+                "blocks": [{"id": "m-b1", "order": 1, "text": "合成公共材料正文"}],
+            }
+        ],
+    }
+
+
+def test_objective_group_snapshot_preserves_all_member_prompts_without_answer_leaks():
+    snapshot = build_question_session_snapshot(_objective_group_result(), max_chars=500)
+    pages = format_session_prompt_pages(snapshot)
+    rendered = "\n".join(pages)
+
+    assert len(snapshot["materials"]) == 1
+    assert len(snapshot["prompts"]) == 2
+    assert rendered.count("合成公共材料正文") == 1
+    assert rendered.count("合成成员甲题干") == 1
+    assert rendered.count("合成成员乙题干") == 1
+    assert "q-a 专属答题要求" in rendered
+    assert "q-b 专属答题要求" in rendered
+    assert "q-a 私有解析" not in rendered
+    assert "q-b 私有解析" not in rendered
+    assert "参考答案：A" not in rendered
+    assert "参考答案：B" not in rendered
+    assert all(len(page) <= 500 for page in pages)
+    assert "A" in format_session_answer(snapshot, prompt_index=0)
+    assert "B" in format_session_answer(snapshot, prompt_index=1)
+
+
+def test_objective_group_initial_pages_are_materials_then_member_prompts():
+    snapshot = build_question_session_snapshot(_objective_group_result())
+
+    pages = format_session_prompt_pages(snapshot)
+    material_end = len(snapshot["materials"][0]["pages"])
+    prompt_one_end = material_end + len(snapshot["prompts"][0]["stem_pages"])
+
+    assert pages[:material_end] == snapshot["materials"][0]["pages"]
+    assert pages[material_end:prompt_one_end] == snapshot["prompts"][0]["stem_pages"]
+    assert pages[prompt_one_end:] == snapshot["prompts"][1]["stem_pages"]
+
+
 def test_unresolved_structured_answer_keeps_missing_answer_fallback():
     candidate = _candidate_with_answer(None)
     candidate["question"]["answer_status"] = "unresolved"
@@ -576,6 +667,54 @@ async def test_service_scopes_question_session_and_reveals_answers_only_on_reque
     )
     assert "【解析秘密】依法分析构成要件。" in explanation["text"]
     assert "【答案秘密】" not in explanation["text"]
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_objective_group_session_reveals_each_source_number_independently(
+    tmp_path,
+):
+    storage = SQLiteStorage(tmp_path / "objective-group-session.sqlite3")
+    service = LawAssistantService(
+        storage, config=SimpleNamespace(question_message_max_chars=500)
+    )
+    scope = "aiocqhttp:FriendMessage:objective-group-user"
+    opened = service.open_question_session(
+        _objective_group_result(), session_origin=scope, actor_id="42"
+    )
+
+    assert opened["success"] is True
+    assert "合成公共材料正文" in opened["text"]
+    assert "合成成员甲题干" not in opened["text"]
+    assert "合成成员甲答案秘密" not in opened["text"]
+    first_prompt = await service.question_session_action(
+        "next", session_origin=scope, actor_id="42"
+    )
+    assert "原始题号：206" in first_prompt["text"]
+    assert "合成成员甲题干" in first_prompt["text"]
+    assert "合成成员乙题干" not in first_prompt["text"]
+
+    first_answer = await service.question_session_action(
+        "answer", session_origin=scope, actor_id="42"
+    )
+    assert "A" in first_answer["text"]
+    next_question = await service.question_session_action(
+        "next-question", session_origin=scope, actor_id="42"
+    )
+    assert "原始题号：207" in next_question["text"]
+    assert "合成成员乙题干" in next_question["text"]
+    second_answer = await service.question_session_action(
+        "answer", session_origin=scope, actor_id="42"
+    )
+    assert "B" in second_answer["text"]
+
+    session = service.question_sessions.get(opened["session_id"])
+    assert session["source_item_key"] == "synthetic-group"
+    assert [
+        event["metadata"]["prompt_index"]
+        for event in service.question_sessions.list_events(opened["session_id"])
+        if event["event_kind"] == "answer_revealed"
+    ] == [0, 1]
     storage.close()
 
 

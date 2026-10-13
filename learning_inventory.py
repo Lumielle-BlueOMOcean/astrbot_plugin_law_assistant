@@ -44,6 +44,118 @@ class LearningContentProvider:
         self.rng = rng or random.Random()
         self.daily_case_card_max_chars = daily_case_card_max_chars
 
+    def _structured_real_question_units(
+        self, request: QuestionRequest, matching_real_questions: list[Any]
+    ) -> tuple[list[dict[str, Any]], set[int]]:
+        if self.library_service is None:
+            return [], set()
+        repository = self.library_service.repository
+        if not hasattr(repository, "list_structured_delivery_units"):
+            return [], set()
+
+        matching_by_id = {
+            int(question.id): question for question in matching_real_questions
+        }
+        candidates: list[dict[str, Any]] = []
+        structured_real_ids: set[int] = set()
+        objective_types = {
+            "single_choice",
+            "multiple_choice",
+            "indefinite_choice",
+            "true_false",
+        }
+        for unit in repository.list_structured_delivery_units():
+            members = unit.get("members", [])
+            if not isinstance(members, list) or not members:
+                continue
+            group = unit.get("group")
+            is_group = isinstance(group, dict)
+            payloads = [member.get("payload", {}) for member in members]
+            if any(
+                not isinstance(payload, dict)
+                or payload.get("question_type") not in objective_types
+                or payload.get("subquestions")
+                for payload in payloads
+            ):
+                continue
+            if not is_group and not payloads[0].get("material_refs"):
+                continue
+
+            linked_ids = [member.get("verified_real_question_id") for member in members]
+            structured_real_ids.update(
+                int(question_id)
+                for question_id in linked_ids
+                if question_id is not None
+            )
+            if any(question_id is None for question_id in linked_ids):
+                continue
+            real_questions = [
+                matching_by_id.get(int(question_id)) for question_id in linked_ids
+            ]
+            if any(question is None for question in real_questions):
+                continue
+            if any(not member["bundle"].item.active for member in members):
+                continue
+            if any(
+                request.question_type
+                and payload.get("question_type") != request.question_type
+                for payload in payloads
+            ):
+                continue
+            if any(
+                request.subject
+                and not subject_matches((question.subject,), request.subject)
+                for question in real_questions
+            ):
+                continue
+
+            first = real_questions[0]
+            first_item = members[0]["bundle"].item
+            source_kind = "structured_objective_group" if is_group else "real_question"
+            source_item_key = str(unit["unit_key"]) if is_group else str(first.id)
+            candidates.append(
+                {
+                    "available": True,
+                    "origin": "real",
+                    "label": "真题",
+                    "identity": "verified_real_question",
+                    "subject": request.subject or first.subject,
+                    "question_type": first.question_type,
+                    "source_name": first.source_name,
+                    "exam_name": first.exam_name,
+                    "exam_year": first.exam_year,
+                    "exam_date": first.exam_date,
+                    "paper": first.paper,
+                    "question_number": first.question_number,
+                    "source_url": first.source_url,
+                    "source_locator": first.source_locator,
+                    "answer_source": first.answer_source,
+                    "verification_status": "verified",
+                    "question_id": int(first.id),
+                    "question": {
+                        **_real_question_result(first),
+                        "question_identity": "verified_real_question",
+                    },
+                    "item": {
+                        "id": first_item.id,
+                        "identity": first_item.identity,
+                        "subjects": list(first_item.subjects),
+                        "title": first_item.title,
+                    },
+                    "objective_group_id": unit.get("group_id") or "",
+                    "objective_questions": payloads,
+                    "shared_materials": unit.get("shared_materials", []),
+                    "source_kind": source_kind,
+                    "source_item_key": source_item_key,
+                    "_member_real_question_ids": [
+                        int(question.id) for question in real_questions
+                    ],
+                    "import_id": int(unit["import_id"]),
+                    "source_item_key_in_import": str(unit["source_item_key"]),
+                }
+            )
+        return candidates, structured_real_ids
+
     async def select_case(
         self,
         subject: str | None = None,
@@ -162,18 +274,49 @@ class LearningContentProvider:
             source_name=source_name,
             exam_year=exam_year,
         )
-        all_real_candidates = self.storage.list_real_questions(
+        all_real_questions = self.storage.list_real_questions(
             subject=request.subject,
             question_type=request.question_type,
             source_name=request.source_name,
             exam_year=request.exam_year,
             limit=None,
         )
-        real_candidates = [
+        structured_candidates, structured_real_ids = (
+            self._structured_real_question_units(request, all_real_questions)
+        )
+        standalone_real_questions = [
             question
-            for question in all_real_candidates
+            for question in all_real_questions
+            if int(question.id) not in structured_real_ids
+        ]
+        all_real_candidates: list[Any] = [
+            *standalone_real_questions,
+            *structured_candidates,
+        ]
+        real_candidates: list[Any] = [
+            question
+            for question in standalone_real_questions
             if not _is_used(used_content_keys, "real_question", question.id)
         ]
+        for candidate in structured_candidates:
+            member_ids = candidate["_member_real_question_ids"]
+            is_used = _is_used(
+                used_content_keys,
+                candidate["source_kind"],
+                candidate["source_item_key"],
+            ) or any(
+                _is_used(used_content_keys, "real_question", member_id)
+                for member_id in member_ids
+            )
+            was_previous = previous_content_key == (
+                candidate["source_kind"],
+                candidate["source_item_key"],
+            ) or any(
+                previous_content_key == ("real_question", member_id)
+                for member_id in member_ids
+            )
+            if not is_used and not was_previous:
+                real_candidates.append(candidate)
         all_mock_candidates = self._mock_question_bundles(
             request.subject, request.question_type
         )
@@ -202,7 +345,11 @@ class LearningContentProvider:
                         else "暂无匹配的已核验真题"
                     ),
                 }
-            return _real_question_result(self.rng.choice(real_candidates))
+            selected = self.rng.choice(real_candidates)
+            if isinstance(selected, dict):
+                selected.pop("_member_real_question_ids", None)
+                return selected
+            return _real_question_result(selected)
 
         selected_origin = request.origin
         if request.origin == "random":
@@ -247,7 +394,11 @@ class LearningContentProvider:
                         else "暂无匹配的已核验真题"
                     ),
                 }
-            return _real_question_result(self.rng.choice(real_candidates))
+            selected = self.rng.choice(real_candidates)
+            if isinstance(selected, dict):
+                selected.pop("_member_real_question_ids", None)
+                return selected
+            return _real_question_result(selected)
         if self.llm_service is None:
             return {
                 "available": False,

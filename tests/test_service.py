@@ -1383,6 +1383,147 @@ async def test_slow_target_publisher_does_not_block_later_target(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_daily_objective_group_pages_are_sent_once_under_import_scoped_key(
+    tmp_path,
+):
+    now = datetime(2026, 10, 13, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class GroupLearning:
+        async def generate_question(self, **_kwargs):
+            return {
+                "available": True,
+                "origin": "real",
+                "question_id": 31,
+                "question_identity": "verified_real_question",
+                "subject": "civil_commercial",
+                "question_type": "multiple_choice",
+                "source_kind": "structured_objective_group",
+                "source_item_key": "4:civil-objective-206-208",
+                "objective_group_id": "civil-objective-206-208",
+                "item": {
+                    "id": 71,
+                    "identity": "verified_real_question",
+                    "subjects": ["civil_commercial"],
+                },
+                "question": {
+                    "question_identity": "verified_real_question",
+                    "question_type": "multiple_choice",
+                },
+                "objective_questions": [
+                    {
+                        "id": f"daily-objective-{number}",
+                        "source_number": str(number),
+                        "question_type": "multiple_choice",
+                        "subjects": ["civil_commercial"],
+                        "stem_blocks": [
+                            {
+                                "text": f"第 {number} 道每日合成题题干。",
+                                "order": 1,
+                            }
+                        ],
+                        "options": [{"key": "A", "text": "合成选项"}],
+                        "answer": {"keys": ["DAILY_SECRET_ANSWER"]},
+                        "explanation_blocks": [
+                            {"text": "DAILY_SECRET_EXPLANATION", "order": 1}
+                        ],
+                    }
+                    for number in (206, 207, 208)
+                ],
+                "shared_materials": [
+                    {
+                        "id": "daily-material",
+                        "title": "合成每日材料",
+                        "blocks": [{"text": "每日共享事实", "order": 1}],
+                    }
+                ],
+                "content": {"fixture": "group"},
+            }
+
+    class PagePublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            return True
+
+    storage = SQLiteStorage(tmp_path / "daily-objective-group.sqlite3")
+    target = storage.bind_target("aiocqhttp:group:daily-objective", "每日题群")
+    publisher = PagePublisher()
+    service = LawAssistantService(
+        storage,
+        publisher=publisher,
+        learning_service=GroupLearning(),
+        config=SimpleNamespace(
+            timezone="Asia/Shanghai",
+            question_message_max_chars=1000,
+        ),
+        clock=lambda: now,
+    )
+    storage.upsert_daily_plan(
+        DailyPlan(
+            "daily_question",
+            enabled=True,
+            time="16:30",
+            selection_mode="fixed",
+            fixed_subject="civil_commercial",
+            question_origin="real",
+            question_type="multiple_choice",
+            question_type_selection_mode="fixed",
+            fixed_question_type="multiple_choice",
+        )
+    )
+
+    first = await service._run_daily_target(
+        target=target,
+        content_type="daily_question",
+        now=now,
+        task_id="daily-group-task",
+    )
+    sent_count = len(publisher.calls)
+    second = await service._run_daily_target(
+        target=target,
+        content_type="daily_question",
+        now=now,
+        task_id="daily-group-task-retry",
+    )
+
+    assert first == 1
+    assert second == 0
+    assert sent_count == 4
+    assert len(publisher.calls) == sent_count
+    assert all(
+        destination == target["unified_msg_origin"]
+        for destination, _ in publisher.calls
+    )
+    assert all(len(text) <= 1000 for _, text in publisher.calls)
+    joined = "\n".join(text for _, text in publisher.calls)
+    assert "每日共享事实" in joined
+    assert all(
+        f"第 {number} 道每日合成题题干。" in joined for number in (206, 207, 208)
+    )
+    assert "DAILY_SECRET_ANSWER" not in joined
+    assert "DAILY_SECRET_EXPLANATION" not in joined
+    history = storage.list_daily_contents(limit=5)[0]
+    assert history["status"] == "sent"
+    assert history["source_kind"] == "structured_objective_group"
+    assert history["source_item_key"] == "4:civil-objective-206-208"
+    session = service.question_sessions.get_active(target["unified_msg_origin"])
+    assert session is not None
+    assert session["source_item_key"] == "4:civil-objective-206-208"
+    assert session["snapshot"]["objective_group_pages_sent"] is True
+    calls_before_navigation = len(publisher.calls)
+    continued = await service.question_session_action(
+        "next",
+        session_origin=target["unified_msg_origin"],
+        actor_id="scheduler",
+    )
+    assert "全部题面已在发布时完整发送" in continued["text"]
+    assert len(publisher.calls) == calls_before_navigation
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_daily_selection_logs_finish_before_claim_and_omit_content(
     tmp_path, caplog
 ):
