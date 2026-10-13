@@ -613,6 +613,92 @@ async def test_material_referenced_single_question_remains_a_singleton_unit(tmp_
 
 
 @pytest.mark.asyncio
+async def test_material_referenced_objective_singleton_study_is_paged_but_publish_is_complete(
+    tmp_path,
+):
+    pdf_bytes = _text_pdf_bytes()
+    payload = _objective_group_payload(pdf_bytes)
+    payload["objective_question_groups"] = []
+    payload["questions"] = [payload["questions"][0]]
+    payload["materials"][0]["blocks"][0]["text"] = "Z" * 1100
+    storage, ingestion, prepared, _ = await _prepare_service(
+        tmp_path, payload_override=payload
+    )
+    await ingestion.confirm(prepared)
+
+    class PagePublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            return True
+
+    publisher = PagePublisher()
+    service = LawAssistantService(
+        storage,
+        library_service=ingestion.library_service,
+        publisher=publisher,
+        config=SimpleNamespace(question_message_max_chars=600),
+    )
+    target = await service.bind_target("aiocqhttp:group:singleton", "单题群")
+
+    study = await service.start_question_by_number(
+        "206",
+        source_selector=None,
+        session_origin="aiocqhttp:FriendMessage:operator-1",
+        actor_id="operator-1",
+    )
+    assert study["success"] is True
+    assert "材料 1/1" in study["text"]
+    assert "合成问题 206？" not in study["text"]
+    read_pages = [study["text"]]
+    while not any("合成问题 206？" in page for page in read_pages):
+        next_page = await service.question_session_action(
+            "next",
+            session_origin="aiocqhttp:FriendMessage:operator-1",
+            actor_id="operator-1",
+        )
+        assert next_page["success"] is True
+        read_pages.append(next_page["text"])
+        assert len(read_pages) < 20
+    assert sum(page.count("Z") for page in read_pages) == 1100
+    assert any("合成选项 A" in page for page in read_pages)
+
+    preview = await service.prepare_publish_question(
+        source_number="206",
+        target_selectors=["单题群"],
+        actor_id="operator-1",
+    )
+
+    assert preview["ready"] is True
+    assert preview["targets"] == [target]
+    assert len(preview["preview_pages"]) > 1
+    assert "preview" not in preview
+    assert all(len(page) <= 600 for page in preview["preview_pages"])
+    preview_text = "\n".join(preview["preview_pages"])
+    assert sum(page.count("Z") for page in preview["preview_pages"]) == 1100
+    assert "合成问题 206？" in preview_text
+    assert "合成选项 A" in preview_text
+    assert "合成选项 B" in preview_text
+    assert "合成解析" not in preview_text
+
+    result = await service.confirm_publish(preview["token"], actor_id="operator-1")
+
+    assert result == {"success": True, "published_count": 1, "failed_count": 0}
+    assert publisher.calls == [
+        (target["unified_msg_origin"], page) for page in preview["preview_pages"]
+    ]
+    after_publish = await service.question_session_action(
+        "next",
+        session_origin=target["unified_msg_origin"],
+        actor_id="operator-1",
+    )
+    assert "完整发送" in after_publish["text"]
+    storage.close()
+
+
+@pytest.mark.asyncio
 async def test_structured_pdf_json_prepare_confirm_persists_rich_candidate_data(
     tmp_path,
 ):

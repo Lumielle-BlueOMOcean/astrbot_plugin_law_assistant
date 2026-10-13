@@ -14,6 +14,7 @@ try:
         validate_generated_question,
     )
     from .learning_card import ContentTooLongError, format_case_card
+    from .objective_question_groups import current_real_question_payload
 except ImportError:
     from content import (
         QUESTION_TYPE_LABELS,
@@ -24,6 +25,7 @@ except ImportError:
         validate_generated_question,
     )
     from learning_card import ContentTooLongError, format_case_card
+    from objective_question_groups import current_real_question_payload
 
 
 class LearningContentProvider:
@@ -70,15 +72,15 @@ class LearningContentProvider:
                 continue
             group = unit.get("group")
             is_group = isinstance(group, dict)
-            payloads = [member.get("payload", {}) for member in members]
+            source_payloads = [member.get("payload", {}) for member in members]
             if any(
                 not isinstance(payload, dict)
                 or payload.get("question_type") not in objective_types
                 or payload.get("subquestions")
-                for payload in payloads
+                for payload in source_payloads
             ):
                 continue
-            if not is_group and not payloads[0].get("material_refs"):
+            if not is_group and not source_payloads[0].get("material_refs"):
                 continue
 
             linked_ids = [member.get("verified_real_question_id") for member in members]
@@ -93,6 +95,18 @@ class LearningContentProvider:
                 matching_by_id.get(int(question_id)) for question_id in linked_ids
             ]
             if any(question is None for question in real_questions):
+                continue
+            payloads = [
+                current_real_question_payload(source, question)
+                for source, question in zip(
+                    source_payloads, real_questions, strict=True
+                )
+            ]
+            if any(
+                payload.get("question_type") not in objective_types
+                or payload.get("subquestions")
+                for payload in payloads
+            ):
                 continue
             if any(not member["bundle"].item.active for member in members):
                 continue

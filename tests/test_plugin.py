@@ -132,6 +132,53 @@ def test_help_text_does_not_show_slash_prefixed_law_commands(plugin_module):
 
 
 @pytest.mark.asyncio
+async def test_question_group_preview_replies_as_header_and_distinct_locked_pages(
+    plugin_module,
+):
+    plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
+
+    class LongPreviewService:
+        async def prepare_publish_question(self, **_kwargs):
+            pages = ["LOCKED_PAGE_ONE", "LOCKED_PAGE_TWO", "LOCKED_PAGE_THREE"]
+            return {
+                "ready": True,
+                "token": "preview-token-123",
+                "targets": [
+                    {
+                        "id": 17,
+                        "label": "法硕一群",
+                        "unified_msg_origin": "aiocqhttp:group:law-one",
+                    }
+                ],
+                "preview": "\n\n".join(pages),
+                "preview_pages": pages,
+            }
+
+    plugin.service = LongPreviewService()
+    event = FakeEvent(
+        private=True,
+        sender_id="42",
+        message="/law publish-question-number 206 法硕一群",
+        unified_msg_origin="aiocqhttp:FriendMessage:42",
+    )
+
+    replies = [reply async for reply in plugin.law(event)]
+
+    assert len(replies) == 4
+    assert "preview-token-123" in replies[0]
+    assert "/law confirm preview-token-123" in replies[0]
+    assert "法硕一群" in replies[0]
+    assert "law-one" in replies[0]
+    assert "3" in replies[0]
+    assert replies[1:] == [
+        "LOCKED_PAGE_ONE",
+        "LOCKED_PAGE_TWO",
+        "LOCKED_PAGE_THREE",
+    ]
+    assert "LOCKED_PAGE" not in replies[0]
+
+
+@pytest.mark.asyncio
 async def test_command_requires_private_admin_or_operator_and_delegates(plugin_module):
     plugin = plugin_module.LawAssistant(None, {"operator_ids": ["42"]})
     recording = RecordingService()

@@ -404,15 +404,24 @@ class LawAssistant(Star):
             if not source_number:
                 text = "请提供原始题号。"
             else:
-                text = _json_text(
-                    await self.service.prepare_publish_question(
-                        source_number=source_number,
-                        source_selector=source_selector,
-                        target_selectors=targets,
-                        session_origin=_session_origin(event),
-                        actor_id=str(event.get_sender_id()),
-                    )
+                prepared = await self.service.prepare_publish_question(
+                    source_number=source_number,
+                    source_selector=source_selector,
+                    target_selectors=targets,
+                    session_origin=_session_origin(event),
+                    actor_id=str(event.get_sender_id()),
                 )
+                preview_pages = prepared.get("preview_pages")
+                if (
+                    prepared.get("ready") is True
+                    and isinstance(preview_pages, list)
+                    and preview_pages
+                ):
+                    yield event.plain_result(_question_publish_preview_header(prepared))
+                    for page in preview_pages:
+                        yield event.plain_result(str(page))
+                    return
+                text = _json_text(prepared)
         elif subcommand == "study" and len(parts) > 2:
             text = _question_session_result_text(
                 await self.service.start_library_question_session(
@@ -597,13 +606,13 @@ class LawAssistant(Star):
         question_number: str = "",
         source_selector: str = "",
     ) -> str:
-        """按来源、方向和题型获取题目，或按资料原始题号打开完整题组。
+        """按来源、方向和题型获取题目；原始题号进入逐页学习，不执行整组发布。
 
         Args:
             subject(string): 可选方向，如刑法、民商法、知识产权。
             origin(string): real、mock 或 random，默认 random。
             question_type(string): 单选、多选、不定项选择、判断、简答或案例分析；留空随机。
-            question_number(string): 可选资料原始题号；指定时打开其所属完整题组，不拆分成员。
+            question_number(string): 可选资料原始题号；指定时开启其所属单题/题组的逐页学习会话。
             source_selector(string): 题号跨资料来源重号时，用导入编号、文件名或 PDF SHA-256 精确区分。
         """
         if not self._authorized(event):
@@ -1102,7 +1111,7 @@ class LawAssistant(Star):
         return (
             "常用：法务 状态、法务 活动、法务 截止、法务 题目 [方向] [题型]、"
             "法务 真题 [方向] [题型]、法务 模拟题 [方向] [题型]、法务 案例 [方向]、"
-            "法务 题号 <原始题号> [来源]、法务 发布题号 <原始题号> <群名> [--source <来源>]、"
+            "法务 题号 <原始题号> [来源]（逐页学习）、法务 发布题号 <原始题号> <群名> [--source <来源>]（完整预览后确认群发）、"
             "法务 当前、法务 下一页、法务 下一题、法务 答案、法务 解析、法务 结束、"
             "法务 计划、法务 群计划、法务 绑定 <别名>、法务 帮助。"
             "管理与维护：law scan、law import、law question-import、law review、"
@@ -1361,6 +1370,29 @@ def _json_text(value: Any) -> str:
             _event_dict(item) if hasattr(item, "source_key") else item for item in value
         ]
     return json.dumps(value, ensure_ascii=False, default=_json_default, sort_keys=True)
+
+
+def _question_publish_preview_header(prepared: dict[str, Any]) -> str:
+    targets = []
+    for target in prepared.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        label = str(target.get("label") or "未命名目标")
+        target_id = str(target.get("id") or "?")
+        origin = str(target.get("unified_msg_origin") or "")
+        detail = f"ID {target_id}"
+        if origin:
+            detail += f"，{origin}"
+        targets.append(f"{label}（{detail}）")
+    token = str(prepared.get("token") or "")
+    page_count = len(prepared.get("preview_pages", []))
+    return (
+        f"客观题发布预览已准备，共 {page_count} 页。\n"
+        f"目标：{'；'.join(targets) or '未列出'}\n"
+        f"确认 token：{token}\n"
+        f"确认请回复：/law confirm {token}\n"
+        "下面每条消息都是预览时锁定的正文页面，按顺序合起来即为完整待发布内容。"
+    )
 
 
 def _question_session_result_text(value: Any) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -334,6 +335,152 @@ async def test_material_referenced_objective_singleton_uses_structured_snapshot(
     assert len(result["objective_questions"]) == 1
     assert result["source_kind"] == "real_question"
     assert result["shared_materials"][0]["id"] == "material-1"
+    storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_group_daily_and_numbered_selection_use_current_real_question(
+    tmp_path,
+):
+    (
+        storage,
+        _,
+        confirmed,
+        imported_payload,
+        repository,
+    ) = await _import_and_promote_synthetic_objective_group(tmp_path)
+    item_id = next(
+        int(item["item_id"])
+        for item in confirmed["items"]
+        if item["external_id"] == "objective-206"
+    )
+    library = LibraryService(repository)
+
+    class RecordingPublisher:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_text(self, destination, text):
+            self.calls.append((destination, text))
+            return True
+
+    publisher = RecordingPublisher()
+    service = LawAssistantService(
+        storage,
+        library_service=library,
+        publisher=publisher,
+        config=SimpleNamespace(operator_ids=["synthetic-reviewer"]),
+    )
+    edited = await service.update_management_learning_item(
+        item_id,
+        {
+            "stem": "人工修订后的权威题干？",
+            "options": ["A. 旧选项", "B. 人工修订后的正确选项"],
+            "answer": ["B"],
+            "answer_source": "user_verified",
+            "explanation": "人工修订后的权威解析。",
+        },
+        actor_id="synthetic-reviewer",
+    )
+    assert edited["success"] is True
+
+    provider = LearningContentProvider(
+        storage,
+        library_service=library,
+        rng=FirstChoiceRandom(),
+    )
+    daily = await provider.select_question(
+        origin="real",
+        subject="civil_commercial",
+        question_type="multiple_choice",
+    )
+
+    first_daily_member = daily["objective_questions"][0]
+    assert first_daily_member["answer"] == ["B"]
+    assert first_daily_member["stem_blocks"] == "人工修订后的权威题干？"
+    assert first_daily_member["options"] == [
+        "A. 旧选项",
+        "B. 人工修订后的正确选项",
+    ]
+    assert first_daily_member["explanation"] == "人工修订后的权威解析。"
+    assert first_daily_member["answer_source"] == "user_verified"
+
+    stored_import = storage.connection.execute(
+        "SELECT payload_json FROM structured_imports"
+    ).fetchone()
+    persisted_import_payload = json.loads(stored_import["payload_json"])
+    assert (
+        persisted_import_payload["questions"][0]["answer"]["keys"]
+        == imported_payload["questions"][0]["answer"]["keys"]
+        == ["A"]
+    )
+
+    opened = await service.start_question_by_number(
+        "206",
+        source_selector=None,
+        session_origin="aiocqhttp:FriendMessage:synthetic-reviewer",
+        actor_id="synthetic-reviewer",
+    )
+    assert opened["success"] is True
+    assert "人工修订后的权威题干？" not in opened["text"]
+    page = opened
+    for _ in range(10):
+        if "人工修订后的权威题干？" in page["text"]:
+            break
+        page = await service.question_session_action(
+            "next",
+            session_origin="aiocqhttp:FriendMessage:synthetic-reviewer",
+            actor_id="synthetic-reviewer",
+        )
+        assert page["success"] is True
+    assert "人工修订后的权威题干？" in page["text"]
+
+    revealed = await service.question_session_action(
+        "answer",
+        question_number="206",
+        session_origin="aiocqhttp:FriendMessage:synthetic-reviewer",
+        actor_id="synthetic-reviewer",
+    )
+    assert revealed["success"] is True
+    assert "真题参考答案 · 人工核验答案来源" in revealed["text"]
+    assert revealed["text"].splitlines()[-1] == "B"
+    explanation = await service.question_session_action(
+        "explanation",
+        question_number="206",
+        session_origin="aiocqhttp:FriendMessage:synthetic-reviewer",
+        actor_id="synthetic-reviewer",
+    )
+    assert explanation["success"] is True
+    assert "人工修订后的权威解析。" in explanation["text"]
+
+    target = await service.bind_target("aiocqhttp:group:verified-group", "核验题群")
+    preview = await service.prepare_publish_question(
+        source_number="206",
+        target_selectors=["核验题群"],
+        actor_id="synthetic-reviewer",
+    )
+    assert preview["ready"] is True
+    preview_text = "\n".join(preview["preview_pages"])
+    assert "人工修订后的权威题干？" in preview_text
+    assert "人工修订后的正确选项" in preview_text
+    assert "人工修订后的权威解析" not in preview_text
+    assert "真题参考答案" not in preview_text
+
+    published = await service.confirm_publish(
+        preview["token"], actor_id="synthetic-reviewer"
+    )
+    assert published == {"success": True, "published_count": 1, "failed_count": 0}
+    assert publisher.calls == [
+        (target["unified_msg_origin"], text) for text in preview["preview_pages"]
+    ]
+    published_answer = await service.question_session_action(
+        "answer",
+        question_number="206",
+        session_origin=target["unified_msg_origin"],
+        actor_id="synthetic-reviewer",
+    )
+    assert published_answer["success"] is True
+    assert published_answer["text"].splitlines()[-1] == "B"
     storage.close()
 
 

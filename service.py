@@ -43,7 +43,10 @@ if __package__ and "." in __package__:
     from .library_models import LibrarySource
     from .library_service import LibraryService
     from .models import CaseItem, LawUpdate, LegalEvent, SourceDocument
-    from .objective_question_groups import normalize_source_number
+    from .objective_question_groups import (
+        current_real_question_payload,
+        normalize_source_number,
+    )
     from .pagination import page_payload, page_request
     from .publisher import format_deadline_reminder, format_event
     from .question_session import (
@@ -91,7 +94,10 @@ else:
     from library_models import LibrarySource
     from library_service import LibraryService
     from models import CaseItem, LawUpdate, LegalEvent, SourceDocument
-    from objective_question_groups import normalize_source_number
+    from objective_question_groups import (
+        current_real_question_payload,
+        normalize_source_number,
+    )
     from pagination import page_payload, page_request
     from publisher import format_deadline_reminder, format_event
     from question_session import (
@@ -319,6 +325,39 @@ def _case_needs_reprocessing(document: SourceDocument) -> bool:
     return (
         metadata.get("case_segmentation_version") != CASE_SEGMENTATION_VERSION
         or metadata.get("case_processing_status") != "success"
+    )
+
+
+def _is_material_referenced_objective_singleton(content: dict[str, Any]) -> bool:
+    """Identify imported objective singletons that must be issued with their material."""
+    objective_types = {
+        "single_choice",
+        "multiple_choice",
+        "indefinite_choice",
+        "true_false",
+    }
+    source_kind = str(content.get("source_kind") or "")
+    structured_real_singleton = (
+        source_kind == "real_question"
+        and bool(content.get("shared_materials"))
+        and isinstance(content.get("objective_questions"), list)
+        and len(content["objective_questions"]) == 1
+    )
+    return (
+        bool(content.get("shared_materials"))
+        and not content.get("objective_group_id")
+        and not content.get("subquestions")
+        and str(content.get("question_type") or "") in objective_types
+        and (
+            source_kind == "structured_objective_question" or structured_real_singleton
+        )
+    )
+
+
+def _objective_pages_were_published(snapshot: dict[str, Any]) -> bool:
+    return bool(
+        snapshot.get("objective_group_pages_sent")
+        or snapshot.get("objective_question_pages_sent")
     )
 
 
@@ -634,7 +673,7 @@ class LawAssistantService:
             "indefinite_choice",
             "true_false",
         }
-        payloads: list[dict[str, Any]] = []
+        source_payloads: list[dict[str, Any]] = []
         for member in members:
             payload = member.get("payload")
             bundle = member.get("bundle")
@@ -650,7 +689,40 @@ class LawAssistantService:
                 }
             if not bundle.item.active or bundle.item.deleted_at:
                 return {"available": False, "reason": "题组中存在已停用的资料条目"}
-            payloads.append(payload)
+            source_payloads.append(payload)
+
+        linked_ids = [member.get("verified_real_question_id") for member in members]
+        real_questions_by_id = (
+            {
+                int(question.id): question
+                for question in self.storage.list_real_questions(limit=None)
+            }
+            if any(question_id is not None for question_id in linked_ids)
+            else {}
+        )
+        payloads: list[dict[str, Any]] = []
+        for member, payload in zip(members, source_payloads, strict=True):
+            real_question_id = member.get("verified_real_question_id")
+            if real_question_id is None:
+                payloads.append(payload)
+                continue
+            real_question = real_questions_by_id.get(int(real_question_id))
+            if real_question is None:
+                return {
+                    "available": False,
+                    "reason": "题组关联的核验真题记录不可用；不会回退到旧导入内容。",
+                }
+            payloads.append(current_real_question_payload(payload, real_question))
+        if any(
+            payload.get("question_type") not in objective_types
+            or payload.get("subquestions")
+            for payload in payloads
+        ):
+            return {
+                "available": False,
+                "error": "unsupported_question_type",
+                "reason": "核验后的题组成员不再全部属于支持的客观题类型。",
+            }
 
         all_verified = all(
             member.get("verified_real_question_id") is not None
@@ -698,15 +770,14 @@ class LawAssistantService:
             "objective_group_id": unit.get("group_id") or "",
             "import_id": int(unit["import_id"]),
         }
-        if is_group:
-            content["objective_questions"] = [
-                {
-                    "payload": payload,
-                    "source_number": str(member.get("source_number") or ""),
-                }
-                for member, payload in zip(members, payloads, strict=True)
-            ]
-        else:
+        content["objective_questions"] = [
+            {
+                "payload": payload,
+                "source_number": str(member.get("source_number") or ""),
+            }
+            for member, payload in zip(members, payloads, strict=True)
+        ]
+        if not is_group:
             content["stem_blocks"] = first_payload.get("stem_blocks", [])
             content["subquestions"] = first_payload.get("subquestions", [])
         if all_verified:
@@ -922,12 +993,13 @@ class LawAssistantService:
                     "success": False,
                     "reason": f"当前正在阅读已揭晓内容；请使用 {continuation} 继续，不会跳转题面。",
                 }
-            if snapshot.get("objective_group_pages_sent"):
+            if _objective_pages_were_published(snapshot):
+                unit_label = "题组" if snapshot.get("objective_group_id") else "客观题"
                 return {
                     "success": True,
                     "session_id": session["id"],
                     "text": (
-                        "该题组的公共材料和全部题面已在发布时完整发送。"
+                        f"该{unit_label}的公共材料和全部题面已在发布时完整发送。"
                         "可用「下一题」切换当前成员，或用「答案 <题号>」/「解析 <题号>」查看对应内容。"
                     ),
                 }
@@ -1041,16 +1113,17 @@ class LawAssistantService:
                 or session
             )
             session["snapshot"] = snapshot
-            if snapshot.get("objective_group_pages_sent"):
+            if _objective_pages_were_published(snapshot):
                 source_number = str(
                     prompts[next_index].get("source_number") or next_index + 1
                 )
+                unit_label = "题组" if snapshot.get("objective_group_id") else "客观题"
                 return {
                     "success": True,
                     "session_id": session["id"],
                     "text": (
                         f"已切换至题号 {source_number}。"
-                        "题面已随题组发布并完整发送；可用「答案」或「解析」分阶段查看。"
+                        f"题面已随{unit_label}发布并完整发送；可用「答案」或「解析」分阶段查看。"
                     ),
                 }
         elif action in {"answer", "explanation"}:
@@ -2769,12 +2842,11 @@ class LawAssistantService:
             ),
             bodies=tuple(bodies),
         )
-        return {
+        result = {
             "ready": True,
             "token": token,
             "content_type": "question",
             "targets": targets,
-            "preview": "\n\n".join(bodies),
             "preview_pages": bodies,
             "content_ref": content.get("content_ref"),
             "selection": {
@@ -2783,6 +2855,9 @@ class LawAssistantService:
                 if content.get(key) is not None
             },
         }
+        if len(bodies) == 1:
+            result["preview"] = bodies[0]
+        return result
 
     def _build_question_snapshot(
         self, content: dict[str, Any], *, group_pages_sent: bool = False
@@ -2792,15 +2867,22 @@ class LawAssistantService:
             limit = max(300, min(4000, int(limit)))
         except (TypeError, ValueError):
             limit = 1600
-        if content.get("objective_group_id"):
+        material_objective_singleton = _is_material_referenced_objective_singleton(
+            content
+        )
+        if content.get("objective_group_id") or material_objective_singleton:
             limit = min(limit, 1000)
         snapshot_input = content
         if group_pages_sent and content.get("objective_group_id"):
             snapshot_input = {**content, "objective_group_pages_sent": True}
+        elif group_pages_sent and material_objective_singleton:
+            snapshot_input = {**content, "objective_question_pages_sent": True}
         return build_question_session_snapshot(snapshot_input, max_chars=limit)
 
     def _snapshot_publication_bodies(self, snapshot: dict[str, Any]) -> list[str]:
-        if snapshot.get("objective_group_id"):
+        if snapshot.get("objective_group_id") or _objective_pages_were_published(
+            snapshot
+        ):
             pages = format_session_prompt_pages(snapshot)
             if pages:
                 return pages

@@ -57,3 +57,43 @@ def resolve_objective_question_group(
     if selected.get("publish_mode") != "all_at_once":
         raise ValueError("unsupported objective group publish_mode")
     return copy.deepcopy(selected)
+
+
+def current_real_question_payload(
+    source_payload: Mapping[str, Any], question: Any
+) -> dict[str, Any]:
+    """Keep imported relations while taking verified question content from SQLite.
+
+    The import remains authoritative for group membership, materials, source number,
+    and answer requirements. Once a member is verified, its editable question fields
+    must come from the current persisted ``RealQuestion`` row instead of the older
+    hash-bound import snapshot.
+    """
+    payload = copy.deepcopy(dict(source_payload))
+    payload.update(
+        {
+            "subjects": [str(question.subject)],
+            "question_type": str(question.question_type),
+            "stem_blocks": str(question.stem),
+            "options": copy.deepcopy(question.options),
+            "answer": copy.deepcopy(question.answer),
+            "answer_status": "provided"
+            if question.answer is not None
+            else "unresolved",
+            "answer_source": str(question.answer_source),
+            "verification_status": str(question.verification_status),
+            "content_hash": str(question.content_hash),
+            "explanation_blocks": [],
+            "explanation": str(question.explanation or ""),
+            "source_name": str(question.source_name),
+            "exam_name": str(question.exam_name),
+            "exam_year": str(question.exam_year),
+            "exam_date": str(question.exam_date),
+            "paper": str(question.paper),
+            "question_number": str(question.question_number),
+            "source_url": str(question.source_url),
+            "source_locator": str(question.source_locator),
+            "metadata": copy.deepcopy(question.metadata),
+        }
+    )
+    return payload

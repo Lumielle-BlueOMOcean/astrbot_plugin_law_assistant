@@ -199,12 +199,16 @@ def _header(snapshot: dict[str, Any], prompt_index: int | None = None) -> str:
     )
 
 
-def _answer_label(snapshot: dict[str, Any]) -> str:
+def _answer_label(snapshot: dict[str, Any], *, answer_source: str | None = None) -> str:
     identity = snapshot.get("identity")
     if identity == "real_question_candidate":
         return "来源资料参考答案 · 待人工核验"
     if identity == "verified_real_question":
-        answer_source = str(snapshot.get("exam", {}).get("answer_source") or "")
+        answer_source = str(
+            answer_source
+            if answer_source is not None
+            else snapshot.get("exam", {}).get("answer_source") or ""
+        )
         source_label = {
             "official": "官方答案来源标注",
             "third_party": "第三方参考答案来源标注",
@@ -873,6 +877,7 @@ def build_question_session_snapshot(
                         "question_type_label": QUESTION_TYPE_LABELS.get(
                             member_type, member_type
                         ),
+                        "answer_source": str(member_payload.get("answer_source") or ""),
                     }
                 )
             if first_payload:
@@ -972,15 +977,24 @@ def build_question_session_snapshot(
         "answer_requirements": requirements,
         "exam": exam,
     }
-    if has_objective_group and result.get("objective_group_pages_sent") is True:
+    if result.get("objective_group_pages_sent") is True:
         snapshot["objective_group_pages_sent"] = True
+    if result.get("objective_question_pages_sent") is True:
+        snapshot["objective_question_pages_sent"] = True
     for index, prompt in enumerate(snapshot["prompts"]):
         prompt["source_stem_blocks"] = prompt.pop("stem_blocks", [])
         prompt["source_options"] = prompt.pop("options", [])
         prompt["source_answer_blocks"] = prompt.pop("answer_blocks", [])
         prompt["source_explanation_blocks"] = prompt.pop("explanation_blocks", [])
         prompt["source_answer_requirements"] = prompt.pop("answer_requirements", [])
-        prompt["answer_label"] = _answer_label(snapshot)
+        prompt["answer_label"] = _answer_label(
+            snapshot,
+            answer_source=(
+                str(prompt.get("answer_source") or "")
+                if "answer_source" in prompt
+                else None
+            ),
+        )
         prompt["explanation_label"] = _explanation_label(snapshot)
     snapshot = _render_snapshot(
         snapshot,
@@ -1111,6 +1125,8 @@ def format_session_status(session: dict[str, Any]) -> str:
             )
         if snapshot.get("objective_group_pages_sent"):
             lines.append("题组题面：发布时已完整发送")
+        elif snapshot.get("objective_question_pages_sent"):
+            lines.append("客观题面：发布时已完整发送")
         else:
             lines.append(f"{stage_label}：{page_index + 1}/{max(1, len(pages))}")
     lines.append(
